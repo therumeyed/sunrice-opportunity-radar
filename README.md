@@ -86,20 +86,30 @@ Default actors (overridable, see `.env.example`):
 
 ## 3. Topic library
 
-`src/topics.js` is the editable query library: weeknight dinners, curry
-night, healthy eating, lunchbox & snacks, sushi & Asian cooking, seasonal
-occasions -- chosen from SunRice's own real product categories (Everyday
-Rice, Healthy Rice Blends, Microwave Rice, Rice Snacks) and the cuisine
-categories their own site organizes recipe content around. **Seasonal
-occasions** is fixed-date, mainstream-Australian only (Christmas,
-Australia Day) -- a shifting or non-Gregorian occasion never belongs
-there, because that theme can auto-promote straight to a `Create`
-recommendation. **Multicultural discovery** is where Lunar New Year,
-Diwali and Ramadan live instead: real, recurring, worth tracking, but
-culturally-specific and date-shifting, so every hit from this theme is
-hard-locked to `early_signal` confidence and the `Investigate` action --
-it can never auto-promote to `Create`. That's enforced in `src/scoring.js`
-/ `src/reportBuilder.js`, not just documented.
+`src/topics.js` is the editable query library: rice cooking & prep,
+weeknight dinners, curry night, healthy eating, lunchbox & snacks, sushi &
+Asian cooking, seasonal occasions -- chosen from SunRice's own real product
+categories (Everyday Rice, Healthy Rice Blends, Microwave Rice, Rice
+Snacks) and the cuisine categories their own site organizes recipe content
+around. **Rice cooking & prep** (washing, cooking, choosing the right type
+for a recipe) is evergreen, foundational content every rice buyer searches
+for eventually, so it carries the top editorial relevance weight alongside
+the other core cooking/cuisine themes. **Seasonal occasions** is
+fixed-date, mainstream-Australian only (Christmas, Australia Day) -- a
+shifting or non-Gregorian occasion never belongs there, because that theme
+can auto-promote straight to a `Create` recommendation. **Multicultural
+discovery** is where Lunar New Year, Diwali and Ramadan live instead: real,
+recurring, worth tracking, but culturally-specific and date-shifting, so
+every hit from this theme is hard-locked to `early_signal` confidence and
+the `Investigate` action -- it can never auto-promote to `Create`. That's
+enforced in `src/scoring.js` / `src/reportBuilder.js`, not just documented.
+
+`src/reportBuilder.js`'s `THEME_RELEVANCE` is the fixed editorial priority
+ranking between themes -- rice basics and the meal/cuisine themes score
+full relevance, `lunchbox_snacks` is weighted down (real signal, just a
+narrower audience), and multicultural needs no entry since its relevance is
+already forced down by the `requiresReview` lock regardless. Not derived
+from any live metric, same as `seasonalFit`.
 
 Queries are deliberately short/broad (single words or short phrases) rather
 than long compound phrases -- Google Trends' related-queries feature
@@ -109,6 +119,16 @@ social (`curry` also means Steph/Stephen/Seth/Dell Curry, NBA) -- a topic
 can carry an `exclude` list (see `curry_night`) and
 `src/providers/apifySocial.js`'s `isGenuineMatch` rejects a hit whose text
 also trips it, rather than trust a bare substring match on its own.
+
+A rising/related query under a culturally-specific theme can look "early"
+for a reason that's actually just how Google Trends works, not a bug: a
+`% growth`-style rising value off a tiny prior base (a handful of early
+planners searching "chinese lunar new year 2027" months out) can look
+disproportionately significant well before the occasion is close. That's
+exactly why `multicultural` is hard-locked to `Investigate`/`early_signal`
+regardless of score -- it's designed to surface this kind of early,
+unverified signal for a human to judge, not to assert it's worth acting on
+today.
 
 ## 4. Recommendation scoring
 

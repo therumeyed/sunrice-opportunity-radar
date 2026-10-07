@@ -10,6 +10,7 @@ const REQUIRES_REVIEW = new Set(ALL_TOPICS.filter((t) => t.requiresReview).map((
 // audience/filter values the brief's nav requires, decided once here rather
 // than invented per report. Never used as a substitute for a real metric.
 const THEME_AUDIENCE = {
+  rice_basics: 'home cooks',
   weeknight_dinners: 'home cooks',
   curry_night: 'multicultural audiences',
   healthy_eating: 'health-conscious',
@@ -17,6 +18,24 @@ const THEME_AUDIENCE = {
   sushi_asian: 'multicultural audiences',
   seasonal: 'families',
   multicultural: 'multicultural audiences'
+};
+
+// Fixed editorial priority per theme -- rice cooking fundamentals and the
+// meal/cuisine themes are this brand's core, highest-value content; lunchbox
+// snacks is real but narrower, so it's weighted down rather than treated as
+// equally important by default. Not derived from any live metric, same as
+// THEME_AUDIENCE/seasonalFit above and below. multicultural is deliberately
+// left out here -- its relevance is already forced to 0.5 by the
+// requiresReview lock regardless of this map, so giving it its own entry
+// would just be a second, easily-stale way of saying the same thing.
+const THEME_RELEVANCE = {
+  rice_basics: 1,
+  weeknight_dinners: 1,
+  curry_night: 1,
+  healthy_eating: 1,
+  sushi_asian: 1,
+  seasonal: 1,
+  lunchbox_snacks: 0.7
 };
 
 function suggestedChannelFor(socialTotal, hasSearch) {
@@ -39,6 +58,7 @@ function seasonalFit(theme, date = new Date()) {
   switch (theme) {
     case 'lunchbox_snacks': return isSchoolTerm ? 0.8 : 0.3;
     case 'healthy_eating': return month === 0 ? 0.9 : 0.6; // January health resolutions
+    case 'rice_basics': return 0.7; // evergreen, no seasonal dip -- still ranks a little below an active seasonal moment
     case 'weeknight_dinners': return 0.6;
     case 'curry_night': return 0.6;
     case 'sushi_asian': return 0.6;
@@ -188,7 +208,7 @@ async function buildReport(reportId, reportDate) {
       daysOld,
       velocityPct,
       distinctSourceCount: distinctSourceTypes.size,
-      relevance: forceEarlySignal ? 0.5 : 1,
+      relevance: forceEarlySignal ? 0.5 : (THEME_RELEVANCE[theme] ?? 1),
       seasonalFit: seasonalFit(theme, new Date(reportDate))
     });
 
@@ -292,4 +312,4 @@ function distinctCount(items) {
   return new Set(items.map((i) => i.source_type)).size;
 }
 
-module.exports = { buildReport, seasonalFit, lifecycleFor };
+module.exports = { buildReport, seasonalFit, lifecycleFor, THEME_RELEVANCE };

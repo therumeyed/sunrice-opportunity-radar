@@ -11,6 +11,12 @@
 // categories their own site organizes recipe content around (curry night,
 // Chinese/Indian/Korean recipes, sushi).
 const TOPICS = [
+  // Rice prep/cooking fundamentals: how to wash it, how to cook it, how to
+  // pick the right type for a recipe. Evergreen, highest-relevance content
+  // for a rice brand -- everyone who buys rice eventually searches these --
+  // so it carries the top editorial relevance weight below, above
+  // lunchbox_snacks and well above multicultural's hard-locked weight.
+  { theme: 'rice_basics', label: 'Rice cooking & prep', queries: ['cook rice', 'wash rice', 'rice cooker', 'rice types'] },
   { theme: 'weeknight_dinners', label: 'Weeknight dinners', queries: ['fried rice', 'rice recipes', 'dinner ideas'] },
   // "curry" alone is ambiguous (Steph/Stephen/Seth/Dell Curry, NBA) --
   // `exclude` is read by apifySocial.js to reject a social match that also

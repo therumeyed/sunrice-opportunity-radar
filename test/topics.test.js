@@ -19,4 +19,10 @@ describe('topics', () => {
   test('an unknown query maps to no theme', () => {
     assert.equal(themeForQuery('something nobody configured'), null);
   });
+  test('rice prep/cooking basics has its own theme covering wash/cook/choose', () => {
+    assert.equal(themeForQuery('wash rice'), 'rice_basics');
+    assert.equal(themeForQuery('cook rice'), 'rice_basics');
+    assert.equal(themeForQuery('rice cooker'), 'rice_basics');
+    assert.equal(themeForQuery('rice types'), 'rice_basics');
+  });
 });
