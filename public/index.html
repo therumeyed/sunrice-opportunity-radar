@@ -1,0 +1,117 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SunRice Opportunity Radar</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div class="bd-shell">
+    <aside class="bd-side" aria-label="Dashboard navigation">
+      <div class="bd-brand">
+        <div class="bd-mark">S</div>
+        <div><strong>Brand Assistant</strong><span>Decision intelligence</span></div>
+      </div>
+      <div class="bd-nav-label">SunRice radar</div>
+      <nav class="bd-nav" id="bd-nav">
+        <button type="button" data-view="today" aria-pressed="true">Today</button>
+        <button type="button" disabled>Local visibility <span class="bd-soon">Later</span></button>
+        <button type="button" disabled>Digital availability <span class="bd-soon">Later</span></button>
+        <button type="button" disabled>Competitor pulse <span class="bd-soon">Later</span></button>
+        <button type="button" disabled>Customer voice <span class="bd-soon">Later</span></button>
+      </nav>
+    </aside>
+
+    <main class="bd-main">
+      <header class="bd-top">
+        <div class="bd-title"><small>Daily opportunity report</small><h1>SunRice</h1></div>
+        <div class="bd-top-actions">
+          <span class="bd-status" id="bd-updated-status">Loading…</span>
+          <button class="bd-action" id="bd-history-button" type="button" aria-expanded="false" aria-controls="bd-history-popover">
+            <span class="bd-hide-mobile">History</span>
+          </button>
+          <button class="bd-action primary" id="bd-refresh-button" type="button">
+            <span class="bd-hide-mobile">Refresh</span>
+          </button>
+        </div>
+        <section class="bd-history" id="bd-history-popover" aria-label="Report history" hidden>
+          <div class="bd-history-head">
+            <strong id="bd-history-month">Loading…</strong>
+            <div class="bd-cal-actions">
+              <button class="bd-icon" type="button" id="bd-history-prev" aria-label="Previous month">&larr;</button>
+              <button class="bd-icon" type="button" id="bd-history-next" aria-label="Next month">&rarr;</button>
+              <button class="bd-icon" id="bd-history-close" type="button" aria-label="Close history">&times;</button>
+            </div>
+          </div>
+          <div class="bd-week" aria-hidden="true"><span>M</span><span>T</span><span>W</span><span>T</span><span>F</span><span>S</span><span>S</span></div>
+          <div class="bd-days" id="bd-history-days"></div>
+        </section>
+      </header>
+
+      <div class="bd-content">
+        <div id="bd-view-today">
+          <div class="bd-filterbar">
+            <div class="bd-report-date" id="bd-report-date">Loading…</div>
+            <div class="bd-filters" aria-label="Report filters">
+              <select id="bd-filter-theme" aria-label="Theme"><option value="">All themes</option></select>
+              <select id="bd-filter-audience" aria-label="Audience"><option value="">All audiences</option></select>
+              <select id="bd-filter-state" aria-label="State"><option value="">All Australia</option></select>
+            </div>
+          </div>
+
+          <section class="bd-hero">
+            <div class="bd-hero-top">
+              <div><div class="bd-kicker">Today's read</div><h2>The three things worth acting on today</h2></div>
+              <div class="bd-hero-note">Prioritised using freshness, momentum, source agreement and brand relevance.</div>
+            </div>
+            <div class="bd-priorities" id="bd-priorities"></div>
+          </section>
+
+          <div class="bd-grid">
+            <section class="bd-panel">
+              <div class="bd-panel-head">
+                <div><h3>Search demand by state</h3><p>Relative interest for one topic at a time, last 30 days &mdash; scores from different topics are never comparable</p></div>
+                <span class="bd-source-tag" id="bd-search-tag">&mdash;</span>
+              </div>
+              <select id="bd-search-topic-select" aria-label="Search demand topic" style="margin-bottom:11px;width:100%;color:var(--bd-ink);background:var(--bd-panel);border:1px solid var(--bd-line);border-radius:8px;padding:7px 9px;font-size:11px;"></select>
+              <div class="bd-bars" id="bd-search-bars"><div class="bd-empty">Loading…</div></div>
+            </section>
+            <section class="bd-panel">
+              <div class="bd-panel-head">
+                <div><h3>Rising search nuggets</h3><p>Human review required before targeting a new audience</p></div>
+              </div>
+              <div class="bd-nuggets" id="bd-search-nuggets"><div class="bd-empty">Loading…</div></div>
+            </section>
+
+            <section class="bd-panel bd-full">
+              <div class="bd-panel-head">
+                <div><h3>Social signals behind today's ideas</h3><p>Every opportunity links to an original example</p></div>
+                <span class="bd-source-tag">Apify &middot; Reddit, TikTok, Instagram</span>
+              </div>
+              <div class="bd-signal-list" id="bd-social-list"><div class="bd-empty">Loading…</div></div>
+            </section>
+          </div>
+        </div>
+
+        <div id="bd-view-stub" hidden class="bd-stub">
+          <h2>Not built yet</h2>
+          <p>This section is parked behind a feature flag for a later phase. See the README for what's live today.</p>
+        </div>
+      </div>
+    </main>
+  </div>
+
+  <div class="bd-drawer-scrim" id="bd-proof-scrim" hidden>
+    <aside class="bd-drawer" aria-label="Recommendation evidence" aria-modal="true" role="dialog">
+      <div class="bd-drawer-top"><span class="bd-source-tag">Evidence chain</span><button class="bd-icon" id="bd-proof-close" type="button" aria-label="Close evidence">&times;</button></div>
+      <h2 id="bd-proof-title">&nbsp;</h2>
+      <p id="bd-proof-summary"></p>
+      <div class="bd-scores" id="bd-proof-scores"></div>
+      <div id="bd-proof-evidence"></div>
+    </aside>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>

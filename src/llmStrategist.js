@@ -1,0 +1,99 @@
+// Writes the recommendation rationale by reasoning over already-collected
+// real evidence plus SunRice's real product catalog -- e.g. spotting that a
+// rising "biryani" query under a curry-related theme maps onto Basmati
+// Rice, something the deterministic scorer has no way to know since it
+// only counts signals, it doesn't understand what they mean.
+//
+// Hard boundary: this NEVER touches score, confidence, action_type or which
+// opportunities make the top 3 -- all of that stays deterministic and
+// auditable per the brief's non-negotiable data rule. This only writes
+// prose from data it's handed, and it must never invent a metric, source,
+// or product that isn't in the evidence/catalog it's given. A missing key,
+// a failed call, or a suspicious response all fall back to the existing
+// deterministic template rationale -- this is a nice-to-have layer on top,
+// never a dependency the report needs to succeed.
+const ANTHROPIC_API_BASE = 'https://api.anthropic.com/v1/messages';
+const MODEL = process.env.ANTHROPIC_MODEL || 'claude-haiku-4-5-20251001';
+const { PRODUCTS } = require('./products');
+
+function buildPrompt({ themeLabel, actionType, distinctSourceCount, risingQueries, topQueries, interestByRegion, socialExamples }) {
+  const productList = PRODUCTS.map((p) => `- ${p.name}${p.sizes ? ` (${p.sizes})` : ''}`).join('\n');
+  const risingList = risingQueries.length > 0
+    ? risingQueries.map((q) => `- "${q.query}"${q.value != null ? ` (${q.value})` : ''}`).join('\n')
+    : '(none returned)';
+  const topList = topQueries.length > 0 ? topQueries.map((q) => `- "${q.query}"`).join('\n') : '(none returned)';
+  const regionList = interestByRegion.length > 0
+    ? interestByRegion.map((r) => `- ${r.region}: ${r.value}`).join('\n')
+    : '(none returned)';
+  const socialList = socialExamples.length > 0
+    ? socialExamples.map((s) => `- [${s.platform}] "${(s.excerpt || '').slice(0, 200)}" (matched query: "${s.queryOrTopic}")`).join('\n')
+    : '(none)';
+
+  return `You are a sharp, commercially-minded social media strategist for SunRice, an Australian rice company. You are given REAL evidence already collected for one theme today, and SunRice's REAL current product range. Write ONE tight paragraph (2-4 sentences, no more): first the "why" grounded in the real evidence, then ONE concrete, specific action to actually take.
+
+The concrete action must be ONE of these three types -- pick whichever the evidence actually supports, don't force one that doesn't fit:
+1. A specific social post/video idea using a named product from the list (e.g. what to show, what angle -- concrete enough that someone could film it tomorrow).
+2. A recipe or how-to content idea built around a named product (e.g. a real recognisable dish that product could be used for).
+3. Directly engaging with the specific matched social post/thread already given as evidence below (reply, comment, join the conversation) -- reference what that post is about, not a generic "engage on social" instruction. Don't invent a URL or quote text not given below; the real link is already shown separately in the dashboard.
+
+Hard rules -- breaking any of these makes your answer useless:
+- Use ONLY the evidence given below. Never invent a metric, count, query, or source that isn't listed.
+- Only mention a product from the list below. Never invent a product or suggest one that isn't listed.
+- Only claim a specific product connection (e.g. a rising query maps onto an existing product) if it's a genuine, recognisable match -- if nothing in the evidence maps cleanly onto a listed product, don't force one; fall back to whichever of the three action types the evidence actually supports.
+- Be specific and commercial, not generic marketing filler. No "own the moment" cliches, no exclamation points, no vague "leverage this opportunity" language.
+
+Theme: ${themeLabel}
+Action already decided (do not change or second-guess it): ${actionType}
+Independent sources corroborating this: ${distinctSourceCount}
+
+Rising related search queries:
+${risingList}
+
+Top related search queries:
+${topList}
+
+Regional search interest (0-100, this topic's own scale, not comparable to other topics):
+${regionList}
+
+Real social post examples matched to this theme:
+${socialList}
+
+SunRice's real current product range:
+${productList}
+
+Respond with ONLY the rationale paragraph. No preamble, no markdown, no quotes around it.`;
+}
+
+async function writeRationale(opportunity) {
+  const apiKey = process.env.ANTHROPIC_API_KEY;
+  if (!apiKey) return null;
+
+  try {
+    const res = await fetch(ANTHROPIC_API_BASE, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': apiKey,
+        'anthropic-version': '2023-06-01'
+      },
+      body: JSON.stringify({
+        model: MODEL,
+        max_tokens: 400,
+        messages: [{ role: 'user', content: buildPrompt(opportunity) }]
+      })
+    });
+    if (!res.ok) throw new Error(`Anthropic strategist call failed: ${res.status} ${await res.text()}`);
+
+    const data = await res.json();
+    const text = (data.content?.[0]?.text || '').trim();
+    // A suspiciously long or empty response is more likely a malformed
+    // answer than a real rationale -- fall back rather than show it.
+    if (!text || text.length > 1000) return null;
+    return text;
+  } catch (err) {
+    console.warn(`[llmStrategist] falling back to deterministic rationale: ${err.message}`);
+    return null;
+  }
+}
+
+module.exports = { writeRationale };

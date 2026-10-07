@@ -1,0 +1,67 @@
+envVarGroups:
+  - name: sunrice-radar-secrets
+    envVars:
+      - key: DATAFORSEO_LOGIN
+        sync: false
+      - key: DATAFORSEO_PASSWORD
+        sync: false
+      - key: DATAFORSEO_DAILY_COST_CEILING_USD
+        value: "5"
+      - key: APIFY_TOKEN
+        sync: false
+      - key: FEATURE_APIFY_REDDIT
+        value: "true"
+      - key: FEATURE_APIFY_TIKTOK
+        value: "true"
+      - key: FEATURE_APIFY_INSTAGRAM
+        value: "true"
+      - key: FEATURE_LOCAL_VISIBILITY
+        value: "false"
+      - key: FEATURE_DIGITAL_AVAILABILITY
+        value: "false"
+      - key: FEATURE_COMPETITOR_PULSE
+        value: "false"
+      - key: FEATURE_CUSTOMER_VOICE
+        value: "false"
+      - key: APIFY_REDDIT_SUBREDDITS
+        value: MealPrepSunday,EatCheapAndHealthy,AskCulinary,budgetfood,AskAnAustralian
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: ADMIN_TOKEN
+        generateValue: true
+
+services:
+  - type: web
+    name: sunrice-radar-dashboard
+    runtime: node
+    plan: starter
+    buildCommand: npm install
+    startCommand: node src/server.js
+    envVars:
+      - fromGroup: sunrice-radar-secrets
+      - key: DATABASE_URL
+        fromDatabase:
+          name: sunrice-radar-db
+          property: connectionString
+
+  - type: cron
+    name: sunrice-radar-ingest
+    runtime: node
+    plan: starter
+    # 20:00 UTC = 6am AEST (Melbourne, UTC+10) / 7am AEDT. Adjust by an hour
+    # at each daylight-saving change -- Render cron is UTC-only.
+    schedule: "0 20 * * *"
+    buildCommand: npm install
+    startCommand: node src/ingest.js
+    envVars:
+      - fromGroup: sunrice-radar-secrets
+      - key: DATABASE_URL
+        fromDatabase:
+          name: sunrice-radar-db
+          property: connectionString
+
+databases:
+  - name: sunrice-radar-db
+    plan: basic-1gb
+    databaseName: sunrice_radar
+    user: sunrice_radar

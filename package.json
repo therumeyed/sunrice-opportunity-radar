@@ -1,0 +1,20 @@
+{
+  "name": "sunrice-opportunity-radar",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Daily opportunity dashboard for SunRice: search demand, social trends and evidence-backed recommendations.",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node src/server.js",
+    "ingest": "node src/ingest.js",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "fast-xml-parser": "^4.5.0",
+    "pg": "^8.12.0"
+  }
+}
