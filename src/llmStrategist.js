@@ -16,6 +16,12 @@ const ANTHROPIC_API_BASE = 'https://api.anthropic.com/v1/messages';
 const MODEL = process.env.ANTHROPIC_MODEL || 'claude-haiku-4-5-20251001';
 const { PRODUCTS } = require('./products');
 
+// Catches a fabricated absolute search-volume count: a k/K-suffixed number
+// (e.g. "103k") or a comma-grouped 4+ digit number (e.g. "600,000"). Our real
+// evidence never contains either shape -- DataForSEO Trends only supplies a
+// 0-100 relative index -- so a match here means the model invented a stat.
+const FABRICATED_VOLUME_PATTERN = /\b\d+(?:\.\d+)?\s*[kK]\b|\b\d{1,3}(?:,\d{3})+\b/;
+
 function buildPrompt({ themeLabel, actionType, distinctSourceCount, risingQueries, topQueries, interestByRegion, socialExamples }) {
   const productList = PRODUCTS.map((p) => `- ${p.name}${p.sizes ? ` (${p.sizes})` : ''}`).join('\n');
   const risingList = risingQueries.length > 0
@@ -41,6 +47,7 @@ Hard rules -- breaking any of these makes your answer useless:
 - Only mention a product from the list below. Never invent a product or suggest one that isn't listed.
 - Only claim a specific product connection (e.g. a rising query maps onto an existing product) if it's a genuine, recognisable match -- if nothing in the evidence maps cleanly onto a listed product, don't force one; fall back to whichever of the three action types the evidence actually supports.
 - Be specific and commercial, not generic marketing filler. No "own the moment" cliches, no exclamation points, no vague "leverage this opportunity" language.
+- CRITICAL: the search numbers given below are a relative interest index (0-100, that topic's own scale) and a source count, NEVER absolute search volumes. You do not have real search volume data. Never state or imply an absolute number of searches, monthly volume, or count of people searching (e.g. "103k searches", "600,000 monthly searches") -- that number does not exist in the evidence and inventing one is the one thing that will get this rejected outright. If you want to describe strength of demand, use the actual 0-100 index value or plain words like "strong, sustained interest" -- never a fabricated count.
 
 Theme: ${themeLabel}
 Action already decided (do not change or second-guess it): ${actionType}
@@ -89,6 +96,15 @@ async function writeRationale(opportunity) {
     // A suspiciously long or empty response is more likely a malformed
     // answer than a real rationale -- fall back rather than show it.
     if (!text || text.length > 1000) return null;
+    // Safety net, not just a prompt instruction: our evidence never contains
+    // an absolute search-volume number (DataForSEO Trends only gives a 0-100
+    // relative index), so any k/K-suffixed count or comma-grouped 4+ digit
+    // number in the output is a fabricated statistic -- reject outright
+    // rather than show an invented metric on the dashboard.
+    if (FABRICATED_VOLUME_PATTERN.test(text)) {
+      console.warn(`[llmStrategist] falling back to deterministic rationale: response contained a fabricated absolute number`);
+      return null;
+    }
     return text;
   } catch (err) {
     console.warn(`[llmStrategist] falling back to deterministic rationale: ${err.message}`);
