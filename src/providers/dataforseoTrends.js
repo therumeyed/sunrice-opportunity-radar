@@ -55,6 +55,28 @@ async function submitTask(keyword) {
 const PENDING_STATUS_CODES = new Set([40601, 40602]);
 const TERMINAL_ERROR_CODES = new Set([40001, 40002, 40003, 40004, 40100, 40501]);
 
+// DataForSEO's own docs describe google_trends_queries_list's `top` and
+// `rising` values as a relative popularity/growth score -- their own example
+// response shows values like 100, 87, 58, 120, nothing close to four or
+// five figures. Production has returned six-figure numbers for this same
+// field (e.g. 489700) that look like absolute search volume, not a relative
+// score -- that doesn't match DataForSEO's documented contract for this
+// endpoint, so rather than trust an unverified number for scoring or show
+// it as if it means something, the query text is kept as a real signal and
+// the suspect number is dropped. Generous ceiling (well beyond any
+// documented example, including "Breakout"-style spikes) so a genuine
+// strong-growth value never gets dropped by mistake.
+const MAX_PLAUSIBLE_QUERY_VALUE = 1000;
+function sanitizeQueryValue(raw, query, keyword) {
+  const value = typeof raw === 'number' ? raw : (typeof raw === 'string' && raw.trim() !== '' && !Number.isNaN(Number(raw)) ? Number(raw) : null);
+  if (value == null) return null;
+  if (value < 0 || value > MAX_PLAUSIBLE_QUERY_VALUE) {
+    console.warn(`[dataforseo] "${keyword}": related query "${query}" returned an out-of-range value (${raw}) -- DataForSEO documents this field as a relative popularity/growth score, not an absolute count. Dropping the number, keeping the query text.`);
+    return null;
+  }
+  return value;
+}
+
 async function pollTask(taskId, { pollMs = 4000, initialDelayMs = 5000, maxWaitMs = 120000 } = {}) {
   const deadline = Date.now() + maxWaitMs;
   await new Promise((r) => setTimeout(r, initialDelayMs)); // give the engine a moment to actually start
@@ -104,8 +126,8 @@ function parseResult(task, keyword) {
   const topRaw = queriesList?.top_queries || queriesList?.top || queriesList?.data?.top || [];
   const risingRaw = queriesList?.rising_queries || queriesList?.rising || queriesList?.data?.rising || [];
   const relatedQueries = {
-    top: topRaw.map((q) => ({ query: q.query || q.keyword, value: q.value ?? q.formatted_value })),
-    rising: risingRaw.map((q) => ({ query: q.query || q.keyword, value: q.value ?? q.formatted_value }))
+    top: topRaw.map((q) => ({ query: q.query || q.keyword, value: sanitizeQueryValue(q.value ?? q.formatted_value, q.query || q.keyword, keyword) })),
+    rising: risingRaw.map((q) => ({ query: q.query || q.keyword, value: sanitizeQueryValue(q.value ?? q.formatted_value, q.query || q.keyword, keyword) }))
   };
 
   // Confirmed via DataForSEO's own dashboard that rising/top queries exist
@@ -146,4 +168,4 @@ async function explore(keyword) {
   }
 }
 
-module.exports = { explore, isConfigured, AUSTRALIA_LOCATION_CODE };
+module.exports = { explore, isConfigured, AUSTRALIA_LOCATION_CODE, sanitizeQueryValue };

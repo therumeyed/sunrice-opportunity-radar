@@ -27,10 +27,12 @@ function suggestedChannelFor(socialTotal, hasSearch) {
 
 // Simple, documented month-based seasonal weighting -- not a forecast,
 // just a deterministic tiebreaker component. getMonth() is 0-indexed
-// (0 = January). `seasonal` itself stays flat: its queries span occasions
-// with shifting or non-Gregorian dates (Lunar New Year, Diwali, Ramadan) --
-// pretending to know precisely when each one falls this year would be
-// exactly the kind of invented precision the data rule exists to prevent.
+// (0 = January). `seasonal` and `multicultural` both stay flat: occasions
+// with shifting or non-Gregorian dates (Lunar New Year, Diwali, Ramadan,
+// under `multicultural`) and fixed-date ones (Christmas, Australia Day,
+// under `seasonal`) are mixed in across these themes, and pretending to
+// know precisely when each one falls this year would be exactly the kind
+// of invented precision the data rule exists to prevent.
 function seasonalFit(theme, date = new Date()) {
   const month = date.getMonth();
   const isSchoolTerm = month !== 0; // roughly: not January

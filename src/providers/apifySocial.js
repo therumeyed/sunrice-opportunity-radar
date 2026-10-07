@@ -1,6 +1,13 @@
 const { runActor } = require('../apifyClient');
-const { themeForQuery } = require('../topics');
+const { themeForQuery, excludeForQuery } = require('../topics');
 const { matchesAny } = require('../util/textMatch');
+
+// A matched query can be ambiguous on its own (e.g. "curry" also means
+// Steph/Stephen/Seth/Dell Curry, NBA) -- reject a hit whose text also trips
+// that query's own exclude list rather than count it as real evidence.
+function isGenuineMatch(text, query) {
+  return matchesAny(text, [query]) && !matchesAny(text, excludeForQuery(query));
+}
 
 function subreddits() {
   return (process.env.APIFY_REDDIT_SUBREDDITS || 'MealPrepSunday,EatCheapAndHealthy,AskCulinary,budgetfood,AskAnAustralian')
@@ -44,7 +51,7 @@ async function searchReddit(topicQueries, sinceDate) {
       .filter((d) => !d.createdAt || new Date(d.createdAt) >= sinceDate)
       .flatMap((d) => {
         const text = `${d.title || ''} ${d.body || ''}`;
-        const hitQuery = topicQueries.find((q) => matchesAny(text, [q]));
+        const hitQuery = topicQueries.find((q) => isGenuineMatch(text, q));
         if (!hitQuery) return [];
         return [{
           platform: 'reddit',
@@ -89,9 +96,9 @@ async function searchTikTok(topicQueries, sinceDate) {
       .filter((d) => !d.createTimeISO || new Date(d.createTimeISO) >= sinceDate)
       .flatMap((d) => {
         const text = `${d.text || ''} ${(d.hashtags || []).map((h) => h.name).join(' ')}`;
-        const hitQuery = d.searchQuery && searchQueries.includes(d.searchQuery)
+        const hitQuery = d.searchQuery && searchQueries.includes(d.searchQuery) && isGenuineMatch(text, d.searchQuery)
           ? d.searchQuery
-          : searchQueries.find((q) => matchesAny(text, [q]));
+          : searchQueries.find((q) => isGenuineMatch(text, q));
         if (!hitQuery) return [];
         return [{
           platform: 'tiktok',
@@ -136,7 +143,11 @@ async function searchInstagram(topicQueries, sinceDate) {
       .filter((d) => !d.publishedAt || new Date(d.publishedAt) >= sinceDate)
       .flatMap((d) => {
         const matchedHashtag = hashtags.find((h) => (d.hashtags || []).some((x) => String(x).toLowerCase() === h.toLowerCase()));
-        const hitQuery = topicQueries[hashtags.indexOf(matchedHashtag)] || topicQueries.find((q) => slugifyHashtag(q) === matchedHashtag) || null;
+        const candidateQuery = topicQueries[hashtags.indexOf(matchedHashtag)] || topicQueries.find((q) => slugifyHashtag(q) === matchedHashtag) || null;
+        // Hashtag match alone isn't enough for an ambiguous query (e.g.
+        // #curry tagged on an NBA post) -- also check the caption text.
+        const hitQuery = candidateQuery && !matchesAny(d.caption || '', excludeForQuery(candidateQuery)) ? candidateQuery : null;
+        if (!hitQuery) return [];
         return [{
           platform: 'instagram',
           externalId: d.postId || d.url,
@@ -157,4 +168,4 @@ async function searchInstagram(topicQueries, sinceDate) {
   }
 }
 
-module.exports = { searchReddit, searchTikTok, searchInstagram };
+module.exports = { searchReddit, searchTikTok, searchInstagram, isGenuineMatch };

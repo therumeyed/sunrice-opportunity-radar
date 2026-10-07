@@ -90,19 +90,25 @@ Default actors (overridable, see `.env.example`):
 night, healthy eating, lunchbox & snacks, sushi & Asian cooking, seasonal
 occasions -- chosen from SunRice's own real product categories (Everyday
 Rice, Healthy Rice Blends, Microwave Rice, Rice Snacks) and the cuisine
-categories their own site organizes recipe content around. **Multicultural
-discovery** deliberately has no fixed queries: rice is a staple across far
-more cuisines than the named themes cover, so this surfaces whatever
-related queries come up on their own rather than hard-coding assumptions.
-Anything from that theme is hard-locked to `early_signal` confidence and
-the `Investigate` action -- it can never auto-promote to a `Create`
-recommendation. That's enforced in `src/scoring.js` / `src/reportBuilder.js`,
-not just documented.
+categories their own site organizes recipe content around. **Seasonal
+occasions** is fixed-date, mainstream-Australian only (Christmas,
+Australia Day) -- a shifting or non-Gregorian occasion never belongs
+there, because that theme can auto-promote straight to a `Create`
+recommendation. **Multicultural discovery** is where Lunar New Year,
+Diwali and Ramadan live instead: real, recurring, worth tracking, but
+culturally-specific and date-shifting, so every hit from this theme is
+hard-locked to `early_signal` confidence and the `Investigate` action --
+it can never auto-promote to `Create`. That's enforced in `src/scoring.js`
+/ `src/reportBuilder.js`, not just documented.
 
 Queries are deliberately short/broad (single words or short phrases) rather
 than long compound phrases -- Google Trends' related-queries feature
 returns much thinner data for a specific 3-4 word phrase than for the
-broad word it's built from.
+broad word it's built from. The tradeoff: a short word can be ambiguous on
+social (`curry` also means Steph/Stephen/Seth/Dell Curry, NBA) -- a topic
+can carry an `exclude` list (see `curry_night`) and
+`src/providers/apifySocial.js`'s `isGenuineMatch` rejects a hit whose text
+also trips it, rather than trust a bare substring match on its own.
 
 ## 4. Recommendation scoring
 
