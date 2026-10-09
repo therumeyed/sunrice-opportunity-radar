@@ -95,6 +95,18 @@ async function searchPinterest(topicQueries, sinceDate) {
           rawPayload: { ...d, apifyRunId: runId, apifyDatasetId: datasetId }
         }];
       });
+
+    // The field names above (term/trendType/rank/scrapedAt/etc.) are taken
+    // from this actor's published README, not a live response we've
+    // verified -- the same kind of unverified-until-seen-in-production gap
+    // that turned out wrong for a different provider on this exact project.
+    // Zero matches from a non-empty result set is more likely a field-name
+    // mismatch than genuinely nothing relevant, so this logs the actual
+    // shape once rather than silently returning nothing forever.
+    if ((items || []).length > 0 && matched.length === 0) {
+      console.warn(`[pinterestTrends] got ${items.length} row(s) back but matched 0 topic queries -- check the raw shape below against topics.js's queries, this may be a field-name mismatch, not a genuine lack of overlap.`);
+      console.warn(`[pinterestTrends] first row raw (first 1000 chars): ${JSON.stringify(items[0]).slice(0, 1000)}`);
+    }
     return { status: 'live', items: matched };
   } catch (err) {
     return { status: 'failed', items: [], error: err.message };
