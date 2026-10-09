@@ -107,6 +107,14 @@ async function initSchema() {
       created_at TIMESTAMPTZ NOT NULL DEFAULT now()
     );
     CREATE INDEX IF NOT EXISTS idx_recommendations_report ON recommendations(report_id);
+    -- Additive migration: CREATE TABLE IF NOT EXISTS above is a no-op against
+    -- an already-existing production table, so a new column needs its own
+    -- statement. Deterministic, computed in reportBuilder.js (never by the
+    -- LLM) -- which named trend sources (google_trends, pinterest) show this
+    -- recommendation's theme as independently rising/growing right now, by
+    -- that source's own definition of rising/growing. Null/empty is normal
+    -- and means neither source showed it, not that something failed.
+    ALTER TABLE recommendations ADD COLUMN IF NOT EXISTS momentum_sources JSONB;
 
     CREATE TABLE IF NOT EXISTS recommendation_evidence (
       id SERIAL PRIMARY KEY,
@@ -290,12 +298,13 @@ async function insertSignal(reportId, signal) {
 async function insertRecommendation(reportId, rec) {
   const res = await pool.query(
     `INSERT INTO recommendations (report_id, rank, action_type, theme, title, rationale, audience, state,
-                                   suggested_channel, freshness, confidence, score, score_components)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING *`,
+                                   suggested_channel, freshness, confidence, score, score_components, momentum_sources)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) RETURNING *`,
     [
       reportId, rec.rank, rec.actionType, rec.theme || null, rec.title, rec.rationale, rec.audience || null,
       rec.state || 'National', rec.suggestedChannel || null, rec.freshness || null,
-      rec.confidence, rec.score, JSON.stringify(rec.scoreComponents)
+      rec.confidence, rec.score, JSON.stringify(rec.scoreComponents),
+      rec.momentumSources && rec.momentumSources.length > 0 ? JSON.stringify(rec.momentumSources) : null
     ]
   );
   return res.rows[0];

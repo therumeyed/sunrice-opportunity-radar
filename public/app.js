@@ -107,6 +107,16 @@
     renderSocialSignals(bundle.signals.filter((s) => s.signalType === 'social_topic'));
   }
 
+  // Deterministic cross-source corroboration, not an LLM claim -- computed
+  // in reportBuilder.js from each source's own rising/growing definition.
+  const MOMENTUM_LABELS = { google_trends: 'Google Trends', pinterest: 'Pinterest' };
+  function momentumBadge(sources) {
+    if (!sources || sources.length === 0) return '';
+    const label = sources.map((s) => MOMENTUM_LABELS[s] || s).join(' + ');
+    const word = sources.length > 1 ? 'Rising across' : 'Rising on';
+    return `<span class="bd-source-tag" style="display:inline-block;margin-bottom:8px;">${word} ${escapeHtml(label)}</span>`;
+  }
+
   function renderPriorities(recommendations) {
     const el = qs('#bd-priorities');
     if (recommendations.length === 0) {
@@ -117,6 +127,7 @@
       <article class="bd-priority">
         <div class="bd-priority-no">0${i + 1} · ${r.actionType.toUpperCase()}</div>
         <h3>${escapeHtml(r.title)}</h3>
+        ${momentumBadge(r.momentumSources)}
         <p>${escapeHtml(r.rationale)}</p>
         <div class="bd-priority-meta">
           <span class="bd-pill">${escapeHtml(r.state || 'National')} · ${escapeHtml(r.audience || 'General')} · ${escapeHtml(r.confidence.replace('_', ' '))}</span>

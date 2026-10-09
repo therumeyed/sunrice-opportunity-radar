@@ -141,7 +141,8 @@ async function buildReport(reportId, reportDate) {
     const socialItemsByPlatform = {
       reddit: items.filter((i) => i.source_type === 'apify_reddit' && i.theme === theme),
       tiktok: items.filter((i) => i.source_type === 'apify_tiktok' && i.theme === theme),
-      instagram: items.filter((i) => i.source_type === 'apify_instagram' && i.theme === theme)
+      instagram: items.filter((i) => i.source_type === 'apify_instagram' && i.theme === theme),
+      pinterest: items.filter((i) => i.source_type === 'apify_pinterest' && i.theme === theme)
     };
     const newsItems = items.filter((i) => i.source_type === 'google_news' && i.theme === theme);
 
@@ -203,6 +204,24 @@ async function buildReport(reportId, reportDate) {
     }
     const velocityPct = searchVelocity ?? (socialVelocity === -Infinity ? null : socialVelocity);
 
+    // Deterministic, named "it's rising/growing right now" flag per source --
+    // by that source's OWN definition of rising/growing, never a magnitude we
+    // can't verify (Pinterest's change/count fields have no documented
+    // scale, see pinterestTrends.js). Google Trends: at least one rising
+    // query survived sanitizeQueryValue's out-of-range check. Pinterest: at
+    // least one matched item is classified trendType 'growing'. This is what
+    // actually answers "is this growing massively, and does more than one
+    // independent source agree" -- the agreement score already rewards
+    // having more distinct sources, but doesn't say which ones are the ones
+    // actively calling this a rising trend right now.
+    const momentumSources = [];
+    if ((searchItems[0]?.normalized_metrics?.relatedQueries?.rising || []).some((q) => q.value != null)) {
+      momentumSources.push('google_trends');
+    }
+    if (socialItemsByPlatform.pinterest.some((i) => i.raw_metrics?.trendType === 'growing')) {
+      momentumSources.push('pinterest');
+    }
+
     const forceEarlySignal = REQUIRES_REVIEW.has(theme);
     const { score, components } = scoreOpportunity({
       daysOld,
@@ -219,6 +238,7 @@ async function buildReport(reportId, reportDate) {
       distinctSourceCount: distinctSourceTypes.size,
       confidence: confidenceFor(score, distinctSourceTypes.size, forceEarlySignal),
       actionType: actionTypeFor(score, forceEarlySignal),
+      momentumSources,
       evidenceItems: allThemeItems.sort((a, b) => new Date(b.collected_at) - new Date(a.collected_at)),
       socialCounts: Object.fromEntries(Object.entries(socialItemsByPlatform).map(([k, v]) => [k, v.length])),
       hasSearch: searchItems.length > 0,
@@ -263,7 +283,8 @@ async function buildReport(reportId, reportDate) {
           risingQueries: opp.risingQueries,
           topQueries: opp.topQueries,
           interestByRegion: opp.interestByRegion,
-          socialExamples: opp.socialExamples
+          socialExamples: opp.socialExamples,
+          momentumSources: opp.momentumSources
         })) || deterministicRationale;
 
     const titleByAction = {
@@ -281,6 +302,7 @@ async function buildReport(reportId, reportDate) {
       audience: THEME_AUDIENCE[opp.theme] || 'general',
       state: 'National',
       suggestedChannel: suggestedChannelFor(socialTotal, opp.hasSearch),
+      momentumSources: opp.momentumSources,
       freshness: opp.evidenceItems[0]?.collected_at ? `Collected ${new Date(opp.evidenceItems[0].collected_at).toISOString().slice(0, 10)}` : null,
       confidence: opp.confidence,
       score: opp.score,

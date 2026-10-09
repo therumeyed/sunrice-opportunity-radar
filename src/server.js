@@ -66,6 +66,7 @@ function serializeBundle(bundle) {
       confidence: r.confidence,
       score: Number(r.score),
       scoreComponents: r.score_components,
+      momentumSources: r.momentum_sources || [],
       evidence: r.evidence.map((e) => ({
         id: e.id,
         note: e.note,

@@ -9,7 +9,7 @@ range and content themes.
 ## What's live in this v1
 
 - **Search demand** -- DataForSEO Google Trends, one keyword at a time, Australia-wide with a state breakdown.
-- **Social trends** -- Reddit, TikTok and Instagram via Apify, each independently feature-flagged.
+- **Social trends** -- Reddit, TikTok, Instagram and Pinterest Trends via Apify, each independently feature-flagged.
 - **Google News RSS** -- free, no API key, feeds evidence and rationale (no separate News panel; it's not a source_type with its own signal, just extra corroborating evidence).
 - **Today screen** -- top 3 evidence-backed recommendations, evidence drawer, History (by-date report browsing), filters (theme/audience/state) persisted in the URL.
 - **Deterministic scoring** -- freshness 25% / velocity 25% / cross-source agreement 20% / relevance 20% / seasonal fit 10%. No LLM touches the numbers; only the score components decide what gets shown, in what order, with what confidence.
@@ -72,17 +72,18 @@ tasks once the day's spend hits it and falls back to the last successful
 (`cached`) pull for the remaining topics instead.
 
 **Apify** (apify.com) -- Settings → Integrations → API token → `APIFY_TOKEN`.
-One token covers all three actors below. Each source is independently
+One token covers all four actors below. Each source is independently
 switchable via `FEATURE_APIFY_REDDIT` / `FEATURE_APIFY_TIKTOK` /
-`FEATURE_APIFY_INSTAGRAM` (all default `true`) -- turn one off without
-touching code if it turns out unreliable or too expensive. Expect
-TikTok/Instagram in particular to have off days; that's the flakiest part
-of this whole pipeline and always will be.
+`FEATURE_APIFY_INSTAGRAM` / `FEATURE_APIFY_PINTEREST` (all default `true`) --
+turn one off without touching code if it turns out unreliable or too
+expensive. Expect TikTok/Instagram in particular to have off days; that's
+the flakiest part of this whole pipeline and always will be.
 
 Default actors (overridable, see `.env.example`):
 - Reddit: `trudax/reddit-scraper-lite`, scoped to `APIFY_REDDIT_SUBREDDITS` (comma-separated, no `r/`) -- defaults to cooking-focused communities (MealPrepSunday, EatCheapAndHealthy, AskCulinary, budgetfood, AskAnAustralian).
 - TikTok: `clockworks/tiktok-scraper`, searched against the active topic library's queries (or `APIFY_TIKTOK_SEARCH_TERMS` to override).
 - Instagram: `instaprism/instagram-hashtag-posts` -- hashtag search is the closest thing to free-text search Instagram allows, so this only catches posts tagged with a topic-derived hashtag, not every relevant post.
+- Pinterest Trends: `automation-lab/pinterest-trends-scraper` (see section 3a below).
 
 ## 3. Topic library
 
@@ -130,6 +131,46 @@ regardless of score -- it's designed to surface this kind of early,
 unverified signal for a human to judge, not to assert it's worth acting on
 today.
 
+## 3a. Pinterest Trends -- a second, independent trend source
+
+`src/providers/pinterestTrends.js` pulls Pinterest's own trending-term lists
+(growing / top-monthly / seasonal) via Apify's
+`automation-lab/pinterest-trends-scraper`, matched locally against the same
+topic library as every other source (same `exclude`/`isGenuineMatch`
+guard, so an ambiguous term like `curry` gets the same NBA-collision
+protection here as on Reddit/TikTok/Instagram).
+
+Two things worth knowing before trusting it blindly:
+- **Australia+NZ, not Australia-only.** This actor only offers Australia
+  bundled with New Zealand ("AU+NZ") -- there's no standalone AU option.
+  Every other source here is Australia-only; this one isn't, and the
+  evidence drawer's source name says so (`Pinterest Trends (via Apify,
+  AU+NZ)`) rather than silently treating it as equivalent.
+- **Most of its numeric fields have no documented meaning.** The actor's
+  own README confirms `term`, `trendType` and `rank` but doesn't state
+  units for `weeklyChange`/`monthlyChange`/`yearlyChange`/`normalizedCount`/
+  `searchCount` -- no percentage, no 0-100 scale, nothing. That's exactly
+  the kind of gap that bit this project once already with DataForSEO's
+  query values turning out not to match their own documented scale in
+  production. So here: those fields are kept in `rawMetrics` for audit/
+  evidence only, and never surfaced as a headline stat or handed to the
+  LLM strategist as if their magnitude were known. Only `trendType`
+  (growing/top_monthly/seasonal) and `rank` -- both unambiguous -- drive
+  anything. Velocity for this source still comes from a real, verifiable
+  number: a week-over-week count of how many matched trend rows showed up,
+  the same count-based mechanism already used for Reddit/TikTok/Instagram.
+
+**Cross-source momentum callout.** When the same theme is independently
+flagged as rising by more than one source -- Google Trends showing a real
+(sanitized) rising related query, Pinterest classifying a matched term as
+`growing` -- that's genuinely strong corroboration, not a coincidence.
+`reportBuilder.js` computes this deterministically per recommendation
+(`momentumSources`, stored in `recommendations.momentum_sources`) and it
+shows up two ways: a small badge on the Today card ("Rising on Google
+Trends + Pinterest"), and as an explicit, factual input to the LLM
+strategist so the written rationale can name it too -- never with an
+invented number attached, only the fact that it's independently confirmed.
+
 ## 4. Recommendation scoring
 
 `src/scoring.js` -- five weighted components (see weights above), each a
@@ -154,8 +195,10 @@ which 3 opportunities win stay 100% deterministic and auditable.
 
 `src/llmStrategist.js` writes the rationale sentence for each of the top 3
 recommendations, reading the same real evidence the score was computed
-from -- rising/top queries, regional interest, and a few matched social
-post excerpts -- plus SunRice's real product range (`src/products.js`, 66
+from -- rising/top queries, regional interest, matched social/Pinterest
+post excerpts, and which sources independently flag this theme as
+rising/growing right now (`momentumSources`, see section 3a) -- plus
+SunRice's real product range (`src/products.js`, 66
 products, confirmed directly against the live "Showing 66 Products" count
 on sunrice.com.au -- the site is JS-rendered and couldn't be scraped
 automatically, so the client pasted the actual rendered product grid).

@@ -4,6 +4,7 @@ const { ALL_TOPICS, allQueries } = require('./topics');
 const dataforseoTrends = require('./providers/dataforseoTrends');
 const googleNewsRss = require('./providers/googleNewsRss');
 const apifySocial = require('./providers/apifySocial');
+const pinterestTrends = require('./providers/pinterestTrends');
 const { buildReport } = require('./reportBuilder');
 const { contentHash } = require('./util/hash');
 
@@ -142,7 +143,14 @@ async function collectSocial(report, reportDate, sinceDate) {
   const platforms = [
     { key: 'reddit', sourceType: 'apify_reddit', sourceName: 'Reddit (via Apify)', fn: apifySocial.searchReddit },
     { key: 'tiktok', sourceType: 'apify_tiktok', sourceName: 'TikTok (via Apify)', fn: apifySocial.searchTikTok },
-    { key: 'instagram', sourceType: 'apify_instagram', sourceName: 'Instagram (via Apify)', fn: apifySocial.searchInstagram }
+    { key: 'instagram', sourceType: 'apify_instagram', sourceName: 'Instagram (via Apify)', fn: apifySocial.searchInstagram },
+    // Not a social post source like the three above -- Pinterest's own
+    // trend-list classification (growing/top monthly/seasonal), scoped to
+    // Australia+NZ (no standalone AU option for this actor). Same
+    // search(topicQueries, sinceDate) -> { status, items } shape, so it
+    // slots into this loop and every downstream signal/scoring/evidence
+    // path generically, with no special-casing needed.
+    { key: 'pinterest', sourceType: 'apify_pinterest', sourceName: 'Pinterest Trends (via Apify, AU+NZ)', fn: pinterestTrends.searchPinterest }
   ];
   const summary = {};
 

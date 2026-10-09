@@ -109,6 +109,72 @@ describe('report generation from fixture evidence (DB-backed)', { skip }, () => 
     assert.equal(second.signals.length, first.signals.length, 'a same-day re-run must replace, not accumulate, signals');
   });
 
+  test('momentum_sources names each source that independently flags the theme as rising/growing right now', async () => {
+    const report = await db.getOrCreateReport(TODAY);
+    const trendsRun = await db.recordProviderRun(report.id, {
+      providerName: 'DataForSEO', sourceType: 'dataforseo_trends', status: 'live'
+    });
+    await db.upsertSourceItem({
+      providerRunId: trendsRun.id,
+      sourceType: 'dataforseo_trends',
+      sourceName: 'DataForSEO',
+      contentHash: 'fixture-hash-momentum-trends',
+      title: 'cook rice',
+      queryOrTopic: 'cook rice',
+      theme: 'rice_basics',
+      normalizedMetrics: { relatedQueries: { rising: [{ query: 'rice cooker ratio', value: 85 }], top: [] } },
+      dataStatus: 'live'
+    });
+    const pinterestRun = await db.recordProviderRun(report.id, {
+      providerName: 'Pinterest Trends (via Apify, AU+NZ)', sourceType: 'apify_pinterest', status: 'live'
+    });
+    await db.upsertSourceItem({
+      providerRunId: pinterestRun.id,
+      sourceType: 'apify_pinterest',
+      sourceName: 'Pinterest Trends (via Apify, AU+NZ)',
+      sourceUrl: 'https://trends.pinterest.com/detail/?terms=cook+rice&country=AU',
+      externalId: 'cook rice:AU+NZ:growing:2026-01-01',
+      contentHash: 'fixture-hash-momentum-pinterest',
+      title: 'cook rice',
+      queryOrTopic: 'cook rice',
+      theme: 'rice_basics',
+      rawMetrics: { trendType: 'growing', rank: 2 },
+      dataStatus: 'live'
+    });
+
+    await buildReport(report.id, TODAY);
+    const bundle = await db.getReportBundle(report);
+    const rec = bundle.recommendations.find((r) => r.theme === 'rice_basics');
+    assert.ok(rec, 'expected a rice_basics recommendation to be built from this fixture evidence');
+    assert.deepEqual(rec.momentum_sources, ['google_trends', 'pinterest']);
+  });
+
+  test('momentum_sources is empty when no source currently flags the theme as rising/growing', async () => {
+    const report = await db.getOrCreateReport(TODAY);
+    const run = await db.recordProviderRun(report.id, {
+      providerName: 'Google News RSS', sourceType: 'google_news', status: 'live'
+    });
+    await db.upsertSourceItem({
+      providerRunId: run.id,
+      sourceType: 'google_news',
+      sourceName: 'Test Publication',
+      sourceUrl: 'https://example.com/no-momentum',
+      externalId: 'https://example.com/no-momentum',
+      contentHash: 'fixture-hash-no-momentum',
+      title: 'Lunchbox ideas for term 4',
+      queryOrTopic: 'lunchbox snacks',
+      theme: 'lunchbox_snacks',
+      publishedAt: new Date(),
+      dataStatus: 'live'
+    });
+
+    await buildReport(report.id, TODAY);
+    const bundle = await db.getReportBundle(report);
+    const rec = bundle.recommendations.find((r) => r.theme === 'lunchbox_snacks');
+    assert.ok(rec, 'expected a lunchbox_snacks recommendation to be built from this fixture evidence');
+    assert.ok(!rec.momentum_sources || rec.momentum_sources.length === 0);
+  });
+
   test('an imported/cached item is never surfaced with data_status live', async () => {
     const report = await db.getOrCreateReport(TODAY);
     const run = await db.recordProviderRun(report.id, {
