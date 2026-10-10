@@ -3,9 +3,11 @@ const express = require('express');
 const path = require('path');
 const { spawn } = require('child_process');
 const {
-  pool, initSchemaWithRetry, getReportByDate, getLatestReport, listReportDates, getReportBundle
+  pool, initSchemaWithRetry, getReportByDate, getLatestReport, listReportDates, getReportBundle,
+  tryAcquireIngestLock, releaseIngestLock
 } = require('./db');
 const { ALL_TOPICS } = require('./topics');
+const { peakingEligible } = require('./themeLifecycle');
 
 const app = express();
 app.use(express.static(path.join(__dirname, '..', 'public')));
@@ -17,6 +19,7 @@ const FEATURE_FLAGS = {
   customer_voice: process.env.FEATURE_CUSTOMER_VOICE === 'true'
 };
 
+const THEME_LABEL_BY_KEY = Object.fromEntries(ALL_TOPICS.map((t) => [t.theme, t.label]));
 const AUDIENCES = ['parents', 'families', 'home cooks', 'health-conscious', 'multicultural audiences', 'general'];
 const STATES = ['National', 'VIC', 'NSW', 'QLD', 'SA', 'WA', 'TAS', 'ACT', 'NT'];
 
@@ -32,16 +35,20 @@ function applyFilters(bundle, query) {
   const { theme, audience, state, lifecycle } = query;
   let recommendations = bundle.recommendations;
   let signals = bundle.signals;
+  let themeTrends = bundle.themeTrends;
 
   if (theme) {
     recommendations = recommendations.filter((r) => r.theme === theme);
     signals = signals.filter((s) => s.theme === theme);
+    themeTrends = themeTrends.filter((t) => t.theme === theme);
   }
   if (audience) recommendations = recommendations.filter((r) => r.audience === audience);
   if (state) recommendations = recommendations.filter((r) => r.state === state || r.state === 'National');
   if (lifecycle) signals = signals.filter((s) => s.lifecycle === lifecycle);
+  // audience/state deliberately never filter themeTrends -- it's national
+  // theme momentum, not truly calculated per audience/state.
 
-  return { ...bundle, recommendations, signals };
+  return { ...bundle, recommendations, signals, themeTrends };
 }
 
 function serializeBundle(bundle) {
@@ -67,6 +74,9 @@ function serializeBundle(bundle) {
       score: Number(r.score),
       scoreComponents: r.score_components,
       momentumSources: r.momentum_sources || [],
+      opportunityName: r.opportunity_name || r.title,
+      continuityStatus: r.continuity_status,
+      continuityMeta: r.continuity_meta,
       evidence: r.evidence.map((e) => ({
         id: e.id,
         note: e.note,
@@ -109,6 +119,18 @@ function serializeBundle(bundle) {
       cost: p.cost,
       error: p.error
     })),
+    // National theme momentum -- deliberately not filtered by audience/state,
+    // which aren't truly calculated at the theme level; the theme filter
+    // narrows it, nothing else does. peakingEligible says whether a
+    // "peaking" verdict is even possible yet, independent of whether
+    // today's pattern happens to match it -- the UI uses this to say
+    // "insufficient history" rather than implying a young theme was
+    // checked and simply isn't peaking.
+    themeTrends: (bundle.themeTrends || []).map((t) => ({
+      ...t,
+      label: THEME_LABEL_BY_KEY[t.theme] || t.theme,
+      peakingEligible: peakingEligible(t.observationCount)
+    })),
     featureFlags: FEATURE_FLAGS
   };
 }
@@ -149,7 +171,18 @@ app.get('/api/reports/:date', async (req, res) => {
 // polling in particular), far longer than a sane HTTP request should stay
 // open. The client re-polls /api/reports/latest afterwards rather than this
 // endpoint blocking until completion.
-app.post('/admin/refresh', requireAdmin, (req, res) => {
+app.post('/admin/refresh', requireAdmin, async (req, res) => {
+  // Best-effort immediate feedback only -- ingest.js's own lock-acquire at
+  // the top of run() is the real enforcement (this check-then-spawn has an
+  // unavoidable small race window). Peeking and immediately releasing
+  // rather than holding it: if nobody else holds it right now, don't block
+  // the real ingest from acquiring it a moment later.
+  const peek = await tryAcquireIngestLock();
+  if (!peek) {
+    return res.status(409).json({ ok: false, error: 'An ingest run is already in progress' });
+  }
+  await releaseIngestLock(peek);
+
   const child = spawn(process.execPath, [path.join(__dirname, 'ingest.js')], {
     detached: true,
     stdio: 'ignore',

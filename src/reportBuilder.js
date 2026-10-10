@@ -1,10 +1,25 @@
-const { pool, insertSignal, insertRecommendation, linkEvidence } = require('./db');
+const {
+  pool, insertSignal, insertRecommendation, linkEvidence,
+  upsertThemeSnapshot, getPriorThemeSnapshots, getRecentRecommendations, getSameDayRecommendations
+} = require('./db');
 const { ALL_TOPICS } = require('./topics');
 const { scoreOpportunity, confidenceFor, actionTypeFor } = require('./scoring');
 const { writeRationale } = require('./llmStrategist');
+const { themeLifecycleFor } = require('./themeLifecycle');
+const { computeActionFingerprint, determineContinuityStatus } = require('./continuity');
 
 const THEME_LABELS = Object.fromEntries(ALL_TOPICS.map((t) => [t.theme, t.label]));
 const REQUIRES_REVIEW = new Set(ALL_TOPICS.filter((t) => t.requiresReview).map((t) => t.theme));
+
+// Pinterest is trend/planning evidence, not a social post -- it contributes
+// to source agreement, momentum and creative context same as before, but
+// is never counted toward "N matching social posts" or used to trigger a
+// TikTok/Instagram channel recommendation. Both of those bugs were real:
+// a theme with Pinterest evidence alone (zero actual Reddit/TikTok/
+// Instagram posts) could previously still get suggestedChannelFor() to
+// recommend "Short-form video (TikTok/Instagram)" purely because Pinterest
+// padded socialTotal above zero.
+const REAL_SOCIAL_PLATFORMS = ['reddit', 'tiktok', 'instagram'];
 
 // Taxonomy, not evidence -- a fixed editorial mapping of theme to the
 // audience/filter values the brief's nav requires, decided once here rather
@@ -38,8 +53,8 @@ const THEME_RELEVANCE = {
   lunchbox_snacks: 0.7
 };
 
-function suggestedChannelFor(socialTotal, hasSearch) {
-  if (socialTotal > 0) return 'Short-form video (TikTok/Instagram)';
+function suggestedChannelFor(realSocialPostCount, hasSearch) {
+  if (realSocialPostCount > 0) return 'Short-form video (TikTok/Instagram)';
   if (hasSearch) return 'Recipe/blog content + SEO';
   return null;
 }
@@ -102,6 +117,12 @@ async function firstDetectedAt(items) {
   return new Date(Math.min(...dates.map((d) => d.getTime())));
 }
 
+// Per-platform lifecycle for the existing social panel ONLY -- a single
+// snapshot comparison (today's count vs. a 7-day trailing average), no
+// memory. Left exactly as it was; theme-level lifecycle (new/validating/
+// building/cooling/sustained/peaking, informed by real accumulated
+// history) is themeLifecycleFor() in themeLifecycle.js, a separate
+// function entirely. Conflating the two was explicitly the thing to avoid.
 function lifecycleFor(daysOld, velocityPct) {
   if (daysOld == null) return null;
   if (daysOld <= 2) return 'new';
@@ -111,24 +132,68 @@ function lifecycleFor(daysOld, velocityPct) {
   return 'sustained';
 }
 
+// Robust aggregation: the median of up to the 3 strongest verified rising-
+// query values (already range-checked by sanitizeQueryValue in
+// dataforseoTrends.js) rather than the single highest one. Math.max() let
+// one generous outlier single-handedly max out 25% of the score; the
+// median of the top 3 needs at least two consistent readings to move the
+// number nearly as far. 1 value -> that value; 2 values -> their average
+// (the natural median of a 2-element set) -- both sensible fallbacks when
+// there isn't enough data for a true 3-way median.
 function extractSearchVelocity(searchItem) {
   const rising = searchItem?.normalized_metrics?.relatedQueries?.rising || [];
   const nums = rising.map((r) => (typeof r.value === 'number' ? r.value : null)).filter((v) => v != null);
-  return nums.length > 0 ? Math.max(...nums) : null;
+  if (nums.length === 0) return null;
+  const topThree = [...nums].sort((a, b) => b - a).slice(0, 3);
+  const sorted = [...topThree].sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  return sorted.length % 2 === 0 ? (sorted[mid - 1] + sorted[mid]) / 2 : sorted[mid];
 }
 
-// Builds this report's signals + top recommendations from whatever real
-// evidence was actually collected in this run (getTodayItems). A theme with
-// zero collected items produces no signal and is never considered for a
-// recommendation -- there is no "pad to exactly 3" step; if fewer than 3
-// themes have real evidence, fewer than 3 recommendations are saved.
+// source_type + author, counting only items with a real author -- a
+// missing author is never treated as a distinct creator. Pinterest items
+// never carry an author (no creator concept for a trend-list entry), so
+// they contribute 0 here without needing a special case.
+function uniqueCreatorCount(items) {
+  const seen = new Set();
+  for (const item of items) {
+    if (item.author) seen.add(`${item.source_type}:${item.author}`);
+  }
+  return seen.size;
+}
+
+// Up to 5 real query strings (rising preferred, then top) -- evidence-
+// derived only, never invented, used for the Thematic trends card and for
+// theme_daily_snapshots.leading_queries.
+function leadingQueriesFor(searchItem) {
+  const rising = (searchItem?.normalized_metrics?.relatedQueries?.rising || []).map((q) => q.query);
+  const top = (searchItem?.normalized_metrics?.relatedQueries?.top || []).map((q) => q.query);
+  return [...rising, ...top].filter(Boolean).slice(0, 5);
+}
+
+// Builds this report's signals + theme snapshots + top recommendations from
+// whatever real evidence was actually collected in this run (getTodayItems).
+// A theme with zero collected items gets no signal, no snapshot, and is
+// never considered for a recommendation -- there is no "pad to exactly 3"
+// step; if fewer than 3 themes have real evidence, fewer than 3
+// recommendations are saved. Every theme WITH evidence gets a
+// theme_daily_snapshots row, not only the 3 that win a recommendation slot.
 async function buildReport(reportId, reportDate) {
+  // Captured BEFORE the same-day delete/rebuild below, so a manual Refresh
+  // fired twice in one day doesn't lose the context of what this same
+  // report already proposed earlier today -- see continuity.js.
+  const sameDayRecs = await getSameDayRecommendations(reportId);
+  const sameDayRecByTheme = new Map(sameDayRecs.filter((r) => r.theme).map((r) => [r.theme, r]));
+
   // A same-day re-run (a manual Refresh fired more than once before the
   // calendar day rolls over) must replace this report's derived
   // signals/recommendations, not pile more on top of them -- otherwise
   // "exactly 3 priorities" silently becomes 6, 9, 12... across repeated
   // runs. Raw evidence in source_items is untouched (it's deduped by
   // content_hash anyway); only the derived rows get cleared and rebuilt.
+  // theme_daily_snapshots is NOT cleared here -- it upserts on
+  // (report_id, theme) instead, because it's meant to accumulate across
+  // days, not be scoped to "this run" the way signals/recommendations are.
   await pool.query('DELETE FROM recommendations WHERE report_id = $1', [reportId]); // cascades recommendation_evidence
   await pool.query('DELETE FROM signals WHERE report_id = $1', [reportId]);
 
@@ -147,7 +212,7 @@ async function buildReport(reportId, reportDate) {
     const newsItems = items.filter((i) => i.source_type === 'google_news' && i.theme === theme);
 
     const allThemeItems = [...searchItems, ...Object.values(socialItemsByPlatform).flat(), ...newsItems];
-    if (allThemeItems.length === 0) continue; // no real evidence -- no opportunity, no signal
+    if (allThemeItems.length === 0) continue; // no real evidence -- no opportunity, no signal, no snapshot
 
     // --- Signals -----------------------------------------------------
     if (searchItems.length > 0) {
@@ -179,7 +244,10 @@ async function buildReport(reportId, reportDate) {
         platform,
         theme,
         metricSummary: {
+          // Pinterest trend rows aren't posts -- labelled distinctly so the
+          // UI never says "matching posts" for a trend-list entry.
           matchingPosts: platformItems.length,
+          itemLabel: platform === 'pinterest' ? 'matched trend term' : 'matching post',
           exampleUrl: platformItems[0].source_url,
           engagementSample: platformItems.slice(0, 3).map((i) => i.raw_metrics)
         },
@@ -209,11 +277,7 @@ async function buildReport(reportId, reportDate) {
     // can't verify (Pinterest's change/count fields have no documented
     // scale, see pinterestTrends.js). Google Trends: at least one rising
     // query survived sanitizeQueryValue's out-of-range check. Pinterest: at
-    // least one matched item is classified trendType 'growing'. This is what
-    // actually answers "is this growing massively, and does more than one
-    // independent source agree" -- the agreement score already rewards
-    // having more distinct sources, but doesn't say which ones are the ones
-    // actively calling this a rising trend right now.
+    // least one matched item is classified trendType 'growing'.
     const momentumSources = [];
     if ((searchItems[0]?.normalized_metrics?.relatedQueries?.rising || []).some((q) => q.value != null)) {
       momentumSources.push('google_trends');
@@ -221,6 +285,8 @@ async function buildReport(reportId, reportDate) {
     if (socialItemsByPlatform.pinterest.some((i) => i.raw_metrics?.trendType === 'growing')) {
       momentumSources.push('pinterest');
     }
+
+    const realSocialPostCount = REAL_SOCIAL_PLATFORMS.reduce((sum, p) => sum + socialItemsByPlatform[p].length, 0);
 
     const forceEarlySignal = REQUIRES_REVIEW.has(theme);
     const { score, components } = scoreOpportunity({
@@ -235,13 +301,18 @@ async function buildReport(reportId, reportDate) {
       theme,
       score,
       components,
+      velocityPct,
       distinctSourceCount: distinctSourceTypes.size,
+      sourceTypes: [...distinctSourceTypes],
       confidence: confidenceFor(score, distinctSourceTypes.size, forceEarlySignal),
       actionType: actionTypeFor(score, forceEarlySignal),
       momentumSources,
       evidenceItems: allThemeItems.sort((a, b) => new Date(b.collected_at) - new Date(a.collected_at)),
       socialCounts: Object.fromEntries(Object.entries(socialItemsByPlatform).map(([k, v]) => [k, v.length])),
+      realSocialPostCount,
+      uniqueCreatorCount: uniqueCreatorCount(allThemeItems),
       hasSearch: searchItems.length > 0,
+      leadingQueries: leadingQueriesFor(searchItems[0]),
       // Carried through for the LLM strategist step below -- real evidence
       // only, nothing derived or invented here.
       risingQueries: searchItems[0]?.normalized_metrics?.relatedQueries?.rising || [],
@@ -257,35 +328,101 @@ async function buildReport(reportId, reportDate) {
 
   opportunities.sort((a, b) => b.score - a.score);
   const top = opportunities.slice(0, 3);
+  const topThemes = new Set(top.map((o) => o.theme));
+
+  // --- Theme snapshots: every theme with evidence, not only the top 3 ----
+  // This is what makes lifecycle and the Thematic trends section possible
+  // at all -- signals/recommendations never kept this cross-day history.
+  for (const opp of opportunities) {
+    const priorSnapshots = await getPriorThemeSnapshots(opp.theme, reportDate, 30);
+    const lifecycle = themeLifecycleFor(priorSnapshots, opp.score, opp.velocityPct);
+    await upsertThemeSnapshot(reportId, reportDate, {
+      theme: opp.theme,
+      score: opp.score,
+      scoreComponents: opp.components,
+      velocityPct: opp.velocityPct,
+      distinctSourceCount: opp.distinctSourceCount,
+      sourceTypes: opp.sourceTypes,
+      momentumSources: opp.momentumSources,
+      socialCounts: opp.socialCounts,
+      uniqueCreatorCount: opp.uniqueCreatorCount,
+      hasSearch: opp.hasSearch,
+      leadingQueries: opp.leadingQueries,
+      lifecycle,
+      wasRecommended: topThemes.has(opp.theme)
+    });
+    opp.lifecycle = lifecycle;
+    opp.priorSnapshots = priorSnapshots;
+  }
 
   for (let i = 0; i < top.length; i++) {
     const opp = top[i];
     const label = THEME_LABELS[opp.theme];
-    const socialTotal = Object.values(opp.socialCounts).reduce((a, b) => a + b, 0);
     const parts = [];
     if (opp.hasSearch) parts.push('rising search interest');
-    if (socialTotal > 0) parts.push(`${socialTotal} matching social post${socialTotal === 1 ? '' : 's'}`);
+    if (opp.realSocialPostCount > 0) parts.push(`${opp.realSocialPostCount} matching social post${opp.realSocialPostCount === 1 ? '' : 's'}`);
     const isMulticulturalDisclaimer = opp.actionType === 'Investigate' && opp.theme === 'multicultural';
+
+    // --- Recommendation memory ------------------------------------------
+    const sameDayRec = sameDayRecByTheme.get(opp.theme) || null;
+    const recentRecs = await getRecentRecommendations(opp.theme, reportDate, 14, reportId);
+    const priorForScoreChange = opp.priorSnapshots[opp.priorSnapshots.length - 1];
+    const scoreChange = priorForScoreChange ? Math.round((opp.score - Number(priorForScoreChange.score)) * 10) / 10 : null;
+    const priorSourceTypes = new Set(priorForScoreChange?.source_types || []);
+    const newSources = opp.sourceTypes.filter((s) => !priorSourceTypes.has(s));
+    const lostSources = [...priorSourceTypes].filter((s) => !opp.sourceTypes.includes(s));
+    const daysActive = opp.priorSnapshots.length + 1;
+
     const deterministicRationale = isMulticulturalDisclaimer
       ? `A related query surfaced without a hard-coded assumption -- human review is required before this is used for audience targeting.`
-      : `${opp.distinctSourceCount} independent source${opp.distinctSourceCount === 1 ? '' : 's'} point to ${label.toLowerCase()} right now: ${parts.join(' and ') || 'early signal only'}.`;
+      : buildDeterministicFallback({ opp, label, parts, sameDayRec, recentRecs });
 
-    // The compliance disclaimer above is fixed wording, not something to
-    // let an LLM improvise on. Everywhere else, let it write a sharper
-    // rationale from the same real evidence -- falling back to the
-    // deterministic sentence on any failure, missing key, or bad response.
-    const rationale = isMulticulturalDisclaimer
-      ? deterministicRationale
-      : (await writeRationale({
-          themeLabel: label,
-          actionType: opp.actionType,
-          distinctSourceCount: opp.distinctSourceCount,
-          risingQueries: opp.risingQueries,
-          topQueries: opp.topQueries,
-          interestByRegion: opp.interestByRegion,
-          socialExamples: opp.socialExamples,
-          momentumSources: opp.momentumSources
-        })) || deterministicRationale;
+    let strategy = null;
+    if (!isMulticulturalDisclaimer) {
+      strategy = await writeRationale({
+        themeLabel: label,
+        actionType: opp.actionType,
+        distinctSourceCount: opp.distinctSourceCount,
+        risingQueries: opp.risingQueries,
+        topQueries: opp.topQueries,
+        interestByRegion: opp.interestByRegion,
+        socialExamples: opp.socialExamples,
+        momentumSources: opp.momentumSources,
+        recentRecs,
+        sameDayRec,
+        lifecycle: opp.lifecycle,
+        daysActive,
+        scoreChange,
+        newSources,
+        lostSources
+      });
+    }
+
+    const opportunityName = strategy?.opportunityName || label;
+    const rationale = strategy?.rationale || deterministicRationale;
+    // Null, not a degenerate hash of empty fields, whenever there's no real
+    // strategist output to fingerprint -- no ANTHROPIC_API_KEY, a failed
+    // call, or a validation rejection all mean there's no actual execution
+    // detail (products/channel/format/angle) to compare day to day, so
+    // asserting "repeat_action" from an all-empty fingerprint would be a
+    // specific claim this system can't actually back. determineContinuityStatus
+    // treats a null fingerprint as "fall back to the score trend only".
+    const actionFingerprint = strategy
+      ? computeActionFingerprint({
+          theme: opp.theme,
+          primaryProducts: strategy.primaryProducts,
+          channel: strategy.channel,
+          format: strategy.format,
+          creativeAngle: strategy.creativeAngle
+        })
+      : null;
+
+    // Deterministic, system-of-record continuity status -- never the
+    // LLM's own guess (strategy.continuityStatusGuess is kept in
+    // strategy_output for comparison/audit only).
+    const continuityStatus = isMulticulturalDisclaimer
+      ? null
+      : determineContinuityStatus({ recentRecs, sameDayRec, newFingerprint: actionFingerprint, todayScore: opp.score, reportDate });
 
     const titleByAction = {
       Create: `Own the "${label}" moment`,
@@ -298,11 +435,24 @@ async function buildReport(reportId, reportDate) {
       actionType: opp.actionType,
       theme: opp.theme,
       title: titleByAction[opp.actionType] || `${label} update`,
+      opportunityName,
       rationale,
       audience: THEME_AUDIENCE[opp.theme] || 'general',
       state: 'National',
-      suggestedChannel: suggestedChannelFor(socialTotal, opp.hasSearch),
+      suggestedChannel: strategy?.channel || suggestedChannelFor(opp.realSocialPostCount, opp.hasSearch),
       momentumSources: opp.momentumSources,
+      continuityStatus,
+      actionFingerprint,
+      continuityMeta: {
+        previousRecommendationDate: recentRecs[0] ? new Date(recentRecs[0].report_date).toISOString().slice(0, 10) : null,
+        appearances14d: recentRecs.length,
+        daysActive,
+        scoreChange,
+        newSources,
+        lostSources,
+        changeSincePrevious: strategy?.changeSincePrevious || null
+      },
+      strategyOutput: strategy?.raw || null,
       freshness: opp.evidenceItems[0]?.collected_at ? `Collected ${new Date(opp.evidenceItems[0].collected_at).toISOString().slice(0, 10)}` : null,
       confidence: opp.confidence,
       score: opp.score,
@@ -328,6 +478,24 @@ async function buildReport(reportId, reportDate) {
   }
 
   return { opportunitiesConsidered: opportunities.length, recommendationsCreated: top.length };
+}
+
+// Factual, structured fallback (brief section 13) -- used whenever the LLM
+// is unavailable/invalid, or as the base every opportunityName/rationale
+// falls back to. Never invents a creative execution; states what's known
+// and what changed, nothing more.
+function buildDeterministicFallback({ opp, label, parts, sameDayRec, recentRecs }) {
+  const whySources = `${opp.distinctSourceCount} independent source${opp.distinctSourceCount === 1 ? '' : 's'} point to ${label.toLowerCase()} right now: ${parts.join(' and ') || 'early signal only'}.`;
+  let continuityNote;
+  if (sameDayRec) {
+    continuityNote = 'Already surfaced earlier today -- review the existing evidence rather than treating this as a new idea.';
+  } else if (recentRecs.length > 0) {
+    const lastDate = new Date(recentRecs[0].report_date).toISOString().slice(0, 10);
+    continuityNote = `This theme was last recommended on ${lastDate} (${recentRecs.length} time${recentRecs.length === 1 ? '' : 's'} in the last 14 days) -- recommended again today on the strength of current evidence, not as a brand-new idea.`;
+  } else {
+    continuityNote = 'This is a new appearance for this theme in the last 14 days.';
+  }
+  return `${whySources} ${continuityNote} Evidence should be reviewed before committing to a specific creative execution.`;
 }
 
 function distinctCount(items) {

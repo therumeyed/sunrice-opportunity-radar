@@ -29,11 +29,11 @@ describe('report generation from fixture evidence (DB-backed)', { skip }, () => 
   });
 
   beforeEach(async () => {
-    await db.pool.query('TRUNCATE TABLE recommendation_evidence, recommendations, signals, source_items, provider_runs, reports RESTART IDENTITY CASCADE');
+    await db.pool.query('TRUNCATE TABLE recommendation_evidence, recommendations, signals, theme_daily_snapshots, source_items, provider_runs, reports RESTART IDENTITY CASCADE');
   });
 
   after(async () => {
-    await db.pool.query('TRUNCATE TABLE recommendation_evidence, recommendations, signals, source_items, provider_runs, reports RESTART IDENTITY CASCADE');
+    await db.pool.query('TRUNCATE TABLE recommendation_evidence, recommendations, signals, theme_daily_snapshots, source_items, provider_runs, reports RESTART IDENTITY CASCADE');
     await db.pool.end();
   });
 
@@ -173,6 +173,86 @@ describe('report generation from fixture evidence (DB-backed)', { skip }, () => 
     const rec = bundle.recommendations.find((r) => r.theme === 'lunchbox_snacks');
     assert.ok(rec, 'expected a lunchbox_snacks recommendation to be built from this fixture evidence');
     assert.ok(!rec.momentum_sources || rec.momentum_sources.length === 0);
+  });
+
+  test('every theme with evidence gets a theme_daily_snapshots row, not only the top 3', async () => {
+    const report = await db.getOrCreateReport(TODAY);
+    // 4 distinct themes so at least one cannot win a top-3 slot.
+    const themesAndQueries = [
+      ['rice_basics', 'cook rice'], ['weeknight_dinners', 'fried rice'],
+      ['curry_night', 'curry'], ['healthy_eating', 'low gi']
+    ];
+    for (const [theme, query] of themesAndQueries) {
+      const run = await db.recordProviderRun(report.id, { providerName: 'Google News RSS', sourceType: 'google_news', status: 'live' });
+      await db.upsertSourceItem({
+        providerRunId: run.id, sourceType: 'google_news', sourceName: 'Test Publication',
+        sourceUrl: `https://example.com/${theme}`, externalId: `https://example.com/${theme}`,
+        contentHash: `fixture-hash-${theme}`, title: `${query} is trending`,
+        queryOrTopic: query, theme, publishedAt: new Date(), dataStatus: 'live'
+      });
+    }
+
+    const result = await buildReport(report.id, TODAY);
+    assert.equal(result.opportunitiesConsidered, 4);
+    assert.equal(result.recommendationsCreated, 3, 'only 3 can win a recommendation slot');
+
+    const snapshotsRes = await db.pool.query('SELECT theme, was_recommended FROM theme_daily_snapshots WHERE report_id = $1', [report.id]);
+    assert.equal(snapshotsRes.rowCount, 4, 'all 4 themes with evidence must have a snapshot row, not only the 3 that were recommended');
+    const notRecommendedCount = snapshotsRes.rows.filter((r) => !r.was_recommended).length;
+    assert.equal(notRecommendedCount, 1, 'exactly the one theme that did not win a slot should have was_recommended = false');
+  });
+
+  test('a same-day refresh upserts the same theme_daily_snapshots row rather than duplicating it', async () => {
+    const report = await db.getOrCreateReport(TODAY);
+    const run = await db.recordProviderRun(report.id, { providerName: 'Google News RSS', sourceType: 'google_news', status: 'live' });
+    await db.upsertSourceItem({
+      providerRunId: run.id, sourceType: 'google_news', sourceName: 'Test Publication',
+      sourceUrl: 'https://example.com/same-day-snapshot', externalId: 'https://example.com/same-day-snapshot',
+      contentHash: 'fixture-hash-same-day-snapshot', title: 'Sushi rice trending',
+      queryOrTopic: 'sushi rice', theme: 'sushi_asian', publishedAt: new Date(), dataStatus: 'live'
+    });
+
+    await buildReport(report.id, TODAY);
+    await buildReport(report.id, TODAY); // simulate a second manual Refresh the same day
+
+    const res = await db.pool.query('SELECT * FROM theme_daily_snapshots WHERE report_id = $1 AND theme = $2', [report.id, 'sushi_asian']);
+    assert.equal(res.rowCount, 1, 'a same-day re-run must upsert, never duplicate, a theme snapshot');
+  });
+
+  test('first_observed_date reflects when this dashboard first saw the theme, never an old post publication date', async () => {
+    const report = await db.getOrCreateReport(TODAY);
+    const run = await db.recordProviderRun(report.id, { providerName: 'Google News RSS', sourceType: 'google_news', status: 'live' });
+    const oldPublishDate = new Date(Date.now() - 60 * 86400000); // 60 days ago
+    await db.upsertSourceItem({
+      providerRunId: run.id, sourceType: 'google_news', sourceName: 'Test Publication',
+      sourceUrl: 'https://example.com/old-post-new-theme', externalId: 'https://example.com/old-post-new-theme',
+      contentHash: 'fixture-hash-old-post', title: 'An old article about curry',
+      queryOrTopic: 'curry', theme: 'curry_night', publishedAt: oldPublishDate, dataStatus: 'live'
+    });
+
+    await buildReport(report.id, TODAY);
+    const res = await db.pool.query('SELECT first_observed_date FROM theme_daily_snapshots WHERE report_id = $1 AND theme = $2', [report.id, 'curry_night']);
+    const firstObserved = res.rows[0].first_observed_date.toISOString().slice(0, 10);
+    assert.equal(firstObserved, TODAY, 'first_observed_date must be when WE first saw this theme (today, its first-ever snapshot), not the evidence item\'s own old publish date');
+  });
+
+  test('Pinterest-only evidence is never counted as a matching social post and never forces a TikTok/Instagram channel', async () => {
+    const report = await db.getOrCreateReport(TODAY);
+    const run = await db.recordProviderRun(report.id, { providerName: 'Pinterest Trends (via Apify, AU+NZ)', sourceType: 'apify_pinterest', status: 'live' });
+    await db.upsertSourceItem({
+      providerRunId: run.id, sourceType: 'apify_pinterest', sourceName: 'Pinterest Trends (via Apify, AU+NZ)',
+      sourceUrl: 'https://trends.pinterest.com/detail/?terms=rice+types&country=AU',
+      externalId: 'rice types:AU+NZ:growing:2026-01-01', contentHash: 'fixture-hash-pinterest-only',
+      title: 'rice types', queryOrTopic: 'rice types', theme: 'rice_basics',
+      rawMetrics: { trendType: 'growing', rank: 1 }, dataStatus: 'live'
+    });
+
+    await buildReport(report.id, TODAY);
+    const bundle = await db.getReportBundle(report);
+    const rec = bundle.recommendations.find((r) => r.theme === 'rice_basics');
+    assert.ok(rec, 'expected a rice_basics recommendation from this fixture');
+    assert.notEqual(rec.suggested_channel, 'Short-form video (TikTok/Instagram)', 'Pinterest-only evidence must never trigger a TikTok/Instagram channel suggestion');
+    assert.ok(!rec.rationale.includes('matching social post'), 'the deterministic fallback must never call a Pinterest trend item a "matching social post"');
   });
 
   test('an imported/cached item is never surfaced with data_status live', async () => {

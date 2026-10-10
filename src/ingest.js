@@ -1,5 +1,8 @@
 require('dotenv').config();
-const { pool, initSchemaWithRetry, getOrCreateReport, completeReport, recordProviderRun, upsertSourceItem } = require('./db');
+const {
+  pool, initSchemaWithRetry, getOrCreateReport, completeReport, recordProviderRun, upsertSourceItem,
+  tryAcquireIngestLock, releaseIngestLock
+} = require('./db');
 const { ALL_TOPICS, allQueries } = require('./topics');
 const dataforseoTrends = require('./providers/dataforseoTrends');
 const googleNewsRss = require('./providers/googleNewsRss');
@@ -199,43 +202,63 @@ async function collectSocial(report, reportDate, sinceDate) {
 
 async function run() {
   await initSchemaWithRetry();
-  const now = new Date();
-  const reportDate = melbourneDateString(now);
-  const sinceDate = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000); // 7-day recency window for social/news
 
-  console.log(`[ingest] starting report ${reportDate}`);
-  // Booleans only, never the values -- but seeing this line in Render's log
-  // viewer immediately answers "did this process actually get the secrets"
-  // without needing to load the dashboard and dig through Source health.
-  console.log('[ingest] credentials seen by this process:', {
-    DATAFORSEO_LOGIN: Boolean(process.env.DATAFORSEO_LOGIN),
-    DATAFORSEO_PASSWORD: Boolean(process.env.DATAFORSEO_PASSWORD),
-    APIFY_TOKEN: Boolean(process.env.APIFY_TOKEN)
-  });
-  const report = await getOrCreateReport(reportDate);
+  // A second overlapping ingest (the daily cron firing while a manual
+  // Refresh is still running, or two manual Refreshes close together)
+  // doesn't just waste DataForSEO/Apify spend -- it races on the same-day
+  // DELETE-then-rebuild sequence in buildReport() and ingest.js's own
+  // provider_runs clear. Postgres advisory lock, held for this whole run;
+  // a second process that can't acquire it logs and exits cleanly rather
+  // than starting a competing ingest. Not a queue -- the second run simply
+  // doesn't happen; the next cron fire or manual Refresh tries again later.
+  const lockClient = await tryAcquireIngestLock();
+  if (!lockClient) {
+    console.warn('[ingest] another ingest run is already in progress -- exiting without starting a competing run');
+    await pool.end();
+    return;
+  }
 
-  // A same-day re-run (Refresh fired more than once before midnight) should
-  // reflect only its own latest attempt on Source health, not accumulate
-  // every historical attempt from earlier runs today. Safe to clear: raw
-  // evidence in source_items just loses this FK (ON DELETE SET NULL) and is
-  // looked up by collected_at date in reportBuilder.js, not through this join.
-  await pool.query('DELETE FROM provider_runs WHERE report_id = $1', [report.id]);
+  try {
+    const now = new Date();
+    const reportDate = melbourneDateString(now);
+    const sinceDate = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000); // 7-day recency window for social/news
 
-  const providerSummary = {};
-  providerSummary.dataforseo_trends = await collectTrends(report, reportDate);
-  console.log('[ingest] trends done', providerSummary.dataforseo_trends);
+    console.log(`[ingest] starting report ${reportDate}`);
+    // Booleans only, never the values -- but seeing this line in Render's log
+    // viewer immediately answers "did this process actually get the secrets"
+    // without needing to load the dashboard and dig through Source health.
+    console.log('[ingest] credentials seen by this process:', {
+      DATAFORSEO_LOGIN: Boolean(process.env.DATAFORSEO_LOGIN),
+      DATAFORSEO_PASSWORD: Boolean(process.env.DATAFORSEO_PASSWORD),
+      APIFY_TOKEN: Boolean(process.env.APIFY_TOKEN)
+    });
+    const report = await getOrCreateReport(reportDate);
 
-  providerSummary.google_news = await collectGoogleNews(report, reportDate, sinceDate);
-  console.log('[ingest] news done', providerSummary.google_news);
+    // A same-day re-run (Refresh fired more than once before midnight) should
+    // reflect only its own latest attempt on Source health, not accumulate
+    // every historical attempt from earlier runs today. Safe to clear: raw
+    // evidence in source_items just loses this FK (ON DELETE SET NULL) and is
+    // looked up by collected_at date in reportBuilder.js, not through this join.
+    await pool.query('DELETE FROM provider_runs WHERE report_id = $1', [report.id]);
 
-  providerSummary.social = await collectSocial(report, reportDate, sinceDate);
-  console.log('[ingest] social done', providerSummary.social);
+    const providerSummary = {};
+    providerSummary.dataforseo_trends = await collectTrends(report, reportDate);
+    console.log('[ingest] trends done', providerSummary.dataforseo_trends);
 
-  const buildResult = await buildReport(report.id, reportDate);
-  console.log('[ingest] report built', buildResult);
+    providerSummary.google_news = await collectGoogleNews(report, reportDate, sinceDate);
+    console.log('[ingest] news done', providerSummary.google_news);
 
-  await completeReport(report.id, providerSummary);
-  console.log(`[ingest] report ${reportDate} completed`);
+    providerSummary.social = await collectSocial(report, reportDate, sinceDate);
+    console.log('[ingest] social done', providerSummary.social);
+
+    const buildResult = await buildReport(report.id, reportDate);
+    console.log('[ingest] report built', buildResult);
+
+    await completeReport(report.id, providerSummary);
+    console.log(`[ingest] report ${reportDate} completed`);
+  } finally {
+    await releaseIngestLock(lockClient);
+  }
 
   await pool.end();
 }

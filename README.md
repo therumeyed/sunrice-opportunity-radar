@@ -160,6 +160,16 @@ Two things worth knowing before trusting it blindly:
   number: a week-over-week count of how many matched trend rows showed up,
   the same count-based mechanism already used for Reddit/TikTok/Instagram.
 
+**Not a social post.** Pinterest contributes to source agreement, momentum
+and creative context exactly like a real social post would -- but it's a
+trend-list entry, not a post, and is deliberately excluded from "N matching
+social posts" wording and from `suggestedChannelFor()`'s post-count check.
+Before this was fixed, a theme with Pinterest evidence alone (zero actual
+Reddit/TikTok/Instagram posts) could still get recommended with "Short-form
+video (TikTok/Instagram)" as the suggested channel, purely because Pinterest
+padded the post count above zero. The Social trends panel labels Pinterest
+rows "matched trend term(s)", never "matching post(s)".
+
 **Cross-source momentum callout.** When the same theme is independently
 flagged as rising by more than one source -- Google Trends showing a real
 (sanitized) rising related query, Pinterest classifying a matched term as
@@ -177,8 +187,11 @@ invented number attached, only the fact that it's independently confirmed.
 plain 0-1 input:
 - **freshness** -- linear decay to 0 over 7 days from first detection.
 - **velocity** -- % change vs. a real 7-day trailing average queried from
-  the DB (DataForSEO's own rising-query value is preferred when present).
-  No prior history at all → neutral score, not a fabricated 0% or 100%.
+  the DB (DataForSEO's own sanitized rising-query values are preferred when
+  present, aggregated as the median of the top 3 rather than the single
+  highest -- one generous outlier used to be able to max out this whole
+  component alone). No prior history at all → neutral score, not a
+  fabricated 0% or 100%.
 - **agreement** -- how many distinct source types corroborate it (1 source
   is a hunch, 3+ is a pattern).
 - **relevance** / **seasonal fit** -- fixed editorial weighting per theme
@@ -217,6 +230,103 @@ Hard boundaries, enforced in code not just prompted for:
   sentence -- this is a nice-to-have layer, never a dependency the report
   needs to succeed. The multicultural-discovery compliance disclaimer is
   fixed wording and is never handed to the LLM at all.
+
+## 5a. Theme lifecycle, trend history and recommendation memory
+
+Two gaps this round closed: the dashboard only ever saw "today" (no memory
+of what it said yesterday), and it only ever saw the themes that happened
+to win a top-3 slot (anything else left zero trace).
+
+**`theme_daily_snapshots`** (new table) gets one row per theme per report
+date, for *every* theme with real evidence that day -- not just the 3 that
+became recommendations. `was_recommended` records which ones did.
+Same-day refreshes upsert this row rather than duplicating it; past days'
+rows are never touched or deleted by a later day's run. This is what makes
+the rest of this section possible -- `signals` is rebuilt fresh every
+report and keeps no cross-day history, and `recommendations` only ever had
+rows for themes that won a slot.
+
+**`src/themeLifecycle.js`** -- a theme's lifecycle (`new` / `validating` /
+`building` / `cooling` / `sustained` / `peaking`) is computed from that
+theme's own accumulated snapshot history, completely separate from the
+existing per-platform `lifecycleFor()` in `reportBuilder.js` (which stays
+exactly as it was, for the existing Social trends panel -- conflating the
+two was explicitly the thing to avoid). Every threshold is named in
+`LIFECYCLE_THRESHOLDS` so it can be recalibrated later from real data
+without re-deriving the logic. Deliberately conservative: fewer than 7
+observations can only ever say `new`/`validating`, and `peaking` needs 14+
+observations *and* a real flattening pattern (near its own recent high,
+genuinely building recently, now flattened) -- a 3-day-old theme can never
+be told it's peaking just because today looked a certain way. The API
+exposes `peakingEligible` per theme precisely so the UI can say
+"insufficient history to determine a peak" instead of implying a young
+theme was checked and simply isn't.
+
+**Recommendation memory** reuses the real, already-persisted
+`recommendations` history (never deleted except that same day's own
+re-run) rather than a second table. Before writing today's rationale,
+`reportBuilder.js` pulls the last 14 days of this theme's recommendations
+plus anything already proposed earlier *today* (captured before the
+same-day delete, so a second manual Refresh doesn't erase the first run's
+context) and hands both to `llmStrategist.js`.
+
+**`src/continuity.js`** -- `computeActionFingerprint()` hashes the
+*specific* proposal (product + channel + format + creative angle,
+normalized), and `determineContinuityStatus()` compares it against recent
+history to classify `new` / `continuing` / `strengthening` / `weakening` /
+`new_angle` / `repeat_action`. Both are deterministic and this is the
+system of record -- the LLM proposes its own guess at continuity as part
+of its structured output (see below) purely for its own prose, but
+reportBuilder.js's own comparison is what actually gets stored and shown.
+When there's no usable LLM output at all (no key, failed call, rejected
+response), there's no real execution detail to fingerprint -- the
+fingerprint is `null` in that case rather than a hash of empty fields, and
+continuity falls back to score-trend classification only, never a false
+"repeat_action"/"new_angle" claim it can't actually back.
+
+**`llmStrategist.js` now returns structured JSON**, not a free paragraph:
+`opportunityName` (a specific, concrete name -- "Homemade sushi tutorials",
+never the broad theme label), `intentSummary`, `rationale`,
+`recommendedAction`, `primaryProducts[]`, `channel`/`format`/
+`creativeAngle`, its own `continuityStatus` guess, `changeSincePrevious`,
+and `evidenceReferences[]`. Every field that matters is validated before
+use: `primaryProducts` rejected outright if it names anything outside
+`src/products.js`, the existing fabricated-number regex still runs as a
+second-layer safety net, and a parse/validation failure falls back to the
+same deterministic template as before -- this is still a nice-to-have
+layer, never a dependency the report needs to succeed.
+
+Two related fixes to the prompt itself: a rising query's own numeric
+`value` is no longer sent to the LLM at all (only the query text and the
+fact that it's classified rising) -- its unit isn't actually verified for
+that context specifically, separate from the existing out-of-range
+sanitizer. And the LLM is explicitly told not to use the word "sustained"
+unless the real lifecycle/history given to it actually supports it.
+
+The `/api/reports/*` endpoints now return `themeTrends` -- every active
+theme's lifecycle, score/change, source badges, appearance counts and a
+30-day sparkline, ending at the *selected* report date (never today's
+latest, so browsing a historical report shows the trend as it stood that
+day). Rendered as a new "National theme momentum" section on the Today
+screen, below the top 3 and above the existing search/social panels --
+deliberately national only; audience/state filters narrow recommendations
+and signals but not this section, since neither dimension is truly
+calculated at the theme level.
+
+## 5b. Ingest concurrency
+
+The daily cron and a manual Refresh can overlap (cron fires while a
+Refresh is still running, or two Refreshes close together) -- without a
+guard this wastes DataForSEO/Apify spend and can race on the same-day
+DELETE-then-rebuild sequence in `buildReport()`. `ingest.js` now takes a
+Postgres advisory lock (`pg_try_advisory_lock`) for its whole run; a
+second process that can't acquire it logs and exits cleanly rather than
+starting a competing run -- not a queue, the next cron fire or manual
+Refresh just tries again later. `POST /admin/refresh` also does a quick
+best-effort peek at the same lock to return `409` immediately for the
+obvious case of clicking Refresh twice in a row; the real enforcement is
+always `ingest.js`'s own acquire, since the peek-then-spawn has an
+unavoidable small race window.
 
 ## 6. Deploy to Render
 
