@@ -46,6 +46,29 @@ describe('buildBatchPrompt', () => {
     assert.ok(prompt.includes('cook rice, wash rice'));
     assert.ok(prompt.includes('how to cook rice'));
   });
+
+  test('instructs extraction of dish/behaviour/format from social post text, grounded only in what the post says', () => {
+    const prompt = buildBatchPrompt(sampleThemeBatches());
+    assert.ok(prompt.includes('dish, behaviour, problem, ingredient combination, audience, or format'));
+    assert.ok(prompt.toLowerCase().includes('never invent a dish or behaviour the post doesn\'t describe'.toLowerCase()));
+  });
+
+  test('a real social post is shown with its actual verbatim text, labelled by platform', () => {
+    const batches = sampleThemeBatches();
+    batches[0].candidates.push({
+      clusterKey: 'rice_basics::social::501',
+      displayText: 'air frying leftover rice into crispy bites, kids loved it',
+      members: [{ sourceItemId: 501, sourceType: 'apify_reddit', matchType: 'social_post', metricType: null, metricValue: null }]
+    });
+    const prompt = buildBatchPrompt(batches);
+    assert.ok(prompt.includes('air frying leftover rice into crispy bites, kids loved it'));
+    assert.ok(prompt.includes('Reddit post'));
+  });
+
+  test('allows mixing a social post clusterKey with a search/Pinterest clusterKey in the merge instructions', () => {
+    const prompt = buildBatchPrompt(sampleThemeBatches());
+    assert.ok(prompt.toLowerCase().includes('mix a social post'));
+  });
 });
 
 describe('extractJson', () => {
@@ -185,6 +208,25 @@ describe('parseAndValidateResponse', () => {
     const { assessments, rejectedCount } = parseAndValidateResponse(response, batches);
     assert.equal(assessments.length, 1);
     assert.equal(rejectedCount, 1);
+  });
+
+  // Explicit guarantee the user asked to confirm: a single bad candidate
+  // in an otherwise-valid batch must never destroy the others. Only a
+  // malformed response AS A WHOLE (not valid JSON, or not an array) is a
+  // parse error worth retrying the whole call for -- see analyzeCandidates'
+  // own retry loop. One bad element among many good ones is just a
+  // rejection, not a parse error.
+  test('a 10-candidate response with exactly 1 invalid candidate keeps the other 9, never discards the whole batch', () => {
+    const valid = (i) => ({
+      clusterKeys: ['rice_basics::air fryer rice paper roll'], candidateName: `Real candidate ${i}`, parentTheme: 'rice_basics',
+      classification: 'micro', brandRelevance: 0.5, whyItMattersNow: 'x', proposedAction: { recommendedAction: 'y' }, evidenceIds: [101]
+    });
+    const invalid = { clusterKeys: ['rice_basics::air fryer rice paper roll'], candidateName: 'Bad one', parentTheme: 'rice_basics', classification: 'not-a-real-classification', brandRelevance: 0.5, whyItMattersNow: 'x', proposedAction: { recommendedAction: 'y' }, evidenceIds: [101] };
+    const response = JSON.stringify([...Array.from({ length: 9 }, (_, i) => valid(i)), invalid]);
+    const { assessments, rejectedCount, parseError } = parseAndValidateResponse(response, batches);
+    assert.equal(parseError, undefined, 'a per-candidate validation failure is never a parse error');
+    assert.equal(assessments.length, 9, 'all 9 valid candidates must survive');
+    assert.equal(rejectedCount, 1, 'exactly the 1 invalid candidate is rejected');
   });
 });
 

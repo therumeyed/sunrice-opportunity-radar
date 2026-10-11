@@ -2,7 +2,7 @@ const { test, describe } = require('node:test');
 const assert = require('node:assert/strict');
 const {
   WEIGHTS, scoreMicrotrend, qualifiesForRecommendation, confidenceForMicrotrend, actionTypeForMicrotrend,
-  freshnessScore, velocityScore, noveltyScore, evidenceQualityScore
+  resolveSocialTier, freshnessScore, velocityScore, noveltyScore, evidenceQualityScore
 } = require('../src/microtrendScoring');
 
 describe('WEIGHTS', () => {
@@ -147,5 +147,39 @@ describe('confidenceForMicrotrend / actionTypeForMicrotrend', () => {
   test('low score is early_signal / Watch', () => {
     assert.equal(confidenceForMicrotrend(20, 1), 'early_signal');
     assert.equal(actionTypeForMicrotrend(20), 'Watch');
+  });
+});
+
+describe('resolveSocialTier', () => {
+  test('never touches a non-social-only candidate -- search/Pinterest and mixed-evidence candidates are unaffected', () => {
+    assert.equal(resolveSocialTier('Create', { isSocialOnly: false, distinctPostCount: 1, distinctCreatorCount: 1 }), 'Create');
+  });
+
+  test('a single credible post can still be Watch -- the gate never touches an already-Watch tier', () => {
+    assert.equal(resolveSocialTier('Watch', { isSocialOnly: true, distinctPostCount: 1, distinctCreatorCount: 1 }), 'Watch');
+  });
+
+  test('Investigate requires multiple posts or creators -- a single post downgrades to Watch', () => {
+    assert.equal(resolveSocialTier('Investigate', { isSocialOnly: true, distinctPostCount: 1, distinctCreatorCount: 1 }), 'Watch');
+  });
+
+  test('Investigate survives with multiple posts even from one creator', () => {
+    assert.equal(resolveSocialTier('Investigate', { isSocialOnly: true, distinctPostCount: 3, distinctCreatorCount: 1 }), 'Investigate');
+  });
+
+  test('Investigate survives with multiple creators even from few posts', () => {
+    assert.equal(resolveSocialTier('Investigate', { isSocialOnly: true, distinctPostCount: 1, distinctCreatorCount: 2 }), 'Investigate');
+  });
+
+  test('Create requires creator diversity -- without it, downgrades to Investigate (not all the way to Watch) when multiple posts exist', () => {
+    assert.equal(resolveSocialTier('Create', { isSocialOnly: true, distinctPostCount: 5, distinctCreatorCount: 1 }), 'Investigate');
+  });
+
+  test('Create with neither creator diversity nor multiple posts cascades all the way down to Watch', () => {
+    assert.equal(resolveSocialTier('Create', { isSocialOnly: true, distinctPostCount: 1, distinctCreatorCount: 1 }), 'Watch');
+  });
+
+  test('Create survives with real creator diversity', () => {
+    assert.equal(resolveSocialTier('Create', { isSocialOnly: true, distinctPostCount: 3, distinctCreatorCount: 3 }), 'Create');
   });
 });

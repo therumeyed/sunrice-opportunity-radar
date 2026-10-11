@@ -148,7 +148,31 @@ function actionTypeForMicrotrend(score) {
   return 'Watch';
 }
 
+// Social evidence (real Reddit/TikTok/Instagram posts) has no verified
+// engagement metric -- a play count or like count's real scale/meaning
+// isn't confirmed, same caution as Pinterest's rank/count fields -- so a
+// social-only candidate can never earn "measurable momentum" the way a
+// real DataForSEO rising_value can. This gate is deliberately
+// downgrade-only, applied AFTER the score-driven tier above, and only
+// when the candidate is social-only (every contributing source_type is a
+// real social platform, nothing from search/Pinterest):
+//   - Create requires creator diversity (2+ distinct real authors) --
+//     without it, and with no cross-source corroboration (which would
+//     have made isSocialOnly false in the first place), downgrade to
+//     Investigate.
+//   - Investigate requires multiple posts or multiple creators -- a
+//     single post, however credible, downgrades (further) to Watch.
+//   - Watch is always reachable from a single credible post; this gate
+//     never touches an already-Watch tier.
+function resolveSocialTier(tier, { isSocialOnly, distinctPostCount = 0, distinctCreatorCount = 0 }) {
+  if (!isSocialOnly) return tier;
+  let resolved = tier;
+  if (resolved === 'Create' && distinctCreatorCount < 2) resolved = 'Investigate';
+  if (resolved === 'Investigate' && distinctPostCount < 2 && distinctCreatorCount < 2) resolved = 'Watch';
+  return resolved;
+}
+
 module.exports = {
   WEIGHTS, scoreMicrotrend, qualifiesForRecommendation, confidenceForMicrotrend, actionTypeForMicrotrend,
-  freshnessScore, velocityScore, noveltyScore, evidenceQualityScore
+  resolveSocialTier, freshnessScore, velocityScore, noveltyScore, evidenceQualityScore
 };

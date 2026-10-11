@@ -276,6 +276,16 @@ async function initSchema() {
     -- is available (no API key, a failed call, or validation rejection) --
     -- see the "CREATE must have a concrete action" rule.
     ALTER TABLE recommendations ADD COLUMN IF NOT EXISTS recommended_action TEXT;
+    -- Which real evidence actually grounds this recommendation -- 'search'
+    -- (DataForSEO/Pinterest only), 'social' (real Reddit/TikTok/Instagram
+    -- posts only, no search/Pinterest corroboration), or 'mixed' (both).
+    -- Computed once in reportBuilder.js from the winning candidate's own
+    -- merged evidence and stored as a snapshot of that day's grounding --
+    -- never recomputed from evidence that might be relabeled later. A
+    -- 'social' recommendation must be shown as a social-first signal, not
+    -- implied to be backed by broader search demand it never had.
+    ALTER TABLE recommendations ADD COLUMN IF NOT EXISTS evidence_basis TEXT
+      CHECK (evidence_basis IN ('search', 'social', 'mixed'));
 
     -- Explicit team feedback on a recommendation -- a product mutation,
     -- gated server-side by EDITOR_TOKEN (see server.js), never publicly
@@ -550,8 +560,8 @@ async function insertRecommendation(reportId, rec) {
     `INSERT INTO recommendations (report_id, rank, action_type, theme, title, rationale, audience, state,
                                    suggested_channel, freshness, confidence, score, score_components, momentum_sources,
                                    opportunity_name, continuity_status, action_fingerprint, continuity_meta, strategy_output,
-                                   microtrend_id, recommendation_kind, recommended_action)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22) RETURNING *`,
+                                   microtrend_id, recommendation_kind, recommended_action, evidence_basis)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23) RETURNING *`,
     [
       reportId, rec.rank, rec.actionType, rec.theme || null, rec.title, rec.rationale, rec.audience || null,
       rec.state || 'National', rec.suggestedChannel || null, rec.freshness || null,
@@ -564,7 +574,8 @@ async function insertRecommendation(reportId, rec) {
       rec.strategyOutput ? JSON.stringify(rec.strategyOutput) : null,
       rec.microtrendId || null,
       rec.recommendationKind || null,
-      rec.recommendedAction || null
+      rec.recommendedAction || null,
+      rec.evidenceBasis || null
     ]
   );
   return res.rows[0];
@@ -642,7 +653,8 @@ async function getMicrotrendsForReport(reportId) {
      LEFT JOIN (
        SELECT microtrend_id, json_agg(json_build_object(
          'sourceType', source_type, 'metricType', metric_type, 'metricValue', metric_value,
-         'evidenceCount', evidence_count, 'sourceNativeClassification', source_native_classification
+         'evidenceCount', evidence_count, 'sourceNativeClassification', source_native_classification,
+         'uniqueCreatorCount', unique_creator_count
        )) AS observations
        FROM microtrend_observations WHERE report_id = $1 GROUP BY microtrend_id
      ) obs ON obs.microtrend_id = m.id
@@ -1129,6 +1141,7 @@ async function getIdeas(filters = {}) {
               (array_agg(rec.recommended_action ORDER BY r.report_date DESC))[1] AS recommended_action,
               (array_agg(rec.suggested_channel ORDER BY r.report_date DESC))[1] AS suggested_channel,
               (array_agg(rec.action_type ORDER BY r.report_date DESC))[1] AS tier,
+              (array_agg(rec.evidence_basis ORDER BY r.report_date DESC))[1] AS evidence_basis,
               (array_agg(DISTINCT s.source_type)) AS source_types,
               MIN(r.report_date) AS first_recommended_at,
               MAX(r.report_date) AS last_recommended_at,
@@ -1141,7 +1154,7 @@ async function getIdeas(filters = {}) {
        GROUP BY rec.action_fingerprint
      )
      SELECT i.*, agg.theme, agg.microtrend_id, agg.opportunity_name, agg.recommended_action, agg.suggested_channel,
-            agg.tier, agg.source_types, agg.first_recommended_at, agg.last_recommended_at, agg.recommendation_count,
+            agg.tier, agg.evidence_basis, agg.source_types, agg.first_recommended_at, agg.last_recommended_at, agg.recommendation_count,
             latest_feedback.feedback_type
      FROM ideas i
      JOIN agg ON agg.action_fingerprint = i.action_fingerprint

@@ -371,11 +371,12 @@ today -- this candidate layer decides what (if anything) fills each slot.
 
 **Extraction (`src/microtrendExtraction.js`)** pulls real candidate
 phrases only from evidence that can name a specific `source_items` row as
-proof: each `dataforseo_trends` row's own rising/top related queries, and
-each matched Pinterest trend-list row's own term. News and real social
-posts (Reddit/TikTok/Instagram) stay corroboration only -- there is no
-reliable way to pull a specific emerging phrase out of a post/article body
-without inventing one.
+proof: each `dataforseo_trends` row's own rising/top related queries, each
+matched Pinterest trend-list row's own term, and now every real matched
+Reddit/TikTok/Instagram post (see 5c-i below). Google News stays
+corroboration only -- there's no first-person "here's what I'm actually
+doing" signal in article text the way there is in a social caption, so
+news alone never produces a candidate or a recommendation.
 
 **First-pass clustering (`src/microtrends.js`)** is deterministic text
 processing only, no vector database or embeddings: lowercase +
@@ -394,6 +395,65 @@ automatically. When it does, every merged clusterKey beyond the canonical
 one is recorded on that microtrend's `semantic_merges` column (original
 wording + when), so the grouping stays auditable rather than silently
 reshaping history.
+
+### 5c-i. Social-native candidate discovery
+
+Losing social-only opportunities is not an acceptable side effect of the
+"Claude is mandatory, no fallback" rule -- that rule only governs what
+happens when Claude is *unavailable*, never whether real social evidence
+is allowed to produce a candidate at all. So every real matched
+Reddit/TikTok/Instagram post is sent to Claude for microtrend extraction,
+on equal footing with search/Pinterest candidates:
+
+- Each real post is its own atomic, un-clustered "seed candidate"
+  (`socialCandidatesFor`) -- unlike search/Pinterest terms, there's no
+  reliable string-matching heuristic for free-form post text, so
+  deterministic code never guesses the phrase. Claude reads the actual
+  post text and identifies the specific dish, behaviour, problem,
+  ingredient combination, audience, or creative format it describes,
+  grounded only in what the post actually says (never an invented detail,
+  never an implied engagement number -- a view/like count has no more
+  confirmed scale than Pinterest's rank field).
+- Social posts merge into the same microtrend via the exact same
+  `clusterKeys` mechanism search/Pinterest candidates already use --
+  Claude can unify two differently-worded posts about the same real
+  behaviour, or merge a social post with a search/Pinterest clusterKey for
+  cross-source corroboration. No separate validation path was built for
+  this; it's the same merge-and-audit mechanism, same `semantic_merges`
+  column.
+- Posts are deduplicated by `source_items`' own `(source_type,
+  content_hash)` constraint at ingest, and each post's real `author` is
+  carried through so distinct creators can be counted deterministically
+  (`uniqueCreatorCount` in `aggregateObservations`) -- never something
+  Claude is asked to estimate.
+
+**Social-only tier gating (`resolveSocialTier` in
+`src/microtrendScoring.js`)** is a deterministic, downgrade-only gate
+applied *after* the normal score-driven Watch/Investigate/Create tier, and
+only when every contributing source is a real social platform
+(`isSocialOnly` -- if Claude merged in a search/Pinterest clusterKey, this
+is false and the gate never applies, which is exactly what "corroboration
+from another source" means in practice):
+- **Watch** is always reachable from a single credible post; the gate
+  never touches an already-Watch tier.
+- **Investigate** needs multiple real posts or multiple creators -- a
+  single post, however credible, downgrades to Watch.
+- **Create** additionally needs creator diversity (2+ distinct real
+  authors). "Measurable momentum" and "corroboration from another source"
+  remain valid alternatives in principle, but a verified engagement metric
+  for social platforms doesn't exist yet in this system -- the same
+  caution already applied to Pinterest's own rank/count fields -- so for a
+  *pure* social-only candidate, creator diversity is currently the only
+  satisfiable path to Create.
+
+**`evidence_basis` (`'search' | 'social' | 'mixed'`)** is a write-time
+snapshot on every recommendation (and, recomputed for display, on every
+tracked microtrend in "What's emerging") of what actually grounded it --
+never recomputed after the fact. The dashboard labels a `social` idea with
+a "Social-first signal" badge and a `mixed` one with "Social + search", so
+a social-only find is never presented as if it were broader search
+demand it never had. The common `search` case gets no badge at all, to
+keep that case visually quiet.
 
 **Scoring (`src/microtrendScoring.js`)** is a separate deterministic
 formula from theme-level `scoring.js` -- freshness 20% / velocity 25% /

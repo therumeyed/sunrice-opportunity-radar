@@ -186,6 +186,13 @@ a { color: var(--bd-red); }
 .bd-link-btn { border: 0; background: transparent; color: #ffffff; font-size: 10px; text-decoration: underline; text-underline-offset: 3px; padding: 0; display: inline-block; margin-top: 4px; }
 .bd-kind-badge { border-radius: 999px; padding: 3px 8px; font-size: 9px; font-weight: 600; text-transform: uppercase; letter-spacing: .04em; display: inline-block; margin: 0 0 6px; background: rgba(255,255,255,.14); color: #ffffff; }
 .bd-kind-badge.theme_disclaimer { background: rgba(255,255,255,.08); color: #f4ded5; }
+/* Social-first signal: distinct from a kind/continuity badge so it never
+   reads as a status, just "here's what this is grounded in". Default
+   (dashed) styling matches the dark bd-priority card; .bd-emerging-card
+   overrides it for its light panel. */
+.bd-social-badge { border-radius: 999px; padding: 3px 8px; font-size: 9px; font-weight: 600; letter-spacing: .02em; display: inline-block; margin: 0 0 6px; border: 1px dashed rgba(255,255,255,.5); color: #ffffff; background: transparent; }
+.bd-social-badge.mixed { border-style: solid; opacity: .85; }
+.bd-emerging-card .bd-social-badge { border-color: var(--bd-amber); color: var(--bd-amber); margin: 6px 0 0; }
 .bd-ai-unavailable { color: #fff0ed; padding: 4px 0; }
 .bd-ai-unavailable strong { display: block; font-size: 15px; margin-bottom: 6px; font-family: Georgia, serif; }
 .bd-ai-unavailable p { font-size: 12px; line-height: 1.5; margin: 0 0 6px; }

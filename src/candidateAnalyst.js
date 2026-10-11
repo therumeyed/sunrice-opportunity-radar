@@ -41,9 +41,12 @@ function isConfigured() {
 
 // --- Prompt construction (pure) ------------------------------------------
 
+const SOURCE_LABELS = { apify_reddit: 'Reddit post', apify_tiktok: 'TikTok post', apify_instagram: 'Instagram post' };
+
 function formatMember(m) {
   const metric = m.metricValue != null ? `, ${m.metricType}=${m.metricValue}` : '';
-  return `    - [evidenceId ${m.sourceItemId}] ${m.sourceType} (${m.matchType}${metric})`;
+  const label = SOURCE_LABELS[m.sourceType] || m.sourceType;
+  return `    - [evidenceId ${m.sourceItemId}] ${label} (${m.matchType}${metric})`;
 }
 
 function formatCandidate(c) {
@@ -66,7 +69,11 @@ ${t.candidates.map(formatCandidate).join('\n')}`;
 
 function buildBatchPrompt(themeBatches) {
   const productList = PRODUCTS.map((p) => `- ${p.name}${p.sizes ? ` (${p.sizes})` : ''}`).join('\n');
-  return `You are a sharp, commercially-minded content strategist for SunRice, an Australian rice company. You are given REAL candidate signals already extracted from today's real evidence (Google Trends rising/top queries, Pinterest trend terms), grouped by theme. Your job is to interpret what each one actually means -- never to invent anything.
+  return `You are a sharp, commercially-minded content strategist for SunRice, an Australian rice company. You are given REAL candidate signals from today's real evidence, grouped by theme. Two kinds of candidate:
+1. Google Trends rising/top queries and Pinterest trend terms -- short query/term strings.
+2. Real social posts (Reddit/TikTok/Instagram) -- each one is the ACTUAL text of one real post, given to you verbatim as that candidate's "wording seen in evidence". For these, your job is to read the post and identify the specific dish, behaviour, problem, ingredient combination, audience, or creative format it's actually about -- grounded ONLY in what that post actually says. Never invent a dish or behaviour the post doesn't describe.
+
+Your job is to interpret what each candidate actually means -- never to invent anything.
 
 Respond with ONLY a single valid JSON array (no markdown fences, no prose before or after it). Each element assesses ONE candidate idea, shaped exactly like this:
 
@@ -91,6 +98,8 @@ Respond with ONLY a single valid JSON array (no markdown fences, no prose before
 How to use clusterKeys -- THIS IS WHERE YOU DO REAL ANALYTICAL WORK, not just restate the input:
 - One candidate normally maps to one clusterKey.
 - If two or more candidates in the SAME theme use different wording for what is clearly the same underlying idea (e.g. "sushi rice bowl recipe" and "how to make a sushi bowl at home"), list every one of their clusterKeys together in ONE assessment, so they're treated as a single idea. Only do this when you are confident they are genuinely the same idea -- when unsure, keep them separate.
+- This applies just as much across different social posts as it does across query strings: several posts describing the same real behaviour in different words (e.g. three different TikTok captions all about air-frying leftover rice into crispy bites) should become ONE assessment covering all of their clusterKeys, so the resulting count of supporting posts/creators is accurate.
+- A candidate assessment can also mix a social post's clusterKey with a search or Pinterest clusterKey, when the same real idea is corroborated across both -- do this whenever it's genuinely the same idea, since it's a stronger signal than either alone.
 - Every clusterKey from the input must appear in exactly one assessment in your output. Do not drop any, and do not invent a clusterKey that wasn't given to you.
 
 Classification rules:
@@ -99,8 +108,9 @@ Classification rules:
 - micro: a genuinely more specific, narrower idea than the theme's own baseline. The default is specificity -- do not call something a microtrend just because it's a long or unusual-sounding phrase; an evergreen idea stated as a full question is still macro.
 
 Hard rules -- breaking any of these makes that assessment useless and it will be discarded:
-- Use ONLY the evidence given below. Never invent a metric, count, query, evidenceId, or source that isn't listed. Never state or imply an absolute search-volume number (e.g. "103k searches") -- none of that exists in the evidence given.
+- Use ONLY the evidence given below. Never invent a metric, count, query, evidenceId, source, dish, or behaviour that isn't actually in it. Never state or imply an absolute search-volume or engagement number (e.g. "103k searches", "50k views") -- none of that is verified in the evidence given, for search OR social.
 - evidenceIds must be real evidenceId numbers copied from the candidates you're covering. Never invent one.
+- For a social post candidate specifically: candidateName and whyItMattersNow must describe something the post's actual text supports -- a dish, behaviour, problem, ingredient combination, audience, or format it genuinely mentions or shows, not a generic guess at what the theme is "probably" about.
 - productConnection must contain ONLY exact names from SunRice's real product range below, or be empty. Only claim a product connection if it's a genuine, recognisable match.
 - Be specific and commercial, not generic marketing filler. No "own the moment" cliches, no exclamation points, no vague "leverage this opportunity" language.
 - Action-to-intent fit is mandatory: recommendedAction/creativeAngle must genuinely match what the evidence suggests people are trying to do, not the most generic interpretation of the theme.

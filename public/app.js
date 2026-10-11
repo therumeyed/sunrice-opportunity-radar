@@ -162,6 +162,18 @@
     return `<span class="bd-kind-badge ${escapeHtml(kind)}">${escapeHtml(KIND_LABELS[kind])}</span>`;
   }
 
+  // evidenceBasis is a write-time snapshot of what actually grounded this
+  // idea (recommendations) or what's in today's observation mix (emerging
+  // microtrends) -- 'social' must read as a social-first signal, never be
+  // implied to be broader search demand it never had. 'search' is the
+  // default/expected case and gets no badge at all, to keep the common
+  // case quiet.
+  function socialBasisBadge(evidenceBasis) {
+    if (evidenceBasis === 'social') return '<span class="bd-social-badge">Social-first signal</span>';
+    if (evidenceBasis === 'mixed') return '<span class="bd-social-badge mixed">Social + search</span>';
+    return '';
+  }
+
   // Claude's candidate analysis is mandatory for a recommendation to exist
   // (see src/reportBuilder.js) -- when it's unavailable, zero
   // recommendations looks IDENTICAL to a day where AI ran fine and
@@ -190,6 +202,7 @@
       <article class="bd-priority">
         <div class="bd-priority-no">0${i + 1} · ${r.actionType.toUpperCase()}</div>
         ${kindBadge(r.recommendationKind)}
+        ${socialBasisBadge(r.evidenceBasis)}
         <h3>${escapeHtml(r.opportunityName || r.title)}</h3>
         <div class="bd-pill" style="display:inline-block;margin-bottom:6px;">${escapeHtml(categoryLabel)}</div>
         ${continuityBadge(r.continuityStatus)}
@@ -230,6 +243,7 @@
           <h4>${escapeHtml(m.displayName)}</h4>
           <span class="bd-candidate-type ${escapeHtml(m.candidateType)}">${escapeHtml(m.candidateType)}</span>
         </div>
+        ${socialBasisBadge(m.evidenceBasis)}
         <div class="bd-emerging-meta">
           ${escapeHtml(m.label)} · score <strong>${m.score != null ? Math.round(m.score) : '—'}</strong> · ${m.todayEvidenceCount} evidence item${m.todayEvidenceCount === 1 ? '' : 's'}
         </div>

@@ -9,9 +9,11 @@ const { ALL_TOPICS, evergreenBaselinesForTheme } = require('./topics');
 const { scoreOpportunity, confidenceFor, actionTypeFor } = require('./scoring');
 const { themeLifecycleFor } = require('./themeLifecycle');
 const { computeActionFingerprint, determineContinuityStatus } = require('./continuity');
-const { extractCandidates, aggregateObservations, evidenceLinksFor } = require('./microtrendExtraction');
+const { extractCandidates, socialCandidatesFor, isSocialSourceType, aggregateObservations, evidenceLinksFor } = require('./microtrendExtraction');
 const { hasMaterialChange } = require('./microtrends');
-const { scoreMicrotrend, qualifiesForRecommendation, confidenceForMicrotrend, actionTypeForMicrotrend } = require('./microtrendScoring');
+const {
+  scoreMicrotrend, qualifiesForRecommendation, confidenceForMicrotrend, actionTypeForMicrotrend, resolveSocialTier
+} = require('./microtrendScoring');
 // Namespace import, not destructured -- reportBuilder.test.js monkeypatches
 // candidateAnalyst.analyzeCandidates on this shared module object to test
 // the AI-succeeds path without a real network call. A destructured
@@ -245,6 +247,13 @@ async function processThemeAssessments(opp, assessments, rawCandidateByClusterKe
     });
 
     const allMembers = referencedCandidates.flatMap((c) => c.members);
+    // isSocialOnly: every contributing member is a real social platform --
+    // if Claude merged in a search/Pinterest clusterKey for corroboration,
+    // this goes false and the social-only tier gate below never applies.
+    const isSocialOnly = allMembers.every((m) => isSocialSourceType(m.sourceType));
+    const distinctCreatorCount = new Set(allMembers.map((m) => m.author).filter(Boolean)).size;
+    const socialMemberCount = allMembers.filter((m) => isSocialSourceType(m.sourceType)).length;
+    const evidenceBasis = isSocialOnly ? 'social' : socialMemberCount > 0 ? 'mixed' : 'search';
     const fullHistory = await getMicrotrendObservationHistory(microtrend.id);
     const priorHistory = fullHistory.filter((h) => new Date(h.report_date).toISOString().slice(0, 10) < reportDate);
     const todayObservations = aggregateObservations(allMembers);
@@ -271,7 +280,8 @@ async function processThemeAssessments(opp, assessments, rawCandidateByClusterKe
     for (const obs of todayObservations) {
       await recordMicrotrendObservation(reportId, {
         microtrendId: microtrend.id, sourceType: obs.sourceType, metricType: obs.metricType,
-        metricValue: obs.metricValue, evidenceCount: obs.evidenceCount, sourceNativeClassification: obs.sourceNativeClassification
+        metricValue: obs.metricValue, evidenceCount: obs.evidenceCount, sourceNativeClassification: obs.sourceNativeClassification,
+        uniqueCreatorCount: obs.uniqueCreatorCount
       });
     }
     for (const link of evidenceLinksFor(allMembers)) {
@@ -302,6 +312,7 @@ async function processThemeAssessments(opp, assessments, rawCandidateByClusterKe
 
     results.push({
       microtrend, assessment, allMembers, score, components, distinctSourceCount, uniqueSourceItemCount,
+      isSocialOnly, distinctCreatorCount, evidenceBasis,
       qualifies, hidden: exclusions.hiddenMicrotrendIds.has(microtrend.id),
       actionFingerprint, suppressed: exclusions.suppressedFingerprints.has(actionFingerprint)
     });
@@ -467,6 +478,7 @@ async function buildReport(reportId, reportDate) {
       leadingQueries: leadingQueriesFor(searchItems[0]),
       searchItemsForTheme: searchItems,
       pinterestItemsForTheme: socialItemsByPlatform.pinterest,
+      socialItemsByPlatform,
       candidateResults: []
     });
   }
@@ -498,7 +510,10 @@ async function buildReport(reportId, reportDate) {
     });
     opp.lifecycle = lifecycle;
     opp.priorSnapshots = priorSnapshots;
-    opp.rawCandidates = extractCandidates({ theme: opp.theme, searchItems: opp.searchItemsForTheme, pinterestItems: opp.pinterestItemsForTheme });
+    opp.rawCandidates = [
+      ...extractCandidates({ theme: opp.theme, searchItems: opp.searchItemsForTheme, pinterestItems: opp.pinterestItemsForTheme }),
+      ...socialCandidatesFor(opp.theme, opp.socialItemsByPlatform)
+    ];
   }
 
   // --- Mandatory Claude candidate analysis, ONE batched call for the
@@ -611,7 +626,10 @@ async function buildDisclaimerRecommendation({ reportId, rank, opp }) {
 // decides the tier (via actionTypeForMicrotrend, already computed into
 // winner.score before this runs) and persists it.
 async function buildCandidateRecommendation({ reportId, rank, opp, winner, reportDate, sameDayRec }) {
-  const { microtrend, assessment, score, components, distinctSourceCount, actionFingerprint } = winner;
+  const {
+    microtrend, assessment, score, components, distinctSourceCount, actionFingerprint,
+    isSocialOnly, distinctCreatorCount, uniqueSourceItemCount, evidenceBasis
+  } = winner;
   const name = assessment.candidateName;
 
   const recentRecs = await getRecentRecommendationsForMicrotrend(microtrend.id, reportDate, 14, reportId);
@@ -628,8 +646,13 @@ async function buildCandidateRecommendation({ reportId, rank, opp, winner, repor
   const confidence = confidenceForMicrotrend(score, distinctSourceCount);
   // actionTypeForMicrotrend decides Watch/Investigate/Create purely from
   // the deterministic score -- Claude's own proposedAction is the WHAT
-  // (recommendedAction), never the tier.
-  const actionType = actionTypeForMicrotrend(score);
+  // (recommendedAction), never the tier. resolveSocialTier then applies a
+  // downgrade-only gate when the winning evidence is social-only (no
+  // search/Pinterest corroboration): Create needs creator diversity,
+  // Investigate needs multiple posts or creators -- see microtrendScoring.js.
+  const actionType = resolveSocialTier(actionTypeForMicrotrend(score), {
+    isSocialOnly, distinctPostCount: uniqueSourceItemCount, distinctCreatorCount
+  });
 
   const titleByAction = {
     Create: `Own "${name}"`,
@@ -663,7 +686,8 @@ async function buildCandidateRecommendation({ reportId, rank, opp, winner, repor
     score,
     scoreComponents: components,
     microtrendId: microtrend.id,
-    recommendationKind: 'candidate'
+    recommendationKind: 'candidate',
+    evidenceBasis
   });
 
   // Idea Tracker row -- keyed by this stable action_fingerprint. A

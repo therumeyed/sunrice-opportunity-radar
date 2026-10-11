@@ -57,6 +57,50 @@ describe('report generation from fixture evidence (DB-backed)', { skip }, () => 
     });
   }
 
+  // Merges EVERY candidate currently extracted for one theme into a single
+  // assessment/microtrend -- the social-tier tests below rely on this to
+  // put several real social posts (or a social post + a search query) into
+  // the SAME microtrend, exactly the way Claude's own clusterKeys merging
+  // is meant to unify them (see candidateAnalyst.js).
+  function mergeAllForTheme(theme, overrides = {}) {
+    return async (themeBatches) => {
+      const t = themeBatches.find((b) => b.theme === theme);
+      if (!t || t.candidates.length === 0) return { status: 'ok', assessments: [] };
+      return {
+        status: 'ok',
+        assessments: [{
+          clusterKeys: t.candidates.map((c) => c.clusterKey),
+          candidateName: overrides.candidateName || 'Merged candidate',
+          parentTheme: theme,
+          classification: overrides.classification || 'micro',
+          isDistinctFromEvergreen: true,
+          brandRelevance: overrides.brandRelevance ?? 0.8,
+          productConnection: overrides.productConnection || [],
+          whyItMattersNow: overrides.whyItMattersNow || 'Real social evidence points to this right now.',
+          proposedAction: {
+            recommendedAction: overrides.recommendedAction || 'Do something concrete',
+            channel: overrides.channel === undefined ? 'TikTok/Instagram Reels' : overrides.channel,
+            format: overrides.format === undefined ? 'Short-form video' : overrides.format,
+            creativeAngle: overrides.creativeAngle === undefined ? 'A concrete angle' : overrides.creativeAngle
+          },
+          evidenceIds: t.candidates.flatMap((c) => c.members.map((m) => m.sourceItemId))
+        }]
+      };
+    };
+  }
+
+  // A real matched social post -- one row in source_items, same shape
+  // ingest would produce, with `author` set so distinct-creator counting
+  // has something real to count.
+  async function insertSocialPost(reportId, { theme, sourceType, contentHash, excerpt, author }) {
+    const run = await db.recordProviderRun(reportId, { providerName: sourceType, sourceType, status: 'live' });
+    return db.upsertSourceItem({
+      providerRunId: run.id, sourceType, sourceName: sourceType,
+      sourceUrl: `https://example.com/${contentHash}`, externalId: contentHash, contentHash,
+      title: excerpt, excerpt, author, theme, dataStatus: 'live'
+    });
+  }
+
   before(async () => {
     process.env.DATABASE_URL = TEST_DATABASE_URL;
     db = require('../src/db');
@@ -537,5 +581,124 @@ describe('report generation from fixture evidence (DB-backed)', { skip }, () => 
 
     const themeStats = await db.getThemeRecommendationStats(['weeknight_dinners'], TODAY);
     assert.equal(themeStats.weeknight_dinners.count14d, 1, 'the theme card must report the SAME count as the recommendation card for the same theme, same day');
+  });
+
+  describe('social-native candidate discovery: tier gating and evidence_basis', () => {
+    test('a single credible social post can only ever reach Watch, never Investigate or Create', async () => {
+      const report = await db.getOrCreateReport(TODAY);
+      await insertSocialPost(report.id, {
+        theme: 'lunchbox_snacks', sourceType: 'apify_reddit', contentHash: 'fixture-social-single-1',
+        excerpt: 'Air frying leftover rice into crispy bites for the kids\' lunchboxes, they loved it', author: 'redditor_a'
+      });
+      candidateAnalyst.analyzeCandidates = mergeAllForTheme('lunchbox_snacks', { candidateName: 'Air fryer rice bites', brandRelevance: 0.9 });
+
+      const result = await buildReport(report.id, TODAY);
+      assert.equal(result.recommendationsCreated, 1);
+
+      const bundle = await db.getReportBundle(report);
+      const rec = bundle.recommendations.find((r) => r.theme === 'lunchbox_snacks');
+      assert.ok(rec, 'expected a lunchbox_snacks recommendation');
+      assert.equal(rec.action_type, 'Watch', 'a single social post, however credible, must never clear Investigate or Create');
+      assert.equal(rec.evidence_basis, 'social', 'must be labelled a social-first signal, not broader search demand');
+    });
+
+    test('Investigate survives on 2 real posts even from the same creator', async () => {
+      const report = await db.getOrCreateReport(TODAY);
+      await insertSocialPost(report.id, {
+        theme: 'sushi_asian', sourceType: 'apify_reddit', contentHash: 'fixture-social-multi-1',
+        excerpt: 'Made sushi bake in a tray instead of individual rolls, so much easier', author: 'same_creator'
+      });
+      await insertSocialPost(report.id, {
+        theme: 'sushi_asian', sourceType: 'apify_reddit', contentHash: 'fixture-social-multi-2',
+        excerpt: 'Sushi bake tray recipe update: added spicy mayo layer this time', author: 'same_creator'
+      });
+      candidateAnalyst.analyzeCandidates = mergeAllForTheme('sushi_asian', { candidateName: 'Sushi bake (tray-style)', brandRelevance: 0.7 });
+
+      const result = await buildReport(report.id, TODAY);
+      assert.equal(result.recommendationsCreated, 1);
+
+      const bundle = await db.getReportBundle(report);
+      const rec = bundle.recommendations.find((r) => r.theme === 'sushi_asian');
+      assert.ok(rec, 'expected a sushi_asian recommendation');
+      assert.equal(rec.action_type, 'Investigate', 'multiple real posts (even one creator) must be enough to reach Investigate');
+      assert.equal(rec.evidence_basis, 'social');
+    });
+
+    test('Create is downgraded to Investigate without creator diversity, even with strong multi-platform corroboration', async () => {
+      const report = await db.getOrCreateReport(TODAY);
+      await insertSocialPost(report.id, {
+        theme: 'curry_night', sourceType: 'apify_reddit', contentHash: 'fixture-social-create-1',
+        excerpt: 'Butter chicken curry meal prep in the air fryer, game changer', author: 'one_creator'
+      });
+      await insertSocialPost(report.id, {
+        theme: 'curry_night', sourceType: 'apify_tiktok', contentHash: 'fixture-social-create-2',
+        excerpt: 'Air fryer butter chicken curry meal prep, posting the full recipe', author: 'one_creator'
+      });
+      await insertSocialPost(report.id, {
+        theme: 'curry_night', sourceType: 'apify_instagram', contentHash: 'fixture-social-create-3',
+        excerpt: 'Weekly butter chicken curry meal prep in the air fryer, reel version', author: 'one_creator'
+      });
+      candidateAnalyst.analyzeCandidates = mergeAllForTheme('curry_night', { candidateName: 'Air fryer butter chicken meal prep', brandRelevance: 1 });
+
+      const result = await buildReport(report.id, TODAY);
+      assert.equal(result.recommendationsCreated, 1);
+
+      const bundle = await db.getReportBundle(report);
+      const rec = bundle.recommendations.find((r) => r.theme === 'curry_night');
+      assert.ok(rec, 'expected a curry_night recommendation');
+      assert.equal(rec.action_type, 'Investigate', 'without creator diversity, a social-only candidate must never reach Create regardless of post/platform count');
+      assert.equal(rec.evidence_basis, 'social');
+    });
+
+    test('Create survives with real creator diversity across posts', async () => {
+      const report = await db.getOrCreateReport(TODAY);
+      await insertSocialPost(report.id, {
+        theme: 'weeknight_dinners', sourceType: 'apify_reddit', contentHash: 'fixture-social-diverse-1',
+        excerpt: 'Kimchi fried rice in 10 minutes, weeknight staple now', author: 'creator_one'
+      });
+      await insertSocialPost(report.id, {
+        theme: 'weeknight_dinners', sourceType: 'apify_tiktok', contentHash: 'fixture-social-diverse-2',
+        excerpt: 'Kimchi fried rice hack for busy weeknights, so quick', author: 'creator_two'
+      });
+      await insertSocialPost(report.id, {
+        theme: 'weeknight_dinners', sourceType: 'apify_instagram', contentHash: 'fixture-social-diverse-3',
+        excerpt: 'My go-to kimchi fried rice for weeknight dinners, reel', author: 'creator_three'
+      });
+      candidateAnalyst.analyzeCandidates = mergeAllForTheme('weeknight_dinners', { candidateName: 'Kimchi fried rice', brandRelevance: 1 });
+
+      const result = await buildReport(report.id, TODAY);
+      assert.equal(result.recommendationsCreated, 1);
+
+      const bundle = await db.getReportBundle(report);
+      const rec = bundle.recommendations.find((r) => r.theme === 'weeknight_dinners');
+      assert.ok(rec, 'expected a weeknight_dinners recommendation');
+      assert.equal(rec.action_type, 'Create', 'real creator diversity across posts must be enough to reach Create');
+      assert.equal(rec.evidence_basis, 'social');
+    });
+
+    test('corroboration from a search signal lifts the social-only gate entirely, even with just 1 post and no known creator', async () => {
+      const report = await db.getOrCreateReport(TODAY);
+      const run = await db.recordProviderRun(report.id, { providerName: 'DataForSEO', sourceType: 'dataforseo_trends', status: 'live' });
+      await db.upsertSourceItem({
+        providerRunId: run.id, sourceType: 'dataforseo_trends', sourceName: 'DataForSEO',
+        contentHash: 'fixture-social-mixed-1', title: 'low gi', queryOrTopic: 'low gi', theme: 'healthy_eating',
+        normalizedMetrics: { relatedQueries: { rising: [{ query: 'low gi meal prep bowls', value: 80 }], top: [] } },
+        dataStatus: 'live'
+      });
+      await insertSocialPost(report.id, {
+        theme: 'healthy_eating', sourceType: 'apify_reddit', contentHash: 'fixture-social-mixed-2',
+        excerpt: 'Low GI meal prep bowls got me through this week, sharing my method', author: null
+      });
+      candidateAnalyst.analyzeCandidates = mergeAllForTheme('healthy_eating', { candidateName: 'Low GI meal prep bowls', brandRelevance: 0.9 });
+
+      const result = await buildReport(report.id, TODAY);
+      assert.equal(result.recommendationsCreated, 1);
+
+      const bundle = await db.getReportBundle(report);
+      const rec = bundle.recommendations.find((r) => r.theme === 'healthy_eating');
+      assert.ok(rec, 'expected a healthy_eating recommendation');
+      assert.notEqual(rec.action_type, 'Watch', 'a single post with no known creator must not be capped at Watch once corroborated by a real search signal');
+      assert.equal(rec.evidence_basis, 'mixed', 'must be labelled mixed, not pure social or pure search, once both are merged into one microtrend');
+    });
   });
 });

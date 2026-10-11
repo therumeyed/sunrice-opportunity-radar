@@ -9,6 +9,7 @@ const {
 } = require('./db');
 const { ALL_TOPICS } = require('./topics');
 const { peakingEligible } = require('./themeLifecycle');
+const { isSocialSourceType } = require('./microtrendExtraction');
 const { FEEDBACK_TYPES, REASONS_BY_TYPE, validateFeedbackInput } = require('./feedback');
 
 const app = express();
@@ -89,7 +90,16 @@ function applyFilters(bundle, query) {
   return { ...bundle, recommendations, signals, themeTrends, microtrends };
 }
 
+// isSocialOnly/evidenceBasis are derived here from TODAY's own observation
+// mix (never stored on the microtrend row itself, which can span many
+// days and source mixes) -- same "every contributing source_type is a real
+// social platform" rule as reportBuilder.js's winning-candidate gate, just
+// recomputed for display across every tracked microtrend, not only the one
+// that won a slot.
 function serializeMicrotrend(m) {
+  const todayObservations = m.today_observations || [];
+  const isSocialOnly = todayObservations.length > 0 && todayObservations.every((o) => isSocialSourceType(o.sourceType));
+  const hasSocial = todayObservations.some((o) => isSocialSourceType(o.sourceType));
   return {
     id: m.id,
     theme: m.theme,
@@ -101,8 +111,10 @@ function serializeMicrotrend(m) {
     lastSeenAt: m.last_seen_at,
     score: m.last_score != null ? Number(m.last_score) : null,
     scoreComponents: m.last_score_components,
-    todayObservations: m.today_observations || [],
-    todayEvidenceCount: Number(m.today_evidence_count) || 0
+    todayObservations,
+    todayEvidenceCount: Number(m.today_evidence_count) || 0,
+    isSocialOnly,
+    evidenceBasis: isSocialOnly ? 'social' : hasSocial ? 'mixed' : 'search'
   };
 }
 
@@ -144,6 +156,10 @@ async function serializeBundle(bundle) {
       recommendationKind: r.recommendation_kind,
       microtrendId: r.microtrend_id,
       recommendedAction: r.recommended_action,
+      // Write-time snapshot of what grounded THIS recommendation (never
+      // recomputed later) -- 'social' must never be shown as if it were
+      // broader search demand. See reportBuilder.js buildCandidateRecommendation.
+      evidenceBasis: r.evidence_basis,
       evidence: r.evidence.map((e) => ({
         id: e.id,
         note: e.note,

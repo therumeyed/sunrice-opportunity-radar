@@ -4,16 +4,24 @@
 // (sourceItemId), which is exactly what lets microtrend_evidence be built
 // straight from its output with no guesswork.
 //
-// Source rules (brief section 3):
+// Source rules:
 //  - Google rising/top queries: each dataforseo_trends row IS the evidence
 //    for every query string in its own relatedQueries.rising/top lists.
 //  - Pinterest growing/top_monthly/seasonal terms: each matched row is one
 //    term, and is its own evidence.
-//  - News and real social posts (reddit/tiktok/instagram) are corroboration
-//    for a theme's overall momentum, not a source of new candidate phrases
-//    here -- there is no reliable, evidence-backed way to pull a specific
-//    emerging phrase out of a post/article body without the LLM inventing
-//    one, which the brief explicitly forbids.
+//  - Real social posts (reddit/tiktok/instagram): each matched post is its
+//    own seed candidate (extractSocialCandidates below) -- deliberately NOT
+//    deterministically pre-clustered the way search/Pinterest candidates
+//    are, because there's no reliable string-matching heuristic for free-
+//    form post text. Claude (src/candidateAnalyst.js) identifies the
+//    actual dish/behaviour/problem/ingredient-combo/audience/creative-
+//    format each post or group of posts is about, citing real evidenceIds
+//    -- this module only hands over the raw, real, unprocessed post as a
+//    single-member candidate; it never extracts or guesses the phrase
+//    itself. News stays corroboration only -- articles don't carry the
+//    same first-person "here's what I'm actually doing" signal a post
+//    does, and there's no real evidence a specific behaviour is described
+//    in article text the way it can be quoted from a social caption.
 const { normalizeKey, clusterCandidates } = require('./microtrends');
 
 function rawCandidatesFromSearch(searchItems) {
@@ -54,6 +62,43 @@ function rawCandidatesFromPinterest(pinterestItems) {
     });
   }
   return raw;
+}
+
+// Real social platforms whose evidence carries actual free-text post
+// content worth sending for semantic extraction -- Pinterest's own
+// trend-list terms are a different, already-classified kind of signal
+// (handled by rawCandidatesFromPinterest above) and never go through this.
+const SOCIAL_SOURCE_TYPES = ['apify_reddit', 'apify_tiktok', 'apify_instagram'];
+
+function isSocialSourceType(sourceType) {
+  return SOCIAL_SOURCE_TYPES.includes(sourceType);
+}
+
+// One real post = one seed candidate, un-clustered -- deduped already by
+// upsertSourceItem's own (source_type, content_hash) constraint at ingest
+// time, so the same post can't appear twice here. `author` is carried
+// through on the member so reportBuilder.js can deterministically count
+// distinct creators without asking Claude to do that math.
+function socialCandidatesFor(theme, socialItemsByPlatform) {
+  const candidates = [];
+  for (const platform of SOCIAL_SOURCE_TYPES) {
+    for (const item of socialItemsByPlatform[platform.replace('apify_', '')] || []) {
+      const text = (item.excerpt || item.title || '').trim();
+      if (!text) continue; // nothing to analyze -- never hand Claude an empty post as if it said something
+      candidates.push({
+        theme,
+        normalizedKey: `social-${item.id}`, // not used for matching, just a stable internal identity
+        displayName: text.slice(0, 280),
+        sourceWording: text.slice(0, 280),
+        clusterKey: `${theme}::social::${item.id}`,
+        members: [{
+          sourceItemId: item.id, sourceType: platform, matchType: 'social_post',
+          metricType: null, metricValue: null, sourceNativeClassification: null, author: item.author || null
+        }]
+      });
+    }
+  }
+  return candidates;
 }
 
 // Most-frequent raw wording in the cluster is the one shown/stored --
@@ -109,11 +154,19 @@ function aggregateObservations(members) {
     const [sourceType, metricType] = key.split(':');
     const numericValues = group.map((g) => g.metricValue).filter((v) => typeof v === 'number');
     const classifications = [...new Set(group.map((g) => g.sourceNativeClassification).filter(Boolean))];
+    // null (not 0) when this group has no creator concept at all (search/
+    // Pinterest members never carry an `author` property) -- a real 0
+    // would wrongly imply "zero creators were found" for a metric where
+    // creators were never a meaningful thing to look for in the first
+    // place. Only real, non-null authors count as distinct creators.
+    const hasCreatorConcept = group.some((g) => g.author !== undefined);
+    const uniqueCreatorCount = hasCreatorConcept ? new Set(group.map((g) => g.author).filter(Boolean)).size : null;
     return {
       sourceType,
       metricType,
       metricValue: numericValues.length > 0 ? Math.max(...numericValues) : null,
       evidenceCount: group.length,
+      uniqueCreatorCount,
       sourceNativeClassification: classifications.join(',') || null,
       sourceItemIds: [...new Set(group.map((g) => g.sourceItemId))]
     };
@@ -135,4 +188,4 @@ function evidenceLinksFor(members) {
   return links;
 }
 
-module.exports = { extractCandidates, aggregateObservations, evidenceLinksFor };
+module.exports = { extractCandidates, socialCandidatesFor, isSocialSourceType, SOCIAL_SOURCE_TYPES, aggregateObservations, evidenceLinksFor };
