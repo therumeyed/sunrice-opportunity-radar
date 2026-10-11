@@ -14,7 +14,7 @@
 //    here -- there is no reliable, evidence-backed way to pull a specific
 //    emerging phrase out of a post/article body without the LLM inventing
 //    one, which the brief explicitly forbids.
-const { normalizeKey, clusterCandidates, classifyCandidate } = require('./microtrends');
+const { normalizeKey, clusterCandidates } = require('./microtrends');
 
 function rawCandidatesFromSearch(searchItems) {
   const raw = [];
@@ -64,13 +64,19 @@ function pickDisplayName(members) {
   return [...counts.entries()].sort((a, b) => b[1] - a[1])[0][0];
 }
 
+// Classification (macro/micro/seasonal), brand relevance, product fit and
+// everything else about what a candidate MEANS is Claude's call
+// (src/candidateAnalyst.js), not this module's -- this is deliberately
+// pure string extraction and FIRST-PASS clustering only (exact
+// normalized-key match, or near-duplicate token overlap). Claude is then
+// allowed to additionally unify differently-worded candidates this first
+// pass didn't catch (see candidateAnalyst's clusterKeys merging), with
+// that judgment call stored and audited on the microtrends row -- this
+// module has no opinion on that, it just hands over every real clusterKey.
 /**
- * @returns {Array<{theme, normalizedKey, displayName, sourceWording, candidateType, members}>}
+ * @returns {Array<{theme, normalizedKey, displayName, sourceWording, clusterKey, members}>}
  */
-function extractCandidates({ theme, themeLabel, searchItems = [], pinterestItems = [], seedQueries = [], evergreenBaselines = [] }) {
-  const seedQueryKeys = seedQueries.map(normalizeKey);
-  const evergreenBaselineKeys = evergreenBaselines.map(normalizeKey);
-
+function extractCandidates({ theme, searchItems = [], pinterestItems = [] }) {
   const raw = [...rawCandidatesFromSearch(searchItems), ...rawCandidatesFromPinterest(pinterestItems)]
     .filter((c) => c.normalizedKey); // an all-stopword/empty candidate carries no comparable identity
   if (raw.length === 0) return [];
@@ -79,12 +85,9 @@ function extractCandidates({ theme, themeLabel, searchItems = [], pinterestItems
 
   return clusters.map((cluster) => {
     const displayName = pickDisplayName(cluster.members);
-    const candidateType = classifyCandidate({
-      normalizedKey: cluster.normalizedKey, themeLabel, seedQueryKeys, evergreenBaselineKeys
-    });
     return {
       theme, normalizedKey: cluster.normalizedKey, displayName, sourceWording: displayName,
-      candidateType, members: cluster.members
+      clusterKey: `${theme}::${cluster.normalizedKey}`, members: cluster.members
     };
   });
 }

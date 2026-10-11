@@ -185,7 +185,11 @@ a { color: var(--bd-red); }
 /* --- Microtrend kind badges, feedback controls, Emerging, manager ------ */
 .bd-link-btn { border: 0; background: transparent; color: #ffffff; font-size: 10px; text-decoration: underline; text-underline-offset: 3px; padding: 0; display: inline-block; margin-top: 4px; }
 .bd-kind-badge { border-radius: 999px; padding: 3px 8px; font-size: 9px; font-weight: 600; text-transform: uppercase; letter-spacing: .04em; display: inline-block; margin: 0 0 6px; background: rgba(255,255,255,.14); color: #ffffff; }
-.bd-kind-badge.baseline_opportunity { background: rgba(255,255,255,.08); color: #f4ded5; }
+.bd-kind-badge.theme_disclaimer { background: rgba(255,255,255,.08); color: #f4ded5; }
+.bd-ai-unavailable { color: #fff0ed; padding: 4px 0; }
+.bd-ai-unavailable strong { display: block; font-size: 15px; margin-bottom: 6px; font-family: Georgia, serif; }
+.bd-ai-unavailable p { font-size: 12px; line-height: 1.5; margin: 0 0 6px; }
+.bd-ai-unavailable-reason { font-size: 10px; opacity: .8; font-style: italic; }
 .bd-feedback-row { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 10px; }
 .bd-feedback-btn { border: 1px solid rgba(255,255,255,.3); background: transparent; color: #ffffff; border-radius: 7px; padding: 5px 8px; font-size: 10px; }
 .bd-feedback-btn:hover { background: rgba(255,255,255,.12); }
@@ -213,3 +217,29 @@ a { color: var(--bd-red); }
 .bd-manager-row strong { font-size: 12px; display: block; }
 .bd-manager-row span { color: var(--bd-muted); font-size: 10px; display: block; margin-top: 3px; line-height: 1.4; }
 .bd-manager-undo { border: 1px solid var(--bd-line); background: var(--bd-panel-2); border-radius: 7px; padding: 6px 9px; font-size: 10px; white-space: nowrap; }
+
+/* --- Idea Tracker ------------------------------------------------------- */
+.bd-ideas-summary { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin-bottom: 16px; }
+.bd-ideas-summary-tile { background: var(--bd-panel); border: 1px solid var(--bd-line); border-radius: 12px; padding: 13px; }
+.bd-ideas-summary-tile strong { display: block; font-size: 22px; font-family: Georgia, serif; }
+.bd-ideas-summary-tile span { color: var(--bd-muted); font-size: 10px; text-transform: uppercase; letter-spacing: .04em; }
+.bd-ideas-filterbar { display: flex; gap: 7px; flex-wrap: wrap; margin-bottom: 14px; align-items: center; }
+.bd-ideas-filterbar input, .bd-ideas-filterbar select {
+  color: var(--bd-ink); background: var(--bd-panel); border: 1px solid var(--bd-line); border-radius: 8px; padding: 7px 9px; font-size: 11px;
+}
+.bd-ideas-filterbar input[type="search"] { flex: 1 1 200px; min-width: 160px; }
+.bd-date-filter { font-size: 10px; color: var(--bd-muted); display: flex; align-items: center; gap: 4px; }
+.bd-ideas-table-wrap { background: var(--bd-panel); border: 1px solid var(--bd-line); border-radius: 14px; overflow-x: auto; }
+.bd-ideas-table { width: 100%; border-collapse: collapse; font-size: 11px; min-width: 1000px; }
+.bd-ideas-table th { text-align: left; padding: 10px 12px; color: var(--bd-muted); font-size: 9px; text-transform: uppercase; letter-spacing: .04em; border-bottom: 1px solid var(--bd-line); white-space: nowrap; }
+.bd-ideas-table td { padding: 10px 12px; border-bottom: 1px solid var(--bd-line); vertical-align: top; }
+.bd-ideas-table tr:last-child td { border-bottom: 0; }
+.bd-ideas-table .bd-idea-name { font-weight: 600; max-width: 220px; }
+.bd-ideas-table .bd-idea-action { color: var(--bd-muted); font-size: 10px; margin-top: 3px; max-width: 220px; }
+.bd-ideas-table select, .bd-ideas-table input {
+  color: var(--bd-ink); background: var(--bd-panel-2); border: 1px solid var(--bd-line); border-radius: 6px; padding: 5px 6px; font-size: 10px; width: 100%; min-width: 90px;
+}
+.bd-ideas-table .bd-idea-meta { color: var(--bd-muted); font-size: 10px; white-space: nowrap; }
+@media (max-width: 860px) {
+  .bd-ideas-summary { grid-template-columns: repeat(2, 1fr); }
+}

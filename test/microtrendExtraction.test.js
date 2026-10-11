@@ -12,49 +12,28 @@ function pinterestItem(id, title, trendType, rank) {
 
 describe('extractCandidates', () => {
   test('returns nothing when there is no real evidence', () => {
-    assert.deepEqual(extractCandidates({ theme: 'rice_basics', themeLabel: 'Rice cooking & prep' }), []);
+    assert.deepEqual(extractCandidates({ theme: 'rice_basics' }), []);
   });
 
   test('every candidate is traceable to a real source_items id, never invented', () => {
     const items = [searchItem(101, [{ query: 'air fryer rice paper rolls', value: 80 }])];
-    const candidates = extractCandidates({ theme: 'rice_basics', themeLabel: 'Rice cooking & prep', searchItems: items, seedQueries: ['cook rice'] });
+    const candidates = extractCandidates({ theme: 'rice_basics', searchItems: items });
     assert.equal(candidates.length, 1);
     assert.equal(candidates[0].members[0].sourceItemId, 101);
   });
 
-  test('a seed query appearing as its own related query classifies macro, not micro', () => {
-    const items = [searchItem(1, [], [{ query: 'cook rice', value: 90 }])];
-    const candidates = extractCandidates({ theme: 'rice_basics', themeLabel: 'Rice cooking & prep', searchItems: items, seedQueries: ['cook rice', 'wash rice'] });
-    assert.equal(candidates[0].candidateType, 'macro');
-  });
-
-  test('an evergreen baseline phrase stays macro, not a microtrend just for being a full question', () => {
-    const items = [searchItem(1, [{ query: 'how to cook sushi rice', value: 60 }])];
-    const candidates = extractCandidates({
-      theme: 'sushi_asian', themeLabel: 'Sushi & Asian cooking', searchItems: items,
-      seedQueries: ['sushi', 'sushi rice'], evergreenBaselines: ['how to cook sushi rice']
-    });
-    assert.equal(candidates[0].candidateType, 'macro');
-  });
-
-  test('a genuinely specific rising query is classified micro', () => {
+  // Classification (macro/micro/seasonal) is Claude's call now
+  // (src/candidateAnalyst.js), not this module's -- extraction only
+  // extracts and clusters, it never decides what a candidate means.
+  test('every candidate carries a stable clusterKey for candidateAnalyst to reference', () => {
     const items = [searchItem(1, [{ query: 'air fryer rice paper rolls', value: 80 }])];
-    const candidates = extractCandidates({
-      theme: 'rice_basics', themeLabel: 'Rice cooking & prep', searchItems: items,
-      seedQueries: ['cook rice'], evergreenBaselines: ['how to cook rice']
-    });
-    assert.equal(candidates[0].candidateType, 'micro');
-  });
-
-  test('a seasonal occasion phrase is classified seasonal', () => {
-    const items = [searchItem(1, [{ query: 'christmas rice pudding', value: 50 }])];
-    const candidates = extractCandidates({ theme: 'seasonal', themeLabel: 'Seasonal occasions', searchItems: items, seedQueries: ['christmas'] });
-    assert.equal(candidates[0].candidateType, 'seasonal');
+    const candidates = extractCandidates({ theme: 'rice_basics', searchItems: items });
+    assert.equal(candidates[0].clusterKey, `rice_basics::${candidates[0].normalizedKey}`);
   });
 
   test('Pinterest growing terms become candidates with the matched row as their evidence', () => {
     const items = [pinterestItem(55, 'air fryer rice bowls', 'growing', 3)];
-    const candidates = extractCandidates({ theme: 'rice_basics', themeLabel: 'Rice cooking & prep', pinterestItems: items, seedQueries: ['cook rice'] });
+    const candidates = extractCandidates({ theme: 'rice_basics', pinterestItems: items });
     assert.equal(candidates.length, 1);
     assert.equal(candidates[0].members[0].sourceItemId, 55);
     assert.equal(candidates[0].members[0].sourceType, 'apify_pinterest');
@@ -63,9 +42,7 @@ describe('extractCandidates', () => {
   test('the same underlying phrase from Google and Pinterest clusters into one candidate with both as evidence', () => {
     const searchItems = [searchItem(1, [{ query: 'air fryer rice paper rolls', value: 70 }])];
     const pinterestItems = [pinterestItem(2, 'air fryer rice paper roll', 'growing', 5)];
-    const candidates = extractCandidates({
-      theme: 'rice_basics', themeLabel: 'Rice cooking & prep', searchItems, pinterestItems, seedQueries: ['cook rice']
-    });
+    const candidates = extractCandidates({ theme: 'rice_basics', searchItems, pinterestItems });
     assert.equal(candidates.length, 1);
     const sourceTypes = candidates[0].members.map((m) => m.sourceType);
     assert.ok(sourceTypes.includes('dataforseo_trends'));
@@ -74,7 +51,7 @@ describe('extractCandidates', () => {
 
   test('distinct unrelated candidates are never collapsed into one', () => {
     const items = [searchItem(1, [{ query: 'air fryer rice paper rolls', value: 70 }, { query: 'jasmine rice storage tips', value: 40 }])];
-    const candidates = extractCandidates({ theme: 'rice_basics', themeLabel: 'Rice cooking & prep', searchItems: items, seedQueries: ['cook rice'] });
+    const candidates = extractCandidates({ theme: 'rice_basics', searchItems: items });
     assert.equal(candidates.length, 2);
   });
 
@@ -83,7 +60,7 @@ describe('extractCandidates', () => {
     // passing theme-matched evidence that isn't search or Pinterest should
     // simply produce no candidates, confirming corroboration-only sources
     // can't smuggle an invented phrase in.
-    const candidates = extractCandidates({ theme: 'rice_basics', themeLabel: 'Rice cooking & prep', seedQueries: ['cook rice'] });
+    const candidates = extractCandidates({ theme: 'rice_basics' });
     assert.deepEqual(candidates, []);
   });
 });

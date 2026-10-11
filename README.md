@@ -12,9 +12,11 @@ range and content themes.
 - **Social trends** -- Reddit, TikTok, Instagram and Pinterest Trends via Apify, each independently feature-flagged.
 - **Google News RSS** -- free, no API key, feeds evidence and rationale (no separate News panel; it's not a source_type with its own signal, just extra corroborating evidence).
 - **Today screen** -- top 3 evidence-backed recommendations, evidence drawer, History (by-date report browsing), filters (theme/audience/state) persisted in the URL.
-- **Microtrend discovery** -- each of today's 3 slots is a specific, evidence-backed microtrend inside a theme when one qualifies, not just the theme itself (section 5c); "What's emerging" surfaces every real microtrend tracked today that didn't win a slot.
+- **Claude-authoritative candidate analysis** -- mandatory, not optional: Claude interprets what today's evidence means (macro/micro/seasonal, brand relevance, product fit, the actual proposed action); deterministic code validates evidence/products and owns the final tier. No AI = zero recommendations that day, shown plainly, never a generic fallback (sections 5, 5c).
+- **Microtrend discovery** -- each of today's 3 slots is a specific, evidence-backed candidate inside a theme when one qualifies, not just the theme itself; "What's emerging" surfaces every real candidate tracked today that didn't win a slot.
 - **Recommendation feedback** -- Useful / Already covered / Not relevant / Don't show again, each a precise deterministic exclusion rule, plus a Hidden & covered items manager with Undo (section 5c).
-- **Deterministic scoring** -- freshness 25% / velocity 25% / cross-source agreement 20% / relevance 20% / seasonal fit 10% at the theme level, a separate microtrend-level formula underneath (section 5c). No LLM touches either set of numbers; only the score components decide what gets shown, in what order, with what confidence.
+- **Idea Tracker** -- a second tab: one row per stable action, searchable/filterable, with workflow status, feedback, owner, notes and a content URL editable from the table, full audit history (section 5d).
+- **Deterministic scoring** -- freshness 25% / velocity 25% / cross-source agreement 20% / relevance 20% / seasonal fit 10% at the theme level, a separate candidate-level formula underneath that uses Claude's own brand-relevance judgment as one real input (section 5c). The score, confidence and final tier are never decided by Claude -- only the score components decide what gets shown, in what order, with what confidence.
 
 ## What's deliberately not built yet
 
@@ -42,6 +44,13 @@ the original URL, raw payload, and collection timestamp. A recommendation
 with zero real evidence is never created -- if fewer than 3 themes have
 actual collected evidence on a given day, fewer than 3 recommendations are
 shown. Nothing is padded to hit "exactly 3."
+
+A recommendation also never exists without a valid Claude candidate
+analysis behind it (section 5). If `ANTHROPIC_API_KEY` is missing, or the
+call fails validation after one retry, the dashboard shows real signals
+and theme history as normal but zero recommendations, with "AI analysis
+unavailable" stated plainly -- never a generic deterministic sentence
+standing in for one.
 
 ## 1. Local setup
 
@@ -206,32 +215,53 @@ plain 0-1 input:
 Scoring itself has no LLM in it, and never will -- score, confidence and
 which 3 opportunities win stay 100% deterministic and auditable.
 
-## 5. Recommendation rationale (LLM strategist, optional)
+## 5. Candidate analysis (Claude, mandatory)
 
-`src/llmStrategist.js` writes the rationale sentence for each of the top 3
-recommendations, reading the same real evidence the score was computed
-from -- rising/top queries, regional interest, matched social/Pinterest
-post excerpts, and which sources independently flag this theme as
-rising/growing right now (`momentumSources`, see section 3a) -- plus
-SunRice's real product range (`src/products.js`, 66
-products, confirmed directly against the live "Showing 66 Products" count
-on sunrice.com.au -- the site is JS-rendered and couldn't be scraped
-automatically, so the client pasted the actual rendered product grid).
-This is what lets it notice things the deterministic scorer structurally
-can't, like a rising "biryani" query under a curry theme mapping onto
-Basmati Rice -- the scorer only counts signals, it has no idea what
-biryani *is*.
+`src/candidateAnalyst.js` is not a nice-to-have prose layer -- it is
+load-bearing. Claude is authoritative for interpreting what today's real
+evidence *means*: whether a candidate is macro/micro/seasonal, whether
+it's genuinely distinct from an obvious evergreen topic, its semantic
+relationship to other candidates, brand relevance, product fit, why it
+matters now, and the specific action to propose. Deterministic code stays
+authoritative for everything measurable on top of that: whether cited
+evidence exists, source metrics, freshness/velocity/agreement math,
+recommendation history, feedback exclusions, deduplication, and --
+critically -- the final Watch/Investigate/Create tier. See section 5c for
+the full pipeline; this section is about the call itself.
 
-Hard boundaries, enforced in code not just prompted for:
-- It never sees or touches score, confidence, action_type, or which themes
-  make the top 3 -- all of that is decided before this runs.
-- It's given a fixed, real product list and told never to suggest anything
-  outside it.
-- No `ANTHROPIC_API_KEY`, a failed call, or a suspicious response (empty,
-  or implausibly long) all fall back to the existing deterministic template
-  sentence -- this is a nice-to-have layer, never a dependency the report
-  needs to succeed. The multicultural-discovery compliance disclaimer is
-  fixed wording and is never handed to the LLM at all.
+One batched call per ingest run covers every candidate across every theme
+together (not one call per candidate), so Claude can compare signals
+against each other and judge which ones are genuinely distinctive. Given
+SunRice's real product range (`src/products.js`, 66 products, confirmed
+directly against the live "Showing 66 Products" count on sunrice.com.au --
+the site is JS-rendered and couldn't be scraped automatically, so the
+client pasted the actual rendered product grid), each theme's seed
+queries/evergreen baselines, and past "useful" feedback for style
+reference, Claude returns one structured assessment per candidate (or per
+group of candidates it judges to be the same idea in different words --
+see "semantic merges" in 5c).
+
+Deterministic validation on every assessment before it can become a
+recommendation:
+- Every cited `evidenceId` must be real and must belong to the candidate(s)
+  that assessment actually references -- an invented ID, or one borrowed
+  from a different candidate, gets silently dropped; if NONE of an
+  assessment's cited IDs survive, the whole assessment is rejected.
+- `productConnection` must be empty or contain only exact names from the
+  real catalogue -- one invented name rejects the whole assessment.
+- The same fabricated-absolute-number safety net as before (a k/K-suffixed
+  or comma-grouped number in free text is a tell nothing in real evidence
+  ever produces).
+- `classification` must be `macro`, `micro`, or `seasonal`; a concrete
+  `recommendedAction` is required.
+
+No `ANTHROPIC_API_KEY`, or a call that still fails validation/parsing after
+one retry, returns `status: 'unavailable'` -- `reportBuilder.js` then
+builds signals and theme history as normal but creates **zero**
+recommendations for that report, and the dashboard says "AI analysis
+unavailable" plainly. There is no deterministic fallback copy to catch
+the fall -- that was the explicit correction this round made: AI usage
+here is mandatory, not decorative.
 
 ## 5a. Theme lifecycle, trend history and recommendation memory
 
@@ -330,83 +360,95 @@ obvious case of clicking Refresh twice in a row; the real enforcement is
 always `ingest.js`'s own acquire, since the peek-then-spawn has an
 unavoidable small race window.
 
-## 5c. Microtrend discovery and feedback
+## 5c. Candidate discovery, Claude-authoritative analysis, and feedback
 
-The daily recommendation unit changed from "a theme" to "a specific,
-evidence-backed microtrend inside a theme" -- everything in 5a/5b above
-(theme snapshots, lifecycle, theme-level recommendation memory) is kept
-exactly as it was and still drives the "National theme momentum" section;
-this is an additional layer underneath the top-3 slots, not a replacement
-for it.
+The daily recommendation unit is "a specific, evidence-backed candidate
+inside a theme" (macro, micro, or seasonal -- Claude decides which, see
+section 5). Theme snapshots/lifecycle/theme-level ranking (5a) are kept
+exactly as they were and still drive the "National theme momentum"
+section and decide which 3 themes' slots compete for a recommendation
+today -- this candidate layer decides what (if anything) fills each slot.
 
-**Candidate extraction (`src/microtrendExtraction.js`)** pulls real
-candidate phrases only from evidence that can name a specific `source_items`
-row as proof: each `dataforseo_trends` row's own rising/top related
-queries, and each matched Pinterest trend-list row's own term. News and
-real social posts (Reddit/TikTok/Instagram) stay corroboration only -- there
-is no reliable way to pull a specific emerging phrase out of a post/article
-body without an LLM inventing one, which this explicitly never does.
+**Extraction (`src/microtrendExtraction.js`)** pulls real candidate
+phrases only from evidence that can name a specific `source_items` row as
+proof: each `dataforseo_trends` row's own rising/top related queries, and
+each matched Pinterest trend-list row's own term. News and real social
+posts (Reddit/TikTok/Instagram) stay corroboration only -- there is no
+reliable way to pull a specific emerging phrase out of a post/article body
+without inventing one.
 
-**Normalization, clustering, classification (`src/microtrends.js`)** is
-deterministic text processing, no vector database or embeddings: lowercase
-+ punctuation-strip + singularize + a small synonym map produces a
+**First-pass clustering (`src/microtrends.js`)** is deterministic text
+processing only, no vector database or embeddings: lowercase +
+punctuation-strip + singularize + a small synonym map produces a
 `normalized_key`; near-duplicates cluster via stopword-filtered token
-overlap. Each cluster classifies as:
-- **macro** -- identical (post-normalization) to the theme's own seed query
-  or an editorial evergreen-baseline phrase (`evergreenBaselines` in
-  `src/topics.js`, e.g. "how to cook sushi rice" under Sushi & Asian
-  cooking). Macros are suppressed for 30 days after first being shown,
-  unless something genuinely changes (a new contributing source type, or a
-  verified acceleration past anything seen before) -- otherwise every report
-  would "discover" the same evergreen basics every single day.
-- **seasonal** -- tied to a known dated occasion, regardless of theme.
-- **micro** -- everything else. The default is specificity: nothing is
-  treated as a microtrend just because it's a long or unusual-sounding
-  phrase, and nothing evergreen is promoted to "trend" status just because
-  it happened to phrase itself as a question.
+overlap. This used to also decide macro/micro/seasonal classification --
+that's now Claude's call (section 5), since judging whether something is
+genuinely a fresh, specific idea vs. an obvious evergreen restatement is
+exactly the kind of semantic read deterministic string-matching can't
+reliably make.
 
-**Scoring (`src/microtrendScoring.js`)** is a separate deterministic formula
-from theme-level `scoring.js` -- freshness 20% / velocity 25% / agreement
-20% / relevance 15% / novelty 10% / evidence quality 10%, same "every
-component is a plain 0-1 input, weights sum to 1" auditability rule. Novelty
-specifically decays the more times this exact microtrend has already won a
-recommendation slot, so a strong microtrend that keeps winning on its own
-merits doesn't also get credited as "new" forever. Velocity only trusts a
-real number from DataForSEO's rising-query value (Pinterest's rank/count
-fields have no confirmed scale, same caution as section 3a) -- without one,
-it falls back to the source's own rising/growing classification flag.
-Microtrends never compete across themes for a slot: each of the existing
-top-3 theme slots tries to fill itself with that theme's own best-qualifying
-microtrend first, falling back to the theme-level recommendation (now
-tagged `recommendation_kind: 'baseline_opportunity'`) only when none exists
-or qualifies -- this keeps the existing theme-ranking mechanism as the
-safety net rather than risking an unfamiliar cross-theme reshuffle.
+**Semantic merges**: Claude can additionally unify candidates this
+deterministic first pass missed -- two genuinely different wordings for
+the same real idea that don't share enough tokens to cluster
+automatically. When it does, every merged clusterKey beyond the canonical
+one is recorded on that microtrend's `semantic_merges` column (original
+wording + when), so the grouping stays auditable rather than silently
+reshaping history.
 
-**Every microtrend observed today, win or not**, gets persisted
+**Scoring (`src/microtrendScoring.js`)** is a separate deterministic
+formula from theme-level `scoring.js` -- freshness 20% / velocity 25% /
+agreement 20% / relevance 15% / novelty 10% / evidence quality 10%, same
+"every component is a plain 0-1 input, weights sum to 1" auditability
+rule. **Relevance is now Claude's own `brandRelevance` judgment**, not a
+static per-theme map -- a direct, measurable use of Claude's semantic read
+rather than cosmetic prose. Novelty decays the more times this exact
+candidate has already won a slot, so a strong one that keeps winning on
+its own merits doesn't also get credited as "new" forever. Velocity only
+trusts a real number from DataForSEO's rising-query value (Pinterest's
+rank/count fields have no confirmed scale) -- without one, it falls back
+to the source's own rising/growing flag. Candidates never compete across
+themes for a slot: each of the top-3 theme slots fills itself from that
+theme's own best-qualifying, Claude-analyzed candidate, highest score
+first; **if none exists or qualifies, that slot gets no recommendation at
+all** -- there is no deterministic fallback standing in.
+
+**Macro suppression**: a macro candidate (identical to the theme's own
+seed query or an evergreen baseline, e.g. "how to cook sushi rice" under
+Sushi & Asian cooking) is shown once, then suppressed for 30 days unless
+something genuinely changes (a new contributing source type, or a
+verified acceleration past anything seen before) -- otherwise every report
+would "discover" the same evergreen basics every single day.
+
+**Every candidate Claude assessed today, win or not**, gets persisted
 (`microtrends` / `microtrend_observations` / `microtrend_evidence`, plus a
-recomputed `last_score`) -- this is what powers **"What's emerging"**, a new
-section between today's 3 priorities and theme momentum: real microtrends
-tracked today that didn't win a slot, ranked purely by their own score,
-never padded.
+recomputed `last_score`) -- this is what powers **"What's emerging"**,
+between today's 3 priorities and theme momentum: real candidates tracked
+today that didn't win a slot, ranked purely by their own score, never
+padded.
 
 **Feedback (`src/feedback.js`, `recommendation_feedback` table)** is used
-only as explicit, named exclusion rules -- never silent material for an LLM
-to infer a hidden preference profile from:
-- **Useful** -- no suppression; stored as a positive example shown directly
-  and transparently to the LLM strategist for style/channel reference on
-  future recommendations for that theme (never a reason to repeat an idea
-  outright). Every 10 new "useful" examples should trigger a human-reviewed
-  summary before anything acts on the pattern (`needsBrandPreferenceReview`)
-  -- the summary itself is plain counts, never an LLM-inferred profile.
+only as explicit, named exclusion rules -- never silent material for an
+LLM to infer a hidden preference profile from:
+- **Useful** -- no suppression; stored as a positive example shown
+  directly and transparently to Claude for style/channel reference on
+  future candidates for that theme (never a reason to repeat an idea
+  outright, and never a trend-metric boost). Every 10 new "useful"
+  examples should trigger a human-reviewed summary before anything acts on
+  the pattern (`needsBrandPreferenceReview`) -- the summary itself is
+  plain counts, never an LLM-inferred profile.
 - **Already covered** / **Don't show this idea again** -- both suppress by
   the specific `action_fingerprint` (the proposed products/channel/format/
-  angle), not the underlying microtrend, so a genuinely different angle on
-  the same real microtrend is never blocked. When no real LLM action ever
-  existed to fingerprint (no API key, a failed call, a rejected response),
-  there's no finer-grained "angle" to suppress than the microtrend's own
-  deterministic recommendation, so this correctly falls back to hiding the
-  whole microtrend instead of silently staying eligible forever.
-- **Not relevant** -- hides the whole microtrend cluster permanently.
+  angle), not the underlying candidate, so a genuinely different angle on
+  the same real candidate is never blocked. (Every validated Claude
+  assessment carries a real proposed action, so unlike the retired
+  LLM-prose-only flow, this fingerprint is never degenerate/empty.)
+- **Not relevant** -- hides the whole candidate cluster permanently.
+
+An idea's `workflow_status` (see 5d) can also suppress it: `implemented`
+adds that `action_fingerprint` to the same suppression set as
+`dont_show_again`/`already_covered` (presenting it again as "new" would be
+wrong), while `ignored` deliberately does **not** suppress anything -- a
+human skipping it once isn't the same as permanently hiding it.
 
 `recommendation_feedback.recommendation_id` is nullable with
 `ON DELETE SET NULL`, deliberately not `CASCADE` -- `buildReport()` deletes
@@ -418,25 +460,62 @@ stored directly on the feedback row specifically so the exclusion rules
 never need a live `recommendation_id` to keep working.
 
 Feedback-writing endpoints (`POST /api/recommendations/:id/feedback`,
-`POST /api/feedback/:id/undo`) are gated behind `EDITOR_TOKEN` -- same
-session-scoped UX as `ADMIN_TOKEN` (browser prompt, `sessionStorage`, never
-written to the report JSON or any source file), but a separate token, since
-feedback is a distinct, lower-risk write than triggering a paid ingest run.
-Reading feedback (`GET /api/feedback/active`, the "Hidden & covered items"
-manager on the dashboard) stays public, same as every other report read.
+`POST /api/feedback/:id/undo`, plus the Idea Tracker's own `/api/ideas/*`
+mutations below) are gated behind `EDITOR_TOKEN` -- same session-scoped UX
+as `ADMIN_TOKEN` (browser prompt, `sessionStorage`, never written to the
+report JSON or any source file), but a separate token, since these are a
+distinct, lower-risk write than triggering a paid ingest run. Reading
+feedback (`GET /api/feedback/active`, the "Hidden & covered items" manager
+on the dashboard) stays public, same as every other report read.
 
-**Two semantic contradictions fixed in this round:**
+**Two semantic contradictions fixed along the way:**
 - A theme's "recommended N times in the last 14 days" count used to differ
   by one depending on which part of the dashboard showed it (the theme
   momentum card counted today's own just-created recommendation; the
   priority card's own count didn't) -- both now mean the same thing,
   appearances strictly before today.
 - `action_type: 'Create'` could be shown with no concrete action behind it
-  whenever the LLM strategist didn't run -- the LLM's own validated
-  `recommendedAction` field is now actually stored and surfaced ("Do this:
-  ..." on the card), and `Create` deterministically downgrades to
-  `Investigate` whenever no real `recommendedAction` exists, rather than
-  asserting a verdict this system can't back with anything specific.
+  whenever the (now-retired) LLM prose layer didn't run. This is now
+  structurally impossible: `validateAssessment` rejects any candidate
+  analysis missing a concrete `recommendedAction` before it can become a
+  recommendation at all, and that action is actually stored and surfaced
+  ("Do this: ..." on the card).
+
+## 5d. Idea Tracker
+
+A second tab, independent of the daily Today view: one row per stable
+`action_fingerprint` (the specific proposed action), not one row per daily
+appearance -- a microtrend recommended 5 days running with the same
+execution is one row with `recommendation_count: 5`, and a materially
+different execution on the same microtrend is a different row with its
+own fingerprint. `first_recommended_at`/`last_recommended_at`/
+`recommendation_count` are computed live from the real `recommendations`
+history on every read (`getIdeas` in `src/db.js`), never a hand-maintained
+counter -- nothing to keep in sync, no same-day-rebuild double-counting
+risk.
+
+Two fields the brief is explicit must never be conflated:
+- **`workflow_status`** (`ideas` table) -- `new` / `reviewing` / `planned`
+  / `in_production` / `implemented` / `ignored`. Where this idea sits in
+  the team's own pipeline. Edited from the table, logged to
+  `idea_status_history` (previous value, new value, timestamp) on every
+  real change.
+- **`feedback_type`** -- read live from `recommendation_feedback` (the
+  same system the main dashboard's feedback buttons use), never duplicated
+  onto the `ideas` table. Giving feedback from the tracker
+  (`POST /api/ideas/:fingerprint/feedback`) attaches to that idea's most
+  recent real recommendation row and updates the exact same record the
+  main dashboard would -- there is only one feedback system, two places to
+  use it.
+
+Filters: date range, theme, microtrend, workflow status, feedback, tier
+(Watch/Investigate/Create), source, plus free-text search over the idea
+name/action/notes. Default sort is newest first. Compact summary tiles
+(New / Planned+In production / Implemented / Ignored) sit above the table,
+computed from real `workflow_status` counts (`GET /api/ideas/summary`).
+Owner, notes, and an optional content URL are plain editable fields on
+each row, saved via `PATCH /api/ideas/:fingerprint` -- same `EDITOR_TOKEN`
+gate as feedback, read access public.
 
 ## 6. Deploy to Render
 

@@ -1,20 +1,23 @@
 const {
   pool, insertSignal, insertRecommendation, linkEvidence,
-  upsertThemeSnapshot, getPriorThemeSnapshots, getRecentRecommendations, getRecentRecommendationsForMicrotrend,
-  getSameDayRecommendations,
+  upsertThemeSnapshot, getPriorThemeSnapshots, getRecentRecommendationsForMicrotrend, getSameDayRecommendations,
   upsertMicrotrend, getMicrotrendObservationHistory, recordMicrotrendObservation, linkMicrotrendEvidence,
   updateMicrotrendScore, setMicrotrendStatus, getActiveExclusions, getPositiveFeedbackExamples,
-  countRecentMicrotrendRecommendations, getMicrotrendEvidence
+  countRecentMicrotrendRecommendations, getMicrotrendEvidence, setReportAiStatus, ensureIdeaExists
 } = require('./db');
 const { ALL_TOPICS, evergreenBaselinesForTheme } = require('./topics');
 const { scoreOpportunity, confidenceFor, actionTypeFor } = require('./scoring');
-const { writeRationale } = require('./llmStrategist');
 const { themeLifecycleFor } = require('./themeLifecycle');
 const { computeActionFingerprint, determineContinuityStatus } = require('./continuity');
 const { extractCandidates, aggregateObservations, evidenceLinksFor } = require('./microtrendExtraction');
 const { hasMaterialChange } = require('./microtrends');
 const { scoreMicrotrend, qualifiesForRecommendation, confidenceForMicrotrend, actionTypeForMicrotrend } = require('./microtrendScoring');
-const { applyExclusions } = require('./feedback');
+// Namespace import, not destructured -- reportBuilder.test.js monkeypatches
+// candidateAnalyst.analyzeCandidates on this shared module object to test
+// the AI-succeeds path without a real network call. A destructured
+// `const { analyzeCandidates } = require(...)` would capture the original
+// function reference at load time and never see that patch.
+const candidateAnalyst = require('./candidateAnalyst');
 
 const THEME_LABELS = Object.fromEntries(ALL_TOPICS.map((t) => [t.theme, t.label]));
 const REQUIRES_REVIEW = new Set(ALL_TOPICS.filter((t) => t.requiresReview).map((t) => t.theme));
@@ -43,14 +46,12 @@ const THEME_AUDIENCE = {
   multicultural: 'multicultural audiences'
 };
 
-// Fixed editorial priority per theme -- rice cooking fundamentals and the
-// meal/cuisine themes are this brand's core, highest-value content; lunchbox
-// snacks is real but narrower, so it's weighted down rather than treated as
-// equally important by default. Not derived from any live metric, same as
-// THEME_AUDIENCE/seasonalFit above and below. multicultural is deliberately
-// left out here -- its relevance is already forced to 0.5 by the
-// requiresReview lock regardless of this map, so giving it its own entry
-// would just be a second, easily-stale way of saying the same thing.
+// Fixed editorial priority used ONLY for theme-level ranking (which 3
+// themes' slots compete for a recommendation today) -- NOT for a
+// candidate's own relevance score, which is Claude's brandRelevance
+// judgment (see scoreThemeCandidates below). Not derived from any live
+// metric. multicultural is deliberately left out -- its weight is already
+// forced to 0.5 by the requiresReview lock regardless of this map.
 const THEME_RELEVANCE = {
   rice_basics: 1,
   weeknight_dinners: 1,
@@ -60,21 +61,6 @@ const THEME_RELEVANCE = {
   seasonal: 1,
   lunchbox_snacks: 0.7
 };
-
-// "CREATE must have a concrete action" (brief section 11) -- a Create
-// verdict implies there's an actual, specific thing to go do; scoreOpportunity/
-// scoreMicrotrend decide the Create/Investigate/Watch split purely from real
-// evidence, but that number alone says nothing about whether a concrete
-// recommendedAction actually exists to show. Downgrading Create to
-// Investigate here when strategy is null (no API key, a failed call, or a
-// validation rejection all mean no real action was produced) is still a
-// deterministic, auditable rule -- not the LLM choosing the action type,
-// just this system refusing to claim "go create this" with nothing concrete
-// behind it.
-function resolveActionType(actionType, strategy) {
-  if (actionType === 'Create' && !strategy?.recommendedAction) return 'Investigate';
-  return actionType;
-}
 
 function suggestedChannelFor(realSocialPostCount, hasSearch) {
   if (realSocialPostCount > 0) return 'Short-form video (TikTok/Instagram)';
@@ -219,45 +205,53 @@ function materialChangeInputs(priorHistory, todayObservations) {
   return { historicalSourceTypes, todaySourceTypes, todayVelocityPct };
 }
 
-// Extracts, scores and persists every real microtrend candidate inside one
-// theme's today's evidence -- for EVERY theme with evidence, not only the
-// top 3 that go on to compete for an actual recommendation slot. This is
-// what makes the Emerging section possible: a microtrend's score and
-// history accumulate regardless of whether its theme wins a slot today.
-// Observations and evidence are recorded for every candidate unconditionally
-// -- qualification/hidden status controls whether it can WIN a
-// recommendation, never whether its own history keeps accumulating.
-async function processThemeMicrotrends(opp, reportId, reportDate, exclusions) {
-  const label = THEME_LABELS[opp.theme];
+// For each of Claude's validated assessments, merges the first-pass
+// cluster(s) it referenced into one microtrend identity, persists
+// observations/evidence (for EVERY theme's candidates, not only the top 3
+// -- this is what makes the Emerging section possible), scores it using
+// Claude's own brandRelevance as the relevance input, and determines
+// whether it's eligible to win a slot (macro baseline suppression, the
+// not_relevant/dont_show_again/already_covered/implemented exclusions).
+// Claude is authoritative for classification/relevance/product fit/the
+// proposed action; this function is authoritative for everything
+// measurable built on top of that -- evidence, momentum math, history,
+// exclusions, dedup.
+async function processThemeAssessments(opp, assessments, rawCandidateByClusterKey, reportId, reportDate, exclusions) {
   const forceEarlySignal = REQUIRES_REVIEW.has(opp.theme);
-  const candidates = extractCandidates({
-    theme: opp.theme,
-    themeLabel: label,
-    searchItems: opp.searchItemsForTheme,
-    pinterestItems: opp.pinterestItemsForTheme,
-    seedQueries: opp.topic.queries,
-    evergreenBaselines: evergreenBaselinesForTheme(opp.theme)
-  });
-
   const results = [];
-  for (const candidate of candidates) {
+
+  for (const assessment of assessments) {
+    const referencedCandidates = assessment.clusterKeys.map((k) => rawCandidateByClusterKey.get(k)).filter(Boolean);
+    if (referencedCandidates.length === 0) continue; // defensive -- validateAssessment already guarantees this
+
+    // Canonical identity for the merged group: whichever referenced
+    // candidate has the most real evidence members. The others are
+    // recorded as semantic merges on that canonical microtrend -- Claude's
+    // judgment that differently-worded candidates are the same idea,
+    // stored and auditable, never silently applied.
+    const canonical = [...referencedCandidates].sort((a, b) => b.members.length - a.members.length)[0];
+    const semanticMerges = referencedCandidates
+      .filter((c) => c !== canonical)
+      .map((c) => ({ normalizedKey: c.normalizedKey, sourceWording: c.sourceWording, mergedAt: reportDate }));
+
     const microtrend = await upsertMicrotrend({
       theme: opp.theme,
-      normalizedKey: candidate.normalizedKey,
-      displayName: candidate.displayName,
-      sourceWording: candidate.sourceWording,
-      candidateType: candidate.candidateType,
-      observedDate: reportDate
+      normalizedKey: canonical.normalizedKey,
+      displayName: assessment.candidateName,
+      sourceWording: canonical.sourceWording,
+      candidateType: assessment.classification,
+      observedDate: reportDate,
+      semanticMerges
     });
 
+    const allMembers = referencedCandidates.flatMap((c) => c.members);
     const fullHistory = await getMicrotrendObservationHistory(microtrend.id);
     const priorHistory = fullHistory.filter((h) => new Date(h.report_date).toISOString().slice(0, 10) < reportDate);
-    const todayObservations = aggregateObservations(candidate.members);
-    const distinctSourceCount = new Set(candidate.members.map((m) => m.sourceType)).size;
-    const uniqueSourceItemCount = new Set(candidate.members.map((m) => m.sourceItemId)).size;
+    const todayObservations = aggregateObservations(allMembers);
+    const distinctSourceCount = new Set(allMembers.map((m) => m.sourceType)).size;
+    const uniqueSourceItemCount = new Set(allMembers.map((m) => m.sourceItemId)).size;
     // True first-seen (microtrends.first_seen_at, set once on first insert
-    // and never overwritten) -- never an evidence item's own published_at,
-    // same rule theme_daily_snapshots.first_observed_date already follows.
+    // and never overwritten) -- never an evidence item's own published_at.
     const daysOld = (new Date(reportDate) - new Date(microtrend.first_seen_at)) / 86400000;
     const priorRecommendationCount = await countRecentMicrotrendRecommendations(microtrend.id, reportDate, 30, reportId);
 
@@ -266,7 +260,9 @@ async function processThemeMicrotrends(opp, reportId, reportDate, exclusions) {
       observationHistory: priorHistory,
       todayObservations,
       distinctSourceCount,
-      relevance: forceEarlySignal ? 0.5 : (THEME_RELEVANCE[opp.theme] ?? 1),
+      // Claude's own judgment of brand relevance -- authoritative, replaces
+      // the old static THEME_RELEVANCE lookup for this specific input.
+      relevance: forceEarlySignal ? 0.5 : assessment.brandRelevance,
       daysSinceFirstSeen: daysOld,
       priorRecommendationCount,
       uniqueSourceItemCount
@@ -278,90 +274,61 @@ async function processThemeMicrotrends(opp, reportId, reportDate, exclusions) {
         metricValue: obs.metricValue, evidenceCount: obs.evidenceCount, sourceNativeClassification: obs.sourceNativeClassification
       });
     }
-    for (const link of evidenceLinksFor(candidate.members)) {
+    for (const link of evidenceLinksFor(allMembers)) {
       await linkMicrotrendEvidence(microtrend.id, reportId, link.sourceItemId, link.matchType);
     }
     await updateMicrotrendScore(microtrend.id, reportId, score, components);
 
     let qualifies = true;
-    if (candidate.candidateType === 'macro') {
+    if (assessment.classification === 'macro') {
       const { historicalSourceTypes, todaySourceTypes, todayVelocityPct } = materialChangeInputs(priorHistory, todayObservations);
       const materialChange = hasMaterialChange({ historicalSourceTypes, todaySourceTypes, historicalMaxVelocity: null, todayVelocityPct });
       qualifies = qualifiesForRecommendation({
-        candidateType: candidate.candidateType, baselineShownAt: microtrend.baseline_shown_at, reportDate,
+        candidateType: assessment.classification, baselineShownAt: microtrend.baseline_shown_at, reportDate,
         materialChangeSinceBaseline: materialChange
       });
     }
 
+    // Every validated assessment carries a real proposedAction, so this
+    // fingerprint is never degenerate/empty the way the old LLM-prose-only
+    // flow's fingerprint could be when there was nothing to compare.
+    const actionFingerprint = computeActionFingerprint({
+      theme: opp.theme,
+      primaryProducts: assessment.productConnection,
+      channel: assessment.proposedAction.channel,
+      format: assessment.proposedAction.format,
+      creativeAngle: assessment.proposedAction.creativeAngle
+    });
+
     results.push({
-      microtrend, candidate, score, components, distinctSourceCount, uniqueSourceItemCount,
-      qualifies, hidden: exclusions.hiddenMicrotrendIds.has(microtrend.id)
+      microtrend, assessment, allMembers, score, components, distinctSourceCount, uniqueSourceItemCount,
+      qualifies, hidden: exclusions.hiddenMicrotrendIds.has(microtrend.id),
+      actionFingerprint, suppressed: exclusions.suppressedFingerprints.has(actionFingerprint)
     });
   }
   return results.sort((a, b) => b.score - a.score);
 }
 
-// Tries each qualifying, non-hidden microtrend candidate in score order
-// until one's generated action isn't itself suppressed (already_covered /
-// dont_show_again key off the specific action_fingerprint, not the
-// microtrend -- see feedback.js) -- so a suppressed angle on the
-// top-ranked microtrend simply falls through to the next-best real
-// candidate rather than silently losing the theme's recommendation slot
-// for the day. Returns null if nothing in the list is winnable (no
-// candidates at all, or every one hidden/unqualified/suppressed), which
-// is exactly when the caller falls back to the theme-level
-// baseline_opportunity path.
-async function pickWinningMicrotrend(opp, reportId, reportDate, exclusions, context) {
-  const label = THEME_LABELS[opp.theme];
-  const winnable = (opp.microtrendCandidates || []).filter((c) => c.qualifies && !c.hidden);
-  for (const entry of winnable) {
-    const microtrendRecentRecs = await getRecentRecommendationsForMicrotrend(entry.microtrend.id, reportDate, 14, reportId);
-    const positiveExamples = await getPositiveFeedbackExamples(opp.theme, 5);
-    const strategy = await writeRationale({
-      themeLabel: label,
-      actionType: actionTypeForMicrotrend(entry.score),
-      distinctSourceCount: entry.distinctSourceCount,
-      risingQueries: opp.risingQueries,
-      topQueries: opp.topQueries,
-      interestByRegion: opp.interestByRegion,
-      socialExamples: opp.socialExamples,
-      momentumSources: opp.momentumSources,
-      recentRecs: microtrendRecentRecs,
-      sameDayRec: context.sameDayRec,
-      lifecycle: opp.lifecycle,
-      daysActive: microtrendRecentRecs.length + 1,
-      microtrend: { displayName: entry.microtrend.display_name, sourceWording: entry.microtrend.source_wording, candidateType: entry.candidate.candidateType },
-      positiveExamples
-    });
-    const actionFingerprint = strategy
-      ? computeActionFingerprint({
-          theme: opp.theme, primaryProducts: strategy.primaryProducts, channel: strategy.channel,
-          format: strategy.format, creativeAngle: strategy.creativeAngle
-        })
-      : null;
-    if (actionFingerprint && exclusions.suppressedFingerprints.has(actionFingerprint)) continue;
-
-    if (entry.candidate.candidateType === 'macro' && !entry.microtrend.baseline_shown_at) {
-      await setMicrotrendStatus(entry.microtrend.id, 'active', { baselineShownAt: reportDate });
-    }
-
-    const continuityStatus = determineContinuityStatus({
-      recentRecs: microtrendRecentRecs, sameDayRec: context.sameDayRec, newFingerprint: actionFingerprint,
-      todayScore: entry.score, reportDate
-    });
-
-    return { entry, strategy, actionFingerprint, continuityStatus, recentRecs: microtrendRecentRecs };
-  }
-  return null;
+// Highest-scoring candidate for this theme that is qualified (macro
+// baseline rule), not hidden (not_relevant), and not suppressed
+// (dont_show_again / already_covered / implemented) -- results are
+// already sorted by score, so the first match wins. Returns null when
+// nothing in the theme's candidate list is winnable, which is exactly
+// when this slot gets no recommendation at all today -- never a
+// deterministic fallback.
+function pickWinningCandidate(opp) {
+  return (opp.candidateResults || []).find((c) => c.qualifies && !c.hidden && !c.suppressed) || null;
 }
 
-// Builds this report's signals + theme snapshots + top recommendations from
-// whatever real evidence was actually collected in this run (getTodayItems).
-// A theme with zero collected items gets no signal, no snapshot, and is
-// never considered for a recommendation -- there is no "pad to exactly 3"
-// step; if fewer than 3 themes have real evidence, fewer than 3
-// recommendations are saved. Every theme WITH evidence gets a
-// theme_daily_snapshots row, not only the 3 that win a recommendation slot.
+// Builds this report's signals + theme snapshots from whatever real
+// evidence was actually collected in this run (getTodayItems), then runs
+// the mandatory Claude candidate analysis once for the whole report and
+// builds recommendations only from what passes it. A theme with zero
+// collected items gets no signal, no snapshot, and no candidates. If the
+// AI analysis is unavailable (no key, or failed after one retry), signals
+// and theme history still build normally, but zero recommendations are
+// created -- see aiAnalysisAvailable on the return value and on the
+// reports row itself.
 async function buildReport(reportId, reportDate) {
   // Captured BEFORE the same-day delete/rebuild below, so a manual Refresh
   // fired twice in one day doesn't lose the context of what this same
@@ -371,20 +338,17 @@ async function buildReport(reportId, reportDate) {
 
   // A same-day re-run (a manual Refresh fired more than once before the
   // calendar day rolls over) must replace this report's derived
-  // signals/recommendations, not pile more on top of them -- otherwise
-  // "exactly 3 priorities" silently becomes 6, 9, 12... across repeated
-  // runs. Raw evidence in source_items is untouched (it's deduped by
-  // content_hash anyway); only the derived rows get cleared and rebuilt.
-  // theme_daily_snapshots is NOT cleared here -- it upserts on
-  // (report_id, theme) instead, because it's meant to accumulate across
-  // days, not be scoped to "this run" the way signals/recommendations are.
+  // signals/recommendations, not pile more on top of them. Raw evidence in
+  // source_items is untouched (it's deduped by content_hash anyway); only
+  // the derived rows get cleared and rebuilt. theme_daily_snapshots is NOT
+  // cleared here -- it upserts on (report_id, theme) instead, because it's
+  // meant to accumulate across days, not be scoped to "this run".
   await pool.query('DELETE FROM recommendations WHERE report_id = $1', [reportId]); // cascades recommendation_evidence
   await pool.query('DELETE FROM signals WHERE report_id = $1', [reportId]);
 
   const items = await getTodayItems(reportDate);
   const opportunities = [];
-  // Fetched once per build, not once per candidate -- deriveExclusions is a
-  // single query over active (non-reversed) feedback rows.
+  // Fetched once per build, not once per candidate.
   const exclusions = await getActiveExclusions();
 
   for (const topic of ALL_TOPICS) {
@@ -501,20 +465,9 @@ async function buildReport(reportId, reportDate) {
       uniqueCreatorCount: uniqueCreatorCount(allThemeItems),
       hasSearch: searchItems.length > 0,
       leadingQueries: leadingQueriesFor(searchItems[0]),
-      // Carried through for the LLM strategist step below -- real evidence
-      // only, nothing derived or invented here.
-      risingQueries: searchItems[0]?.normalized_metrics?.relatedQueries?.rising || [],
-      topQueries: searchItems[0]?.normalized_metrics?.relatedQueries?.top || [],
-      interestByRegion: searchItems[0]?.normalized_metrics?.interestByRegion || [],
-      socialExamples: Object.values(socialItemsByPlatform).flat().slice(0, 5).map((i) => ({
-        platform: i.source_type.replace('apify_', ''),
-        excerpt: i.excerpt,
-        queryOrTopic: i.query_or_topic
-      })),
-      // Kept so the microtrend layer below can re-derive candidates without
-      // re-filtering `items` -- same rows already filtered to this theme.
       searchItemsForTheme: searchItems,
-      pinterestItemsForTheme: socialItemsByPlatform.pinterest
+      pinterestItemsForTheme: socialItemsByPlatform.pinterest,
+      candidateResults: []
     });
   }
 
@@ -545,34 +498,79 @@ async function buildReport(reportId, reportDate) {
     });
     opp.lifecycle = lifecycle;
     opp.priorSnapshots = priorSnapshots;
-    opp.microtrendCandidates = await processThemeMicrotrends(opp, reportId, reportDate, exclusions);
+    opp.rawCandidates = extractCandidates({ theme: opp.theme, searchItems: opp.searchItemsForTheme, pinterestItems: opp.pinterestItemsForTheme });
   }
 
-  let microtrendWins = 0;
+  // --- Mandatory Claude candidate analysis, ONE batched call for the
+  // whole report (every theme's candidates together, so Claude can
+  // compare signals against each other) -------------------------------
+  const themesWithCandidates = opportunities.filter((opp) => opp.rawCandidates.length > 0);
+  const themeBatches = [];
+  for (const opp of themesWithCandidates) {
+    themeBatches.push({
+      theme: opp.theme,
+      themeLabel: THEME_LABELS[opp.theme],
+      seedQueries: opp.topic.queries,
+      evergreenBaselines: evergreenBaselinesForTheme(opp.theme),
+      positiveExamples: await getPositiveFeedbackExamples(opp.theme, 5),
+      candidates: opp.rawCandidates.map((c) => ({ clusterKey: c.clusterKey, displayText: c.sourceWording, members: c.members }))
+    });
+  }
+
+  const analysis = await candidateAnalyst.analyzeCandidates(themeBatches);
+  await setReportAiStatus(reportId, analysis.status === 'ok', analysis.reason || null);
+
+  if (analysis.status !== 'ok') {
+    // Signals and theme history above already built normally -- only
+    // recommendation generation is gated on AI. No deterministic fallback
+    // copy, per the brief: this is a hard "AI analysis unavailable" state,
+    // not a quieter "nothing qualified today".
+    return {
+      opportunitiesConsidered: opportunities.length, recommendationsCreated: 0, microtrendRecommendations: 0,
+      aiAnalysisAvailable: false, aiAnalysisReason: analysis.reason
+    };
+  }
+
+  const rawCandidateByClusterKey = new Map();
+  for (const opp of opportunities) for (const c of opp.rawCandidates) rawCandidateByClusterKey.set(c.clusterKey, c);
+
+  const assessmentsByTheme = new Map();
+  for (const assessment of analysis.assessments) {
+    if (!assessmentsByTheme.has(assessment.parentTheme)) assessmentsByTheme.set(assessment.parentTheme, []);
+    assessmentsByTheme.get(assessment.parentTheme).push(assessment);
+  }
+
+  // Every theme with candidates gets scored/persisted, not only the top 3
+  // -- this is what makes the Emerging section possible.
+  for (const opp of themesWithCandidates) {
+    opp.candidateResults = await processThemeAssessments(
+      opp, assessmentsByTheme.get(opp.theme) || [], rawCandidateByClusterKey, reportId, reportDate, exclusions
+    );
+  }
+
+  let recommendationsCreated = 0;
   for (let i = 0; i < top.length; i++) {
     const opp = top[i];
     const isMulticulturalDisclaimer = opp.actionType === 'Investigate' && opp.theme === 'multicultural';
-    const sameDayRec = sameDayRecByTheme.get(opp.theme) || null;
 
     if (isMulticulturalDisclaimer) {
       await buildDisclaimerRecommendation({ reportId, rank: i + 1, opp });
+      recommendationsCreated++;
       continue;
     }
 
-    const winner = await pickWinningMicrotrend(opp, reportId, reportDate, exclusions, { sameDayRec });
-    if (winner) {
-      microtrendWins++;
-      await buildMicrotrendRecommendation({ reportId, rank: i + 1, opp, winner });
-    } else {
-      // No real microtrend inside this theme won a slot (none extracted, or
-      // every candidate was hidden/baseline-suppressed/fingerprint-excluded)
-      // -- the exact theme-level recommendation this app always produced is
-      // the safety net, never a gap in today's 3 slots.
-      await buildBaselineOpportunityRecommendation({ reportId, rank: i + 1, opp, sameDayRec, reportDate });
-    }
+    const winner = pickWinningCandidate(opp);
+    if (!winner) continue; // no real, qualified, Claude-analyzed candidate for this slot -- no recommendation, no fallback
+
+    const sameDayRec = sameDayRecByTheme.get(opp.theme) || null;
+    await buildCandidateRecommendation({ reportId, rank: i + 1, opp, winner, reportDate, sameDayRec });
+    recommendationsCreated++;
   }
 
-  return { opportunitiesConsidered: opportunities.length, recommendationsCreated: top.length, microtrendRecommendations: microtrendWins };
+  return {
+    opportunitiesConsidered: opportunities.length, recommendationsCreated, microtrendRecommendations: recommendationsCreated,
+    aiAnalysisAvailable: true, aiAnalysisReason: null
+  };
 }
 
 async function buildDisclaimerRecommendation({ reportId, rank, opp }) {
@@ -602,113 +600,36 @@ async function buildDisclaimerRecommendation({ reportId, rank, opp }) {
   return rec;
 }
 
-// The exact pipeline this app always ran, now explicitly tagged
-// recommendation_kind: 'baseline_opportunity' -- the safety net for a theme
-// whose real evidence doesn't resolve into any single winnable microtrend.
-// Nothing about this path's logic changed from before the microtrend layer
-// existed; only the tag and the theme-level (not microtrend-level) memory
-// lookups are the same as always.
-async function buildBaselineOpportunityRecommendation({ reportId, rank, opp, sameDayRec, reportDate }) {
-  const label = THEME_LABELS[opp.theme];
-  const parts = [];
-  if (opp.hasSearch) parts.push('rising search interest');
-  if (opp.realSocialPostCount > 0) parts.push(`${opp.realSocialPostCount} matching social post${opp.realSocialPostCount === 1 ? '' : 's'}`);
+// The recommendation unit: a specific, evidence-backed candidate inside a
+// theme (macro, micro, or seasonal -- all go through the same pipeline
+// now, Claude decides which). Score/confidence/actionType all come from
+// the candidate's OWN score, never the surrounding theme's -- the theme
+// only decided which 3 slots compete for a recommendation today.
+// opportunityName/rationale/recommendedAction/channel/format/creativeAngle/
+// productConnection all come directly from Claude's validated assessment;
+// nothing here second-guesses or rewrites that semantic content, it only
+// decides the tier (via actionTypeForMicrotrend, already computed into
+// winner.score before this runs) and persists it.
+async function buildCandidateRecommendation({ reportId, rank, opp, winner, reportDate, sameDayRec }) {
+  const { microtrend, assessment, score, components, distinctSourceCount, actionFingerprint } = winner;
+  const name = assessment.candidateName;
 
-  const recentRecs = await getRecentRecommendations(opp.theme, reportDate, 14, reportId);
-  const priorForScoreChange = opp.priorSnapshots[opp.priorSnapshots.length - 1];
-  const scoreChange = priorForScoreChange ? Math.round((opp.score - Number(priorForScoreChange.score)) * 10) / 10 : null;
-  const priorSourceTypes = new Set(priorForScoreChange?.source_types || []);
-  const newSources = opp.sourceTypes.filter((s) => !priorSourceTypes.has(s));
-  const lostSources = [...priorSourceTypes].filter((s) => !opp.sourceTypes.includes(s));
-  const daysActive = opp.priorSnapshots.length + 1;
+  const recentRecs = await getRecentRecommendationsForMicrotrend(microtrend.id, reportDate, 14, reportId);
+  // Deterministic, system-of-record continuity status -- judged against
+  // THIS microtrend's own recommendation history, never the theme's
+  // combined one (a brand-new microtrend under a long-running theme must
+  // never be mislabeled "continuing").
+  const continuityStatus = determineContinuityStatus({ recentRecs, sameDayRec, newFingerprint: actionFingerprint, todayScore: score, reportDate });
 
-  const deterministicRationale = buildDeterministicFallback({ opp, label, parts, sameDayRec, recentRecs });
-  const strategy = await writeRationale({
-    themeLabel: label,
-    actionType: opp.actionType,
-    distinctSourceCount: opp.distinctSourceCount,
-    risingQueries: opp.risingQueries,
-    topQueries: opp.topQueries,
-    interestByRegion: opp.interestByRegion,
-    socialExamples: opp.socialExamples,
-    momentumSources: opp.momentumSources,
-    recentRecs,
-    sameDayRec,
-    lifecycle: opp.lifecycle,
-    daysActive,
-    scoreChange,
-    newSources,
-    lostSources
-  });
+  if (assessment.classification === 'macro' && !microtrend.baseline_shown_at) {
+    await setMicrotrendStatus(microtrend.id, 'active', { baselineShownAt: reportDate });
+  }
 
-  const opportunityName = strategy?.opportunityName || label;
-  const rationale = strategy?.rationale || deterministicRationale;
-  const actionFingerprint = strategy
-    ? computeActionFingerprint({
-        theme: opp.theme, primaryProducts: strategy.primaryProducts, channel: strategy.channel,
-        format: strategy.format, creativeAngle: strategy.creativeAngle
-      })
-    : null;
-  const continuityStatus = determineContinuityStatus({ recentRecs, sameDayRec, newFingerprint: actionFingerprint, todayScore: opp.score, reportDate });
-  const actionType = resolveActionType(opp.actionType, strategy);
-
-  const titleByAction = {
-    Create: `Own the "${label}" moment`,
-    Investigate: `Investigate ${label.toLowerCase()}`,
-    Watch: `Keep watching ${label.toLowerCase()}`
-  };
-
-  const rec = await insertRecommendation(reportId, {
-    rank,
-    actionType,
-    theme: opp.theme,
-    title: titleByAction[actionType] || `${label} update`,
-    opportunityName,
-    rationale,
-    audience: THEME_AUDIENCE[opp.theme] || 'general',
-    state: 'National',
-    suggestedChannel: strategy?.channel || suggestedChannelFor(opp.realSocialPostCount, opp.hasSearch),
-    momentumSources: opp.momentumSources,
-    continuityStatus,
-    actionFingerprint,
-    continuityMeta: {
-      previousRecommendationDate: recentRecs[0] ? new Date(recentRecs[0].report_date).toISOString().slice(0, 10) : null,
-      appearances14d: recentRecs.length,
-      daysActive,
-      scoreChange,
-      newSources,
-      lostSources,
-      changeSincePrevious: strategy?.changeSincePrevious || null
-    },
-    strategyOutput: strategy?.raw || null,
-    recommendedAction: strategy?.recommendedAction || null,
-    freshness: opp.evidenceItems[0]?.collected_at ? `Collected ${new Date(opp.evidenceItems[0].collected_at).toISOString().slice(0, 10)}` : null,
-    confidence: opp.confidence,
-    score: opp.score,
-    scoreComponents: opp.components,
-    recommendationKind: 'baseline_opportunity'
-  });
-
-  await linkDiverseEvidence(rec.id, opp.evidenceItems);
-  return rec;
-}
-
-// The new recommendation unit: a specific, evidence-backed microtrend
-// inside a theme, not the theme as a whole. Score/confidence/actionType
-// all come from the microtrend's OWN score (microtrendScoring.js), never
-// the surrounding theme's -- the theme only decided which 3 slots compete
-// for a recommendation today, not what grade this specific idea deserves.
-async function buildMicrotrendRecommendation({ reportId, rank, opp, winner }) {
-  const label = THEME_LABELS[opp.theme];
-  const { entry, strategy, actionFingerprint, continuityStatus, recentRecs } = winner;
-  const microtrend = entry.microtrend;
-  const name = microtrend.display_name;
-
-  const deterministicRationale = buildMicrotrendDeterministicFallback({ label, entry, recentRecs, sameDayRec: null });
-  const opportunityName = strategy?.opportunityName || name;
-  const rationale = strategy?.rationale || deterministicRationale;
-  const confidence = confidenceForMicrotrend(entry.score, entry.distinctSourceCount);
-  const actionType = resolveActionType(actionTypeForMicrotrend(entry.score), strategy);
+  const confidence = confidenceForMicrotrend(score, distinctSourceCount);
+  // actionTypeForMicrotrend decides Watch/Investigate/Create purely from
+  // the deterministic score -- Claude's own proposedAction is the WHAT
+  // (recommendedAction), never the tier.
+  const actionType = actionTypeForMicrotrend(score);
 
   const titleByAction = {
     Create: `Own "${name}"`,
@@ -721,11 +642,11 @@ async function buildMicrotrendRecommendation({ reportId, rank, opp, winner }) {
     actionType,
     theme: opp.theme,
     title: titleByAction[actionType] || `${name} update`,
-    opportunityName,
-    rationale,
+    opportunityName: name,
+    rationale: assessment.whyItMattersNow,
     audience: THEME_AUDIENCE[opp.theme] || 'general',
     state: 'National',
-    suggestedChannel: strategy?.channel || suggestedChannelFor(opp.realSocialPostCount, opp.hasSearch),
+    suggestedChannel: assessment.proposedAction.channel || suggestedChannelFor(opp.realSocialPostCount, opp.hasSearch),
     momentumSources: opp.momentumSources,
     continuityStatus,
     actionFingerprint,
@@ -733,20 +654,33 @@ async function buildMicrotrendRecommendation({ reportId, rank, opp, winner }) {
       previousRecommendationDate: recentRecs[0] ? new Date(recentRecs[0].report_date).toISOString().slice(0, 10) : null,
       appearances14d: recentRecs.length,
       daysActive: recentRecs.length + 1,
-      changeSincePrevious: strategy?.changeSincePrevious || null
+      changeSincePrevious: null
     },
-    strategyOutput: strategy?.raw || null,
-    recommendedAction: strategy?.recommendedAction || null,
+    strategyOutput: assessment,
+    recommendedAction: assessment.proposedAction.recommendedAction,
     freshness: `Collected ${microtrend.last_seen_at instanceof Date ? microtrend.last_seen_at.toISOString().slice(0, 10) : microtrend.last_seen_at}`,
     confidence,
-    score: entry.score,
-    scoreComponents: entry.components,
+    score,
+    scoreComponents: components,
     microtrendId: microtrend.id,
-    recommendationKind: 'microtrend'
+    recommendationKind: 'candidate'
   });
 
+  // Idea Tracker row -- keyed by this stable action_fingerprint. A
+  // materially different action under the same microtrend gets a
+  // different fingerprint and therefore its own row; this call only
+  // ensures the row exists, it never touches workflow_status.
+  await ensureIdeaExists(actionFingerprint);
+
+  // Evidence actually linked to the recommendation is what Claude cited
+  // as grounding its claim (assessment.evidenceIds), restricted to real
+  // rows -- the microtrend's own broader evidence trail (every real
+  // member, cited or not) still accumulates via microtrend_evidence
+  // regardless, for the Emerging section / audit.
   const microtrendEvidence = await getMicrotrendEvidence(microtrend.id, reportId);
-  await linkDiverseEvidence(rec.id, microtrendEvidence);
+  const cited = microtrendEvidence.filter((e) => assessment.evidenceIds.includes(e.id));
+  await linkDiverseEvidence(rec.id, cited.length > 0 ? cited : microtrendEvidence);
+
   return rec;
 }
 
@@ -768,44 +702,6 @@ async function linkDiverseEvidence(recommendationId, items) {
   for (const item of evidenceToLink) {
     await linkEvidence(recommendationId, item.id, null);
   }
-}
-
-// Factual, structured fallback (brief section 13) -- used whenever the LLM
-// is unavailable/invalid, or as the base every opportunityName/rationale
-// falls back to. Never invents a creative execution; states what's known
-// and what changed, nothing more.
-function buildDeterministicFallback({ opp, label, parts, sameDayRec, recentRecs }) {
-  const whySources = `${opp.distinctSourceCount} independent source${opp.distinctSourceCount === 1 ? '' : 's'} point to ${label.toLowerCase()} right now: ${parts.join(' and ') || 'early signal only'}.`;
-  let continuityNote;
-  if (sameDayRec) {
-    continuityNote = 'Already surfaced earlier today -- review the existing evidence rather than treating this as a new idea.';
-  } else if (recentRecs.length > 0) {
-    const lastDate = new Date(recentRecs[0].report_date).toISOString().slice(0, 10);
-    continuityNote = `This theme was last recommended on ${lastDate} (${recentRecs.length} time${recentRecs.length === 1 ? '' : 's'} in the last 14 days) -- recommended again today on the strength of current evidence, not as a brand-new idea.`;
-  } else {
-    continuityNote = 'This is a new appearance for this theme in the last 14 days.';
-  }
-  return `${whySources} ${continuityNote} Evidence should be reviewed before committing to a specific creative execution.`;
-}
-
-// Same structure and intent as buildDeterministicFallback above, but names
-// the specific microtrend rather than the broader theme -- continuity here
-// is judged against THIS microtrend's own recommendation history
-// (recentRecs is already microtrend-scoped, from
-// getRecentRecommendationsForMicrotrend), never the theme's combined one.
-function buildMicrotrendDeterministicFallback({ label, entry, recentRecs, sameDayRec }) {
-  const name = entry.microtrend.display_name;
-  const whySources = `${entry.distinctSourceCount} independent source${entry.distinctSourceCount === 1 ? '' : 's'} point to "${name}" inside ${label.toLowerCase()} right now.`;
-  let continuityNote;
-  if (sameDayRec) {
-    continuityNote = 'Already surfaced earlier today -- review the existing evidence rather than treating this as a new idea.';
-  } else if (recentRecs.length > 0) {
-    const lastDate = new Date(recentRecs[0].report_date).toISOString().slice(0, 10);
-    continuityNote = `This specific microtrend was last recommended on ${lastDate} (${recentRecs.length} time${recentRecs.length === 1 ? '' : 's'} in the last 14 days) -- recommended again today on the strength of current evidence, not as a brand-new idea.`;
-  } else {
-    continuityNote = 'This is a new appearance for this specific microtrend in the last 14 days.';
-  }
-  return `${whySources} ${continuityNote} Evidence should be reviewed before committing to a specific creative execution.`;
 }
 
 function distinctCount(items) {

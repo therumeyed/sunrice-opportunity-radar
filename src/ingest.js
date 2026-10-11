@@ -230,7 +230,11 @@ async function run() {
     console.log('[ingest] credentials seen by this process:', {
       DATAFORSEO_LOGIN: Boolean(process.env.DATAFORSEO_LOGIN),
       DATAFORSEO_PASSWORD: Boolean(process.env.DATAFORSEO_PASSWORD),
-      APIFY_TOKEN: Boolean(process.env.APIFY_TOKEN)
+      APIFY_TOKEN: Boolean(process.env.APIFY_TOKEN),
+      // Required for ANY recommendation to exist today, not just a nicer
+      // rationale -- worth seeing in the log booleans at the same level of
+      // visibility as the other credentials, not buried.
+      ANTHROPIC_API_KEY: Boolean(process.env.ANTHROPIC_API_KEY)
     });
     const report = await getOrCreateReport(reportDate);
 

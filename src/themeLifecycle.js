@@ -9,7 +9,7 @@
 // Every threshold below is named and documented so it can be recalibrated
 // later from real data without hunting through the logic -- see
 // LIFECYCLE_THRESHOLDS. Never let the LLM anywhere near this: it's called
-// from reportBuilder.js, before llmStrategist.js ever runs.
+// from reportBuilder.js, before the Claude candidate analysis ever runs.
 const LIFECYCLE_THRESHOLDS = {
   // Fewer than this many total observations (including today) -- too little
   // history for a momentum-based claim, regardless of what today's velocity

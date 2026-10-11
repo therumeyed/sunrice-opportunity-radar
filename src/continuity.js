@@ -1,11 +1,12 @@
 // Deterministic recommendation continuity -- action_fingerprint and
-// continuity_status are both computed here, never by the LLM. The LLM
-// (llmStrategist.js) may propose its own guess at continuity as part of
-// its structured output, but that guess is advisory only: reportBuilder.js
-// calls determineContinuityStatus() as the system of record and that's
-// what actually gets stored and shown. Same principle as score/confidence/
-// action_type/ranking -- this is one more thing the LLM never gets final
-// say over.
+// continuity_status are both computed here, never by Claude.
+// computeActionFingerprint hashes the specific proposed action (Claude's
+// own product/channel/format/creative-angle judgment from
+// src/candidateAnalyst.js), but the fingerprint comparison and the
+// resulting new/continuing/strengthening/weakening/new_angle/repeat_action
+// label are reportBuilder.js's own deterministic call, the system of
+// record. Same principle as score/confidence/action_type/ranking -- this
+// is one more thing Claude never gets final say over.
 const crypto = require('crypto');
 
 function normalize(s) {

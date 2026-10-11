@@ -5,7 +5,7 @@ const { spawn } = require('child_process');
 const {
   pool, initSchemaWithRetry, getReportByDate, getLatestReport, listReportDates, getReportBundle,
   tryAcquireIngestLock, releaseIngestLock, getRecommendationById, insertFeedback, restoreFeedback, listActiveFeedback,
-  getActiveExclusions
+  getActiveExclusions, getIdeas, updateIdea, getIdeaHistory, getIdeaStatusCounts, getMostRecentRecommendationByFingerprint
 } = require('./db');
 const { ALL_TOPICS } = require('./topics');
 const { peakingEligible } = require('./themeLifecycle');
@@ -114,7 +114,14 @@ async function serializeBundle(bundle) {
       date: bundle.report.report_date,
       status: bundle.report.status,
       generatedAt: bundle.report.generated_at,
-      providerSummary: bundle.report.provider_summary
+      providerSummary: bundle.report.provider_summary,
+      // null = this report predates the mandatory-AI pipeline. false means
+      // the Claude candidate analysis failed (no key, or failed after one
+      // retry) -- the UI must show "AI analysis unavailable" distinctly
+      // from a day where AI ran fine and genuinely found nothing to
+      // recommend, which looks identical otherwise (zero recommendations).
+      aiAnalysisAvailable: bundle.report.ai_analysis_available,
+      aiAnalysisReason: bundle.report.ai_analysis_reason
     },
     recommendations: bundle.recommendations.map((r) => ({
       id: r.id,
@@ -289,6 +296,102 @@ app.post('/api/feedback/:id/undo', requireEditor, async (req, res) => {
   const row = await restoreFeedback(req.params.id);
   if (!row) return res.status(404).json({ error: `no active feedback with id ${req.params.id}` });
   res.json({ feedback: serializeFeedback(row) });
+});
+
+const WORKFLOW_STATUSES = ['new', 'reviewing', 'planned', 'in_production', 'implemented', 'ignored'];
+
+function serializeIdea(row) {
+  return {
+    actionFingerprint: row.action_fingerprint,
+    workflowStatus: row.workflow_status,
+    owner: row.owner,
+    notes: row.notes,
+    contentUrl: row.content_url,
+    theme: row.theme,
+    themeLabel: THEME_LABEL_BY_KEY[row.theme] || row.theme,
+    microtrendId: row.microtrend_id,
+    opportunityName: row.opportunity_name,
+    recommendedAction: row.recommended_action,
+    suggestedChannel: row.suggested_channel,
+    tier: row.tier,
+    sourceTypes: row.source_types || [],
+    firstRecommendedAt: row.first_recommended_at,
+    lastRecommendedAt: row.last_recommended_at,
+    recommendationCount: Number(row.recommendation_count),
+    // Read live from recommendation_feedback, never duplicated storage --
+    // deliberately a separate field from workflowStatus, never conflated.
+    feedbackType: row.feedback_type,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at
+  };
+}
+
+// One row per stable action_fingerprint, not one row per daily appearance
+// -- see src/db.js's getIdeas for how first/last_recommended_at and
+// recommendation_count are computed live from the real recommendations
+// history rather than a hand-maintained counter. Read access is public,
+// same as every other report read; only PATCH/feedback below are gated.
+app.get('/api/ideas', async (req, res) => {
+  const { theme, microtrendId, workflowStatus, feedbackType, tier, source, fromDate, toDate, search } = req.query;
+  const rows = await getIdeas({
+    theme, microtrendId: microtrendId ? Number(microtrendId) : undefined, workflowStatus, feedbackType, tier, source, fromDate, toDate, search
+  });
+  res.json({ ideas: rows.map(serializeIdea) });
+});
+
+// Compact summary counts for the Idea Tracker's header -- New,
+// Planned + In production (grouped per the brief), Implemented, Ignored.
+app.get('/api/ideas/summary', async (req, res) => {
+  res.json(await getIdeaStatusCounts());
+});
+
+app.get('/api/ideas/:fingerprint/history', async (req, res) => {
+  const rows = await getIdeaHistory(req.params.fingerprint);
+  res.json({ history: rows.map((r) => ({ field: r.field, previousValue: r.previous_value, newValue: r.new_value, changedAt: r.changed_at })) });
+});
+
+// workflow_status/owner/notes/content_url edits -- same EDITOR_TOKEN as
+// the feedback controls. workflow_status and feedback_type are
+// deliberately different fields with different meanings (see src/db.js);
+// this endpoint only ever touches the former. Every changed field is
+// logged to idea_status_history with its previous value.
+app.patch('/api/ideas/:fingerprint', requireEditor, async (req, res) => {
+  const { workflowStatus, owner, notes, contentUrl } = req.body || {};
+  if (workflowStatus !== undefined && !WORKFLOW_STATUSES.includes(workflowStatus)) {
+    return res.status(400).json({ error: `workflowStatus must be one of ${WORKFLOW_STATUSES.join(', ')}` });
+  }
+  const changes = {};
+  if (workflowStatus !== undefined) changes.workflow_status = workflowStatus;
+  if (owner !== undefined) changes.owner = owner;
+  if (notes !== undefined) changes.notes = notes;
+  if (contentUrl !== undefined) changes.contentUrl = contentUrl;
+
+  const updated = await updateIdea(req.params.fingerprint, changes);
+  if (!updated) return res.status(404).json({ error: `no idea with action_fingerprint ${req.params.fingerprint}` });
+  const [detail] = await getIdeas({ actionFingerprint: req.params.fingerprint });
+  res.json({ idea: serializeIdea(detail || updated) });
+});
+
+// Giving feedback FROM the Idea Tracker, which operates per idea
+// (action_fingerprint), not per daily recommendation -- attaches to the
+// most recent real recommendation row for that fingerprint, same
+// validation and exclusion rules as the main dashboard's feedback
+// controls (brief: "must update the same recommendation record").
+app.post('/api/ideas/:fingerprint/feedback', requireEditor, async (req, res) => {
+  const recommendation = await getMostRecentRecommendationByFingerprint(req.params.fingerprint);
+  if (!recommendation) return res.status(404).json({ error: `no recommendation found for action_fingerprint ${req.params.fingerprint}` });
+
+  const { feedbackType, reason, note, existingContentUrl, contentStatus } = req.body || {};
+  const validation = validateFeedbackInput(feedbackType, { reason, note, contentStatus });
+  if (!validation.valid) return res.status(400).json({ error: validation.error });
+
+  const row = await insertFeedback({
+    recommendationId: recommendation.id,
+    microtrendId: recommendation.microtrend_id,
+    actionFingerprint: recommendation.action_fingerprint,
+    feedbackType, reason, note, existingContentUrl, contentStatus
+  });
+  res.status(201).json({ feedback: serializeFeedback(row) });
 });
 
 // Fire-and-forget: an ingestion run can take several minutes (bounded Apify

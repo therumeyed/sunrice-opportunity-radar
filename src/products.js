@@ -3,8 +3,8 @@
 // https://www.sunrice.com.au/products (a JS-rendered Nuxt site that
 // couldn't be scraped automatically -- the client pasted the actual
 // rendered product grid, and the count was verified against the page's own
-// header). Used only to ground the LLM strategist's product-fit reasoning
-// in src/llmStrategist.js -- it must never suggest a product that isn't in
+// header). Used to ground Claude's product-fit judgment in
+// src/candidateAnalyst.js -- it must never suggest a product that isn't in
 // this list, and this list must never be invented.
 //
 // No price data available from the rendered product grid -- never

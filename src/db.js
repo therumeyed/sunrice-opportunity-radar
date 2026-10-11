@@ -25,6 +25,17 @@ async function initSchema() {
       created_at TIMESTAMPTZ NOT NULL DEFAULT now()
     );
 
+    -- Whether the mandatory Claude candidate-analysis call succeeded for
+    -- this report -- when it didn't (no ANTHROPIC_API_KEY, or failed after
+    -- one retry), signals/theme history still built normally but ZERO
+    -- recommendations exist for that day; the UI must say so plainly
+    -- rather than quietly showing an empty "nothing qualified" state that
+    -- looks identical to a day where AI ran fine and genuinely found
+    -- nothing. Null means "not yet attempted" (e.g. a report row that
+    -- predates this column).
+    ALTER TABLE reports ADD COLUMN IF NOT EXISTS ai_analysis_available BOOLEAN;
+    ALTER TABLE reports ADD COLUMN IF NOT EXISTS ai_analysis_reason TEXT;
+
     CREATE TABLE IF NOT EXISTS provider_runs (
       id SERIAL PRIMARY KEY,
       report_id INTEGER NOT NULL REFERENCES reports(id) ON DELETE CASCADE,
@@ -194,6 +205,15 @@ async function initSchema() {
     ALTER TABLE microtrends ADD COLUMN IF NOT EXISTS last_score NUMERIC;
     ALTER TABLE microtrends ADD COLUMN IF NOT EXISTS last_score_components JSONB;
     ALTER TABLE microtrends ADD COLUMN IF NOT EXISTS last_scored_report_id INTEGER REFERENCES reports(id);
+    -- Claude's own first-pass clustering is deterministic string overlap
+    -- only (src/microtrends.js); Claude is then allowed to identify
+    -- semantically equivalent candidates that used different wording and
+    -- unify them into one microtrend (src/candidateAnalyst.js). This is
+    -- the audit trail for that judgment call -- every merged-in clusterKey
+    -- that WASN'T already caught by string clustering, with its own
+    -- original wording and the date Claude proposed the merge, so the
+    -- grouping stays inspectable rather than silently reshaping history.
+    ALTER TABLE microtrends ADD COLUMN IF NOT EXISTS semantic_merges JSONB NOT NULL DEFAULT '[]';
 
     -- Per-report metric readings for a microtrend. UNIQUE on
     -- (report_id, microtrend_id, source_type, metric_type) means a same-day
@@ -234,8 +254,20 @@ async function initSchema() {
     -- disclaimer path (recommendation_kind = 'theme_disclaimer') never had
     -- a microtrend and still doesn't.
     ALTER TABLE recommendations ADD COLUMN IF NOT EXISTS microtrend_id INTEGER REFERENCES microtrends(id);
-    ALTER TABLE recommendations ADD COLUMN IF NOT EXISTS recommendation_kind TEXT
-      CHECK (recommendation_kind IN ('microtrend','baseline_opportunity','theme_disclaimer'));
+    ALTER TABLE recommendations ADD COLUMN IF NOT EXISTS recommendation_kind TEXT;
+    -- Collapsed from the earlier 3-value set ('microtrend' | 'baseline_opportunity'
+    -- | 'theme_disclaimer') to 2 -- macro/micro/seasonal classification is
+    -- now Claude's call (stored on microtrends.candidate_type), not a
+    -- separate deterministic-only "baseline_opportunity" code path, so
+    -- there is no longer a distinct kind for it. Every real recommendation
+    -- is now 'candidate' (a Claude-analyzed, evidence-grounded idea);
+    -- 'theme_disclaimer' is unchanged, a fixed compliance flag that was
+    -- never a trend claim in the first place. Dropped and re-added rather
+    -- than left pointing at stale values, since this hasn't shipped real
+    -- production data yet.
+    ALTER TABLE recommendations DROP CONSTRAINT IF EXISTS recommendations_recommendation_kind_check;
+    ALTER TABLE recommendations ADD CONSTRAINT recommendations_recommendation_kind_check
+      CHECK (recommendation_kind IN ('candidate', 'theme_disclaimer'));
     -- The LLM's own "recommendedAction" field was validated but never
     -- actually stored or shown anywhere -- a real semantic contradiction:
     -- a "Create" action_type implies a concrete action exists, but nothing
@@ -285,6 +317,46 @@ async function initSchema() {
     ALTER TABLE recommendation_feedback DROP CONSTRAINT IF EXISTS recommendation_feedback_recommendation_id_fkey;
     ALTER TABLE recommendation_feedback ADD CONSTRAINT recommendation_feedback_recommendation_id_fkey
       FOREIGN KEY (recommendation_id) REFERENCES recommendations(id) ON DELETE SET NULL;
+
+    -- Idea Tracker: one row per stable action_fingerprint, not one row per
+    -- daily appearance -- appearance history (first/last_recommended_at,
+    -- recommendation_count) is computed on read from the real
+    -- recommendations rows (see getIdeas) rather than hand-maintained
+    -- counters here, so there's nothing to keep in sync and no same-day-
+    -- rebuild double-counting risk. This table only holds what genuinely
+    -- has no other home: the editable workflow state.
+    -- workflow_status and feedback_type are deliberately different
+    -- concepts that must never be conflated -- workflow_status lives here
+    -- (it's not a trend judgment, it's "where is this in our pipeline");
+    -- feedback_type is NOT duplicated onto this table at all, it's read
+    -- live from recommendation_feedback (the existing feedback system) by
+    -- action_fingerprint, so there is exactly one place that can go stale.
+    CREATE TABLE IF NOT EXISTS ideas (
+      id SERIAL PRIMARY KEY,
+      action_fingerprint TEXT NOT NULL UNIQUE,
+      workflow_status TEXT NOT NULL DEFAULT 'new'
+        CHECK (workflow_status IN ('new','reviewing','planned','in_production','implemented','ignored')),
+      owner TEXT,
+      notes TEXT,
+      content_url TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    CREATE INDEX IF NOT EXISTS idx_ideas_workflow_status ON ideas(workflow_status);
+
+    -- Audit trail for workflow_status/owner/notes/content_url edits --
+    -- feedback_type changes are already auditable via recommendation_feedback's
+    -- own created_at/reversed_at, so this table is scoped to the fields
+    -- that are unique to the Idea Tracker.
+    CREATE TABLE IF NOT EXISTS idea_status_history (
+      id SERIAL PRIMARY KEY,
+      idea_id INTEGER NOT NULL REFERENCES ideas(id) ON DELETE CASCADE,
+      field TEXT NOT NULL,
+      previous_value TEXT,
+      new_value TEXT,
+      changed_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    CREATE INDEX IF NOT EXISTS idx_idea_status_history_idea ON idea_status_history(idea_id);
 
     CREATE TABLE IF NOT EXISTS recommendation_evidence (
       id SERIAL PRIMARY KEY,
@@ -337,6 +409,14 @@ async function completeReport(reportId, providerSummary) {
   const res = await pool.query(
     `UPDATE reports SET status = 'completed', generated_at = now(), provider_summary = $2 WHERE id = $1 RETURNING *`,
     [reportId, JSON.stringify(providerSummary)]
+  );
+  return res.rows[0];
+}
+
+async function setReportAiStatus(reportId, available, reason) {
+  const res = await pool.query(
+    `UPDATE reports SET ai_analysis_available = $2, ai_analysis_reason = $3 WHERE id = $1 RETURNING *`,
+    [reportId, available, reason || null]
   );
   return res.rows[0];
 }
@@ -498,16 +578,29 @@ async function insertRecommendation(reportId, rec) {
 // baseline_shown_at are left alone here deliberately -- status/baseline
 // transitions are explicit decisions made elsewhere (reportBuilder.js),
 // never a side effect of simply observing the same candidate again.
+// semanticMerges: candidates Claude unified into this microtrend that
+// deterministic string clustering missed on its own (src/candidateAnalyst.js)
+// -- appended and de-duplicated via jsonb_array_elements rather than
+// overwritten, so the audit trail of every wording Claude has ever folded
+// into this microtrend accumulates across days instead of only showing
+// today's merge.
 async function upsertMicrotrend(microtrend) {
   const res = await pool.query(
-    `INSERT INTO microtrends (theme, normalized_key, display_name, source_wording, candidate_type, first_seen_at, last_seen_at)
-     VALUES ($1,$2,$3,$4,$5,$6,$6)
+    `INSERT INTO microtrends (theme, normalized_key, display_name, source_wording, candidate_type, first_seen_at, last_seen_at, semantic_merges)
+     VALUES ($1,$2,$3,$4,$5,$6,$6,$7)
      ON CONFLICT (theme, normalized_key) DO UPDATE SET
        last_seen_at = EXCLUDED.last_seen_at,
        candidate_type = EXCLUDED.candidate_type,
+       semantic_merges = (
+         SELECT COALESCE(jsonb_agg(DISTINCT elem), '[]'::jsonb)
+         FROM jsonb_array_elements(COALESCE(microtrends.semantic_merges, '[]'::jsonb) || COALESCE(EXCLUDED.semantic_merges, '[]'::jsonb)) elem
+       ),
        updated_at = now()
      RETURNING *`,
-    [microtrend.theme, microtrend.normalizedKey, microtrend.displayName, microtrend.sourceWording || null, microtrend.candidateType, microtrend.observedDate]
+    [
+      microtrend.theme, microtrend.normalizedKey, microtrend.displayName, microtrend.sourceWording || null,
+      microtrend.candidateType, microtrend.observedDate, JSON.stringify(microtrend.semanticMerges || [])
+    ]
   );
   return res.rows[0];
 }
@@ -944,11 +1037,187 @@ async function listActiveFeedback(feedbackTypes = null) {
 // already_covered both key off action_fingerprint (the specific proposed
 // angle), not the underlying trend, so a genuinely different angle on the
 // same real trend is never blocked by either.
+// Unions two independently-sourced exclusion signals: feedback-derived
+// ones (deriveExclusions, from recommendation_feedback) and workflow-
+// derived ones -- an idea marked `implemented` suppresses its own
+// action_fingerprint the same way dont_show_again/already_covered do,
+// since presenting it again as a "new" idea would be wrong; `ignored`
+// deliberately does NOT suppress anything (a human chose to skip it once,
+// not to permanently hide it).
 async function getActiveExclusions() {
-  const res = await pool.query(
+  const feedbackRes = await pool.query(
     `SELECT feedback_type, microtrend_id, action_fingerprint FROM recommendation_feedback WHERE reversed_at IS NULL`
   );
-  return deriveExclusions(res.rows);
+  const exclusions = deriveExclusions(feedbackRes.rows);
+  const implementedRes = await pool.query(`SELECT action_fingerprint FROM ideas WHERE workflow_status = 'implemented'`);
+  for (const row of implementedRes.rows) exclusions.suppressedFingerprints.add(row.action_fingerprint);
+  return exclusions;
+}
+
+// Ensures a row exists for this action_fingerprint so the Idea Tracker has
+// something to show/edit the moment a recommendation using it is created
+// -- workflow_status/owner/notes/content_url are never touched here, only
+// a human (or a future PATCH) ever changes them.
+async function ensureIdeaExists(actionFingerprint) {
+  const res = await pool.query(
+    `INSERT INTO ideas (action_fingerprint) VALUES ($1) ON CONFLICT (action_fingerprint) DO NOTHING RETURNING *`,
+    [actionFingerprint]
+  );
+  if (res.rows[0]) return res.rows[0];
+  const existing = await pool.query('SELECT * FROM ideas WHERE action_fingerprint = $1', [actionFingerprint]);
+  return existing.rows[0];
+}
+
+async function getIdeaByFingerprint(actionFingerprint) {
+  const res = await pool.query('SELECT * FROM ideas WHERE action_fingerprint = $1', [actionFingerprint]);
+  return res.rows[0] || null;
+}
+
+// For giving feedback FROM the Idea Tracker, which operates per
+// action_fingerprint (one row per idea), not per daily recommendation --
+// this finds the most recent real recommendation row for that fingerprint
+// so the feedback can still carry a real recommendation_id/microtrend_id,
+// same shape insertFeedback already expects.
+async function getMostRecentRecommendationByFingerprint(actionFingerprint) {
+  const res = await pool.query(
+    `SELECT rec.* FROM recommendations rec JOIN reports r ON r.id = rec.report_id
+     WHERE rec.action_fingerprint = $1 ORDER BY r.report_date DESC LIMIT 1`,
+    [actionFingerprint]
+  );
+  return res.rows[0] || null;
+}
+
+// Appearance history (first/last_recommended_at, recommendation_count,
+// theme, tier, source_types, opportunity_name) is computed live from the
+// real recommendations history, keyed by action_fingerprint -- never a
+// hand-maintained counter, so there's nothing that can drift out of sync
+// with a same-day report rebuild. feedback_type is read live from
+// recommendation_feedback (latest non-reversed row for that fingerprint),
+// kept deliberately separate from workflow_status per the brief.
+async function getIdeas(filters = {}) {
+  const conditions = ['agg.action_fingerprint IS NOT NULL'];
+  const params = [];
+  function addParam(value) {
+    params.push(value);
+    return `$${params.length}`;
+  }
+  if (filters.actionFingerprint) conditions.push(`i.action_fingerprint = ${addParam(filters.actionFingerprint)}`);
+  if (filters.theme) conditions.push(`agg.theme = ${addParam(filters.theme)}`);
+  if (filters.microtrendId) conditions.push(`agg.microtrend_id = ${addParam(filters.microtrendId)}`);
+  if (filters.tier) conditions.push(`agg.tier = ${addParam(filters.tier)}`);
+  if (filters.source) conditions.push(`agg.source_types @> ${addParam(JSON.stringify([filters.source]))}::jsonb`);
+  if (filters.fromDate) conditions.push(`agg.last_recommended_at >= ${addParam(filters.fromDate)}::date`);
+  if (filters.toDate) conditions.push(`agg.first_recommended_at <= ${addParam(filters.toDate)}::date`);
+  if (filters.workflowStatus) conditions.push(`i.workflow_status = ${addParam(filters.workflowStatus)}`);
+  if (filters.search) {
+    const param = addParam(`%${filters.search}%`);
+    conditions.push(`(agg.opportunity_name ILIKE ${param} OR agg.recommended_action ILIKE ${param} OR i.notes ILIKE ${param})`);
+  }
+
+  // feedback_type filters against the live join below -- 'none' means
+  // explicitly no active feedback, not "don't filter".
+  let feedbackCondition = '';
+  if (filters.feedbackType === 'none') feedbackCondition = 'AND latest_feedback.feedback_type IS NULL';
+  else if (filters.feedbackType) feedbackCondition = `AND latest_feedback.feedback_type = ${addParam(filters.feedbackType)}`;
+
+  const res = await pool.query(
+    `WITH agg AS (
+       SELECT rec.action_fingerprint,
+              (array_agg(rec.theme ORDER BY r.report_date DESC))[1] AS theme,
+              (array_agg(rec.microtrend_id ORDER BY r.report_date DESC))[1] AS microtrend_id,
+              (array_agg(rec.opportunity_name ORDER BY r.report_date DESC))[1] AS opportunity_name,
+              (array_agg(rec.recommended_action ORDER BY r.report_date DESC))[1] AS recommended_action,
+              (array_agg(rec.suggested_channel ORDER BY r.report_date DESC))[1] AS suggested_channel,
+              (array_agg(rec.action_type ORDER BY r.report_date DESC))[1] AS tier,
+              (array_agg(DISTINCT s.source_type)) AS source_types,
+              MIN(r.report_date) AS first_recommended_at,
+              MAX(r.report_date) AS last_recommended_at,
+              COUNT(DISTINCT r.id) AS recommendation_count
+       FROM recommendations rec
+       JOIN reports r ON r.id = rec.report_id
+       LEFT JOIN recommendation_evidence re ON re.recommendation_id = rec.id
+       LEFT JOIN source_items s ON s.id = re.source_item_id
+       WHERE rec.action_fingerprint IS NOT NULL
+       GROUP BY rec.action_fingerprint
+     )
+     SELECT i.*, agg.theme, agg.microtrend_id, agg.opportunity_name, agg.recommended_action, agg.suggested_channel,
+            agg.tier, agg.source_types, agg.first_recommended_at, agg.last_recommended_at, agg.recommendation_count,
+            latest_feedback.feedback_type
+     FROM ideas i
+     JOIN agg ON agg.action_fingerprint = i.action_fingerprint
+     LEFT JOIN (
+       SELECT DISTINCT ON (action_fingerprint) action_fingerprint, feedback_type
+       FROM recommendation_feedback
+       WHERE reversed_at IS NULL AND action_fingerprint IS NOT NULL
+       ORDER BY action_fingerprint, created_at DESC
+     ) latest_feedback ON latest_feedback.action_fingerprint = i.action_fingerprint
+     WHERE ${conditions.join(' AND ')} ${feedbackCondition}
+     ORDER BY agg.last_recommended_at DESC, agg.first_recommended_at DESC`,
+    params
+  );
+  return res.rows;
+}
+
+// field: 'workflow_status' | 'owner' | 'notes' | 'content_url'. Logs
+// previous -> new into idea_status_history for every field that actually
+// changed, so the audit trail only grows when something real happened.
+async function updateIdea(actionFingerprint, changes) {
+  const idea = await getIdeaByFingerprint(actionFingerprint);
+  if (!idea) return null;
+
+  const fields = ['workflow_status', 'owner', 'notes', 'contentUrl'];
+  const columnByField = { workflow_status: 'workflow_status', owner: 'owner', notes: 'notes', contentUrl: 'content_url' };
+  const sets = [];
+  const params = [idea.id];
+  const historyEntries = [];
+
+  for (const field of fields) {
+    if (!(field in changes)) continue;
+    const column = columnByField[field];
+    const newValue = changes[field];
+    const previousValue = idea[column];
+    if (previousValue === newValue) continue;
+    params.push(newValue);
+    sets.push(`${column} = $${params.length}`);
+    historyEntries.push({ field: column, previousValue, newValue });
+  }
+  if (sets.length === 0) return idea;
+
+  const res = await pool.query(
+    `UPDATE ideas SET ${sets.join(', ')}, updated_at = now() WHERE id = $1 RETURNING *`,
+    params
+  );
+  for (const entry of historyEntries) {
+    await pool.query(
+      `INSERT INTO idea_status_history (idea_id, field, previous_value, new_value) VALUES ($1,$2,$3,$4)`,
+      [idea.id, entry.field, entry.previousValue, entry.newValue]
+    );
+  }
+  return res.rows[0];
+}
+
+async function getIdeaHistory(actionFingerprint) {
+  const idea = await getIdeaByFingerprint(actionFingerprint);
+  if (!idea) return [];
+  const res = await pool.query(
+    `SELECT * FROM idea_status_history WHERE idea_id = $1 ORDER BY changed_at DESC`,
+    [idea.id]
+  );
+  return res.rows;
+}
+
+// Summary counts for the Idea Tracker's compact header -- New, Planned +
+// In production (grouped per the brief), Implemented, Ignored.
+async function getIdeaStatusCounts() {
+  const res = await pool.query(`SELECT workflow_status, COUNT(*)::int AS count FROM ideas GROUP BY workflow_status`);
+  const byStatus = Object.fromEntries(res.rows.map((r) => [r.workflow_status, r.count]));
+  return {
+    new: byStatus.new || 0,
+    reviewing: byStatus.reviewing || 0,
+    plannedOrInProduction: (byStatus.planned || 0) + (byStatus.in_production || 0),
+    implemented: byStatus.implemented || 0,
+    ignored: byStatus.ignored || 0
+  };
 }
 
 // Up to `limit` of the most recent "useful" examples for this theme, for
@@ -1026,6 +1295,7 @@ module.exports = {
   initSchemaWithRetry,
   getOrCreateReport,
   completeReport,
+  setReportAiStatus,
   failReport,
   getReportByDate,
   getLatestReport,
@@ -1063,5 +1333,12 @@ module.exports = {
   restoreFeedback,
   listActiveFeedback,
   getActiveExclusions,
-  getPositiveFeedbackExamples
+  getPositiveFeedbackExamples,
+  ensureIdeaExists,
+  getIdeaByFingerprint,
+  getMostRecentRecommendationByFingerprint,
+  getIdeas,
+  updateIdea,
+  getIdeaHistory,
+  getIdeaStatusCounts
 };

@@ -16,6 +16,7 @@
       <div class="bd-nav-label">SunRice radar</div>
       <nav class="bd-nav" id="bd-nav">
         <button type="button" data-view="today" aria-pressed="true">Today</button>
+        <button type="button" data-view="ideas" aria-pressed="false">Idea Tracker</button>
         <button type="button" disabled>Local visibility <span class="bd-soon">Later</span></button>
         <button type="button" disabled>Digital availability <span class="bd-soon">Later</span></button>
         <button type="button" disabled>Competitor pulse <span class="bd-soon">Later</span></button>
@@ -108,9 +109,58 @@
           </div>
         </div>
 
-        <div id="bd-view-stub" hidden class="bd-stub">
-          <h2>Not built yet</h2>
-          <p>This section is parked behind a feature flag for a later phase. See the README for what's live today.</p>
+        <div id="bd-view-ideas" hidden>
+          <div class="bd-ideas-summary" id="bd-ideas-summary"></div>
+          <div class="bd-ideas-filterbar">
+            <input type="search" id="bd-ideas-search" placeholder="Search ideas, actions, notes...">
+            <select id="bd-ideas-filter-theme" aria-label="Theme"><option value="">All themes</option></select>
+            <select id="bd-ideas-filter-workflow" aria-label="Workflow status">
+              <option value="">All statuses</option>
+              <option value="new">New</option>
+              <option value="reviewing">Reviewing</option>
+              <option value="planned">Planned</option>
+              <option value="in_production">In production</option>
+              <option value="implemented">Implemented</option>
+              <option value="ignored">Ignored</option>
+            </select>
+            <select id="bd-ideas-filter-feedback" aria-label="Feedback">
+              <option value="">All feedback</option>
+              <option value="none">No feedback yet</option>
+              <option value="useful">Useful</option>
+              <option value="already_covered">Already covered</option>
+              <option value="not_relevant">Not relevant</option>
+              <option value="dont_show_again">Don't show again</option>
+            </select>
+            <select id="bd-ideas-filter-tier" aria-label="Tier">
+              <option value="">All tiers</option>
+              <option value="Create">Create</option>
+              <option value="Investigate">Investigate</option>
+              <option value="Watch">Watch</option>
+            </select>
+            <select id="bd-ideas-filter-source" aria-label="Source">
+              <option value="">All sources</option>
+              <option value="dataforseo_trends">Search</option>
+              <option value="apify_pinterest">Pinterest</option>
+              <option value="apify_reddit">Reddit</option>
+              <option value="apify_tiktok">TikTok</option>
+              <option value="apify_instagram">Instagram</option>
+              <option value="google_news">News</option>
+            </select>
+            <label class="bd-date-filter">From <input type="date" id="bd-ideas-filter-from"></label>
+            <label class="bd-date-filter">To <input type="date" id="bd-ideas-filter-to"></label>
+          </div>
+          <div class="bd-ideas-table-wrap">
+            <table class="bd-ideas-table">
+              <thead>
+                <tr>
+                  <th>Idea</th><th>Theme</th><th>Tier</th><th>First / last seen</th><th>Count</th>
+                  <th>Workflow</th><th>Feedback</th><th>Owner</th><th>Notes</th><th>Content URL</th>
+                </tr>
+              </thead>
+              <tbody id="bd-ideas-tbody"></tbody>
+            </table>
+            <div id="bd-ideas-empty" class="bd-empty" hidden>No ideas match these filters yet.</div>
+          </div>
         </div>
       </div>
     </main>

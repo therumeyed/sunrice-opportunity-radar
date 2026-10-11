@@ -125,7 +125,7 @@
   function render(bundle) {
     qs('#bd-report-date').textContent = `${fmtDate(bundle.report.date)} · National view`;
     qs('#bd-updated-status').textContent = bundle.report.generatedAt ? `Updated ${fmtDateTime(bundle.report.generatedAt)}` : '';
-    renderPriorities(bundle.recommendations);
+    renderPriorities(bundle.recommendations, bundle.report);
     renderEmerging(bundle.microtrendsEmerging || []);
     renderThemeTrends(bundle.themeTrends || []);
     renderSearchDemand(bundle.signals.filter((s) => s.signalType === 'search_topic'));
@@ -154,16 +154,31 @@
   }
 
   // Purely informational -- tells the reader WHERE today's idea came from
-  // (a specific microtrend vs. the theme-level safety net vs. a disclaimer
+  // (a specific Claude-analyzed candidate vs. a compliance disclaimer
   // needing human review), never affects ranking or wording of the ask.
-  const KIND_LABELS = { microtrend: 'Specific microtrend', baseline_opportunity: 'Theme opportunity', theme_disclaimer: 'Needs human review' };
+  const KIND_LABELS = { candidate: 'Evidence-backed idea', theme_disclaimer: 'Needs human review' };
   function kindBadge(kind) {
     if (!kind || !KIND_LABELS[kind]) return '';
     return `<span class="bd-kind-badge ${escapeHtml(kind)}">${escapeHtml(KIND_LABELS[kind])}</span>`;
   }
 
-  function renderPriorities(recommendations) {
+  // Claude's candidate analysis is mandatory for a recommendation to exist
+  // (see src/reportBuilder.js) -- when it's unavailable, zero
+  // recommendations looks IDENTICAL to a day where AI ran fine and
+  // genuinely found nothing worth recommending, unless this is shown
+  // explicitly. report.aiAnalysisAvailable is null for an old report that
+  // predates this pipeline, in which case there's nothing meaningful to say.
+  function renderPriorities(recommendations, report) {
     const el = qs('#bd-priorities');
+    if (recommendations.length === 0 && report?.aiAnalysisAvailable === false) {
+      el.innerHTML = `
+        <div class="bd-ai-unavailable">
+          <strong>AI analysis unavailable today</strong>
+          <p>Claude's candidate analysis is required before any recommendation can be shown -- it didn't run successfully today, so there are none. Real signals and theme history below are unaffected.</p>
+          ${report.aiAnalysisReason ? `<p class="bd-ai-unavailable-reason">${escapeHtml(report.aiAnalysisReason)}</p>` : ''}
+        </div>`;
+      return;
+    }
     if (recommendations.length === 0) {
       el.innerHTML = `<p class="bd-empty-hero">No recommendation cleared the bar today under the current filters -- widen the filters, or there just wasn't enough evidence yet.</p>`;
       return;
@@ -574,12 +589,140 @@
   }
 
   // --- Nav ------------------------------------------------------------
+  // --- Idea Tracker -------------------------------------------------------
+  // One row per stable action_fingerprint (never one row per daily
+  // appearance) -- first/last seen and recommendation_count are computed
+  // live server-side from the real recommendations history, not a counter
+  // this page maintains. workflowStatus and feedbackType are deliberately
+  // separate controls/fields, never conflated.
+  const WORKFLOW_LABELS = { new: 'New', reviewing: 'Reviewing', planned: 'Planned', in_production: 'In production', implemented: 'Implemented', ignored: 'Ignored' };
+  let ideasSearchDebounce = null;
+
+  async function loadIdeasSummary() {
+    const res = await fetch('/api/ideas/summary');
+    const summary = await res.json();
+    qs('#bd-ideas-summary').innerHTML = `
+      <div class="bd-ideas-summary-tile"><strong>${summary.new}</strong><span>New</span></div>
+      <div class="bd-ideas-summary-tile"><strong>${summary.plannedOrInProduction}</strong><span>Planned / In production</span></div>
+      <div class="bd-ideas-summary-tile"><strong>${summary.implemented}</strong><span>Implemented</span></div>
+      <div class="bd-ideas-summary-tile"><strong>${summary.ignored}</strong><span>Ignored</span></div>
+    `;
+  }
+
+  function populateIdeasThemeFilter() {
+    const sel = qs('#bd-ideas-filter-theme');
+    if (sel.options.length > 1) return; // already populated
+    for (const [value, label] of Object.entries(state.themeLabels)) {
+      sel.insertAdjacentHTML('beforeend', `<option value="${escapeHtml(value)}">${escapeHtml(label)}</option>`);
+    }
+  }
+
+  async function loadIdeas() {
+    const params = new URLSearchParams();
+    const search = qs('#bd-ideas-search').value.trim();
+    const filters = {
+      search,
+      theme: qs('#bd-ideas-filter-theme').value,
+      workflowStatus: qs('#bd-ideas-filter-workflow').value,
+      feedbackType: qs('#bd-ideas-filter-feedback').value,
+      tier: qs('#bd-ideas-filter-tier').value,
+      source: qs('#bd-ideas-filter-source').value,
+      fromDate: qs('#bd-ideas-filter-from').value,
+      toDate: qs('#bd-ideas-filter-to').value
+    };
+    for (const [k, v] of Object.entries(filters)) if (v) params.set(k, v);
+    const res = await fetch(`/api/ideas?${params.toString()}`);
+    const { ideas } = await res.json();
+    renderIdeas(ideas);
+  }
+
+  function renderIdeas(ideas) {
+    const tbody = qs('#bd-ideas-tbody');
+    qs('#bd-ideas-empty').hidden = ideas.length !== 0;
+    if (ideas.length === 0) {
+      tbody.innerHTML = '';
+      return;
+    }
+    tbody.innerHTML = ideas.map((idea) => `
+      <tr data-fingerprint="${escapeHtml(idea.actionFingerprint)}">
+        <td>
+          <div class="bd-idea-name">${escapeHtml(idea.opportunityName || '(untitled)')}</div>
+          ${idea.recommendedAction ? `<div class="bd-idea-action">${escapeHtml(idea.recommendedAction)}</div>` : ''}
+        </td>
+        <td>${escapeHtml(idea.themeLabel || '')}</td>
+        <td>${escapeHtml(idea.tier || '—')}</td>
+        <td class="bd-idea-meta">${escapeHtml(String(idea.firstRecommendedAt || '').slice(0, 10))} &rarr; ${escapeHtml(String(idea.lastRecommendedAt || '').slice(0, 10))}</td>
+        <td class="bd-idea-meta">${idea.recommendationCount}</td>
+        <td><select data-idea-field="workflowStatus">
+          ${Object.entries(WORKFLOW_LABELS).map(([v, l]) => `<option value="${v}" ${idea.workflowStatus === v ? 'selected' : ''}>${l}</option>`).join('')}
+        </select></td>
+        <td><select data-idea-field="feedbackType">
+          <option value="" ${!idea.feedbackType ? 'selected' : ''}>&mdash;</option>
+          ${Object.entries(FEEDBACK_TYPE_LABELS).map(([v, l]) => `<option value="${v}" ${idea.feedbackType === v ? 'selected' : ''}>${l}</option>`).join('')}
+        </select></td>
+        <td><input type="text" data-idea-field="owner" value="${escapeHtml(idea.owner || '')}" placeholder="Owner"></td>
+        <td><input type="text" data-idea-field="notes" value="${escapeHtml(idea.notes || '')}" placeholder="Notes"></td>
+        <td><input type="url" data-idea-field="contentUrl" value="${escapeHtml(idea.contentUrl || '')}" placeholder="https://..."></td>
+      </tr>
+    `).join('');
+
+    tbody.querySelectorAll('select[data-idea-field="workflowStatus"]').forEach((sel) => sel.addEventListener('change', () =>
+      patchIdea(sel.closest('tr').dataset.fingerprint, { workflowStatus: sel.value })));
+    tbody.querySelectorAll('select[data-idea-field="feedbackType"]').forEach((sel) => sel.addEventListener('change', () =>
+      giveIdeaFeedback(sel.closest('tr').dataset.fingerprint, sel.value)));
+    tbody.querySelectorAll('input[data-idea-field]').forEach((input) => input.addEventListener('blur', () =>
+      patchIdea(input.closest('tr').dataset.fingerprint, { [input.dataset.ideaField]: input.value })));
+  }
+
+  async function patchIdea(fingerprint, changes) {
+    const token = getEditorToken();
+    if (!token) return;
+    const res = await fetch(`/api/ideas/${encodeURIComponent(fingerprint)}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify(changes)
+    });
+    if (res.status === 403) { clearEditorToken(); alert('Editor token rejected -- try again.'); return; }
+    if (!res.ok) { alert('Could not save change.'); return; }
+    await loadIdeasSummary();
+  }
+
+  async function giveIdeaFeedback(fingerprint, feedbackType) {
+    if (!feedbackType) return;
+    const token = getEditorToken();
+    if (!token) return;
+    const res = await fetch(`/api/ideas/${encodeURIComponent(fingerprint)}/feedback`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify({ feedbackType })
+    });
+    if (res.status === 403) { clearEditorToken(); alert('Editor token rejected -- try again.'); return; }
+    if (!res.ok) { const body = await res.json().catch(() => ({})); alert(body.error || 'Could not save feedback.'); return; }
+    await loadIdeas();
+  }
+
+  async function openIdeaTracker() {
+    populateIdeasThemeFilter();
+    await Promise.all([loadIdeasSummary(), loadIdeas()]);
+  }
+
+  function setupIdeasFilters() {
+    ['#bd-ideas-filter-theme', '#bd-ideas-filter-workflow', '#bd-ideas-filter-feedback', '#bd-ideas-filter-tier', '#bd-ideas-filter-source', '#bd-ideas-filter-from', '#bd-ideas-filter-to']
+      .forEach((sel) => qs(sel).addEventListener('change', loadIdeas));
+    qs('#bd-ideas-search').addEventListener('input', () => {
+      clearTimeout(ideasSearchDebounce);
+      ideasSearchDebounce = setTimeout(loadIdeas, 300);
+    });
+  }
+
   function setupNav() {
     document.querySelectorAll('#bd-nav button[data-view]').forEach((btn) => btn.addEventListener('click', () => {
       document.querySelectorAll('#bd-nav button[data-view]').forEach((b) => b.setAttribute('aria-pressed', 'false'));
       btn.setAttribute('aria-pressed', 'true');
       const view = btn.dataset.view;
       qs('#bd-view-today').hidden = view !== 'today';
+      qs('#bd-view-ideas').hidden = view !== 'ideas';
+      if (view === 'ideas') openIdeaTracker();
     }));
   }
 
@@ -633,6 +776,7 @@
     setupNav();
     setupEvents();
     setupRefresh();
+    setupIdeasFilters();
     await loadMeta();
     await loadReport();
   }

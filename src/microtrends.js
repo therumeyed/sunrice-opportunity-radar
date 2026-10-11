@@ -1,9 +1,15 @@
-// Normalization, clustering and macro/micro/seasonal classification for
-// microtrend candidates. Deliberately simple, deterministic, inspectable
-// rules -- no vector database, no embeddings, per the brief. Every
-// function here is pure (no DB, no network) so it's cheap to unit test
-// exhaustively; src/microtrendExtraction.js is what actually calls these
-// against real evidence.
+// Normalization and clustering for microtrend candidates. Deliberately
+// simple, deterministic, inspectable rules -- no vector database, no
+// embeddings. Every function here is pure (no DB, no network) so it's
+// cheap to unit test exhaustively; src/microtrendExtraction.js is what
+// actually calls these against real evidence.
+//
+// Classification (macro/micro/seasonal) used to live here as a
+// deterministic rule (string-matching against seed queries/evergreen
+// baselines). That's now Claude's call, authoritative, in
+// src/candidateAnalyst.js -- this module only does the FIRST PASS of
+// clustering (exact/near-duplicate string matching); Claude is then
+// allowed to unify differently-worded candidates this pass missed.
 
 // Small, hand-maintained synonym map -- kept intentionally short and
 // readable rather than exhaustive. Add to this as real collisions are
@@ -22,13 +28,6 @@ const STOPWORDS = new Set([
   'a', 'an', 'the', 'is', 'are', 'to', 'of', 'for', 'and', 'with', 'what',
   'how', 'why', 'do', 'does', 'in', 'on', 'at', 'vs', 'versus', 'or'
 ]);
-
-// Occasions a candidate can be tied to regardless of which theme it came
-// from -- deliberately the same occasion vocabulary as topics.js's own
-// multicultural/seasonal queries, kept here as plain strings rather than
-// importing topics.js, since this module has no reason to depend on the
-// brand-specific topic library.
-const OCCASION_KEYWORDS = ['christmas', 'australia day', 'lunar new year', 'diwali', 'ramadan', 'easter', 'mothers day', 'fathers day'];
 
 function singularize(token) {
   if (token.length <= 3) return token;
@@ -98,21 +97,6 @@ function clusterCandidates(candidates) {
   return clusters;
 }
 
-// macro: identical (post-normalization) to the theme's own seed query or
-// theme label, or on the configured evergreen baseline list. seasonal:
-// tied to a known dated occasion, regardless of theme. Otherwise micro --
-// the default is specificity, not the other way around; nothing is
-// assumed to be a microtrend just because it's a long or unusual phrase
-// (an evergreen baseline term stays macro even if it's a full question).
-function classifyCandidate({ normalizedKey, themeLabel, seedQueryKeys, evergreenBaselineKeys = [] }) {
-  if (OCCASION_KEYWORDS.some((occ) => normalizedKey.includes(normalizeKey(occ)))) return 'seasonal';
-  const themeKey = normalizeKey(themeLabel);
-  if (normalizedKey === themeKey) return 'macro';
-  if (seedQueryKeys.includes(normalizedKey)) return 'macro';
-  if (evergreenBaselineKeys.includes(normalizedKey)) return 'macro';
-  return 'micro';
-}
-
 // Has anything genuinely changed since this macro was last suppressed --
 // a new source type never seen on it before, or velocity crossing the
 // "building" threshold for the first time. Intentionally does NOT treat
@@ -127,6 +111,5 @@ function hasMaterialChange({ historicalSourceTypes, todaySourceTypes, historical
 }
 
 module.exports = {
-  normalizeKey, tokenOverlap, clusterCandidates, classifyCandidate, hasMaterialChange,
-  CLUSTER_OVERLAP_THRESHOLD, OCCASION_KEYWORDS
+  normalizeKey, tokenOverlap, clusterCandidates, hasMaterialChange, CLUSTER_OVERLAP_THRESHOLD
 };

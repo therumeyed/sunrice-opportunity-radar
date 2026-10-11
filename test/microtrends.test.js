@@ -1,7 +1,7 @@
 const { test, describe } = require('node:test');
 const assert = require('node:assert/strict');
 const {
-  normalizeKey, tokenOverlap, clusterCandidates, classifyCandidate, hasMaterialChange
+  normalizeKey, tokenOverlap, clusterCandidates, hasMaterialChange
 } = require('../src/microtrends');
 
 describe('normalizeKey', () => {
@@ -86,61 +86,6 @@ describe('clusterCandidates', () => {
   });
 });
 
-describe('classifyCandidate', () => {
-  test('identical to theme label is macro', () => {
-    const themeLabel = 'Rice';
-    const normalizedKey = normalizeKey(themeLabel);
-    const result = classifyCandidate({ normalizedKey, themeLabel, seedQueryKeys: [] });
-    assert.equal(result, 'macro');
-  });
-
-  test('matches a seed query key is macro', () => {
-    const seedKey = normalizeKey('how to cook rice');
-    const result = classifyCandidate({
-      normalizedKey: seedKey, themeLabel: 'Rice', seedQueryKeys: [seedKey]
-    });
-    assert.equal(result, 'macro');
-  });
-
-  test('evergreen baseline phrase stays macro even as a full question, not a microtrend just because it is long', () => {
-    const baselineKey = normalizeKey('how to cook sushi rice');
-    const result = classifyCandidate({
-      normalizedKey: baselineKey,
-      themeLabel: 'Rice',
-      seedQueryKeys: [],
-      evergreenBaselineKeys: [baselineKey]
-    });
-    assert.equal(result, 'macro');
-  });
-
-  test('a genuinely specific, non-seed, non-baseline phrase is micro', () => {
-    const result = classifyCandidate({
-      normalizedKey: normalizeKey('air fryer rice paper rolls'),
-      themeLabel: 'Rice',
-      seedQueryKeys: [normalizeKey('how to cook rice')],
-      evergreenBaselineKeys: [normalizeKey('how to cook sushi rice')]
-    });
-    assert.equal(result, 'micro');
-  });
-
-  test('a known dated occasion is seasonal regardless of theme', () => {
-    const result = classifyCandidate({
-      normalizedKey: normalizeKey('christmas rice pudding'),
-      themeLabel: 'Rice',
-      seedQueryKeys: []
-    });
-    assert.equal(result, 'seasonal');
-  });
-
-  test('seasonal classification takes priority even if phrase also matches theme label tokens', () => {
-    const result = classifyCandidate({
-      normalizedKey: normalizeKey('lunar new year rice dishes'),
-      themeLabel: 'rice dishes',
-      seedQueryKeys: []
-    });
-    assert.equal(result, 'seasonal');
-  });
-});
 
 describe('hasMaterialChange', () => {
   test('a source type never seen before counts as material change', () => {
