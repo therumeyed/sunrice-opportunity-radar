@@ -91,13 +91,15 @@ describe('report generation from fixture evidence (DB-backed)', { skip }, () => 
 
   // A real matched social post -- one row in source_items, same shape
   // ingest would produce, with `author` set so distinct-creator counting
-  // has something real to count.
-  async function insertSocialPost(reportId, { theme, sourceType, contentHash, excerpt, author }) {
+  // has something real to count. publishedAt defaults to right now (a
+  // genuinely fresh post) unless a test explicitly wants to simulate a
+  // missing (null) or stale (old Date) publication date.
+  async function insertSocialPost(reportId, { theme, sourceType, contentHash, excerpt, author, publishedAt = new Date() }) {
     const run = await db.recordProviderRun(reportId, { providerName: sourceType, sourceType, status: 'live' });
     return db.upsertSourceItem({
       providerRunId: run.id, sourceType, sourceName: sourceType,
       sourceUrl: `https://example.com/${contentHash}`, externalId: contentHash, contentHash,
-      title: excerpt, excerpt, author, theme, dataStatus: 'live'
+      title: excerpt, excerpt, author, publishedAt, theme, dataStatus: 'live'
     });
   }
 
@@ -699,6 +701,133 @@ describe('report generation from fixture evidence (DB-backed)', { skip }, () => 
       assert.ok(rec, 'expected a healthy_eating recommendation');
       assert.notEqual(rec.action_type, 'Watch', 'a single post with no known creator must not be capped at Watch once corroborated by a real search signal');
       assert.equal(rec.evidence_basis, 'mixed', 'must be labelled mixed, not pure social or pure search, once both are merged into one microtrend');
+    });
+
+    // The exact correction the user asked for: a bare cross-source merge
+    // is NOT enough to fully lift the gate -- only GENUINE momentum
+    // (rising query, Pinterest "growing", or a measured increase) does.
+    // A baseline "top" query can corroborate relevance (letting Investigate
+    // stand on a single post) but must never alone turn that post into Create.
+    test('a single social post plus a non-rising "top" query remains capped at Investigate, never reaches Create', async () => {
+      const report = await db.getOrCreateReport(TODAY);
+      const run = await db.recordProviderRun(report.id, { providerName: 'DataForSEO', sourceType: 'dataforseo_trends', status: 'live' });
+      await db.upsertSourceItem({
+        providerRunId: run.id, sourceType: 'dataforseo_trends', sourceName: 'DataForSEO',
+        contentHash: 'fixture-weak-corrob-1', title: 'sushi rice', queryOrTopic: 'sushi rice', theme: 'sushi_asian',
+        // A "top" (baseline/evergreen) query, deliberately NOT rising -- no
+        // genuine momentum signal here, just bare presence.
+        normalizedMetrics: { relatedQueries: { rising: [], top: [{ query: 'sushi rice bowl', value: 50 }] } },
+        dataStatus: 'live'
+      });
+      await insertSocialPost(report.id, {
+        theme: 'sushi_asian', sourceType: 'apify_reddit', contentHash: 'fixture-weak-corrob-2',
+        excerpt: 'Sushi rice bowl meal prep hack, tastes just like the restaurant', author: null
+      });
+      candidateAnalyst.analyzeCandidates = mergeAllForTheme('sushi_asian', { candidateName: 'Sushi rice bowl meal prep', brandRelevance: 1 });
+
+      const result = await buildReport(report.id, TODAY);
+      assert.equal(result.recommendationsCreated, 1);
+
+      const bundle = await db.getReportBundle(report);
+      const rec = bundle.recommendations.find((r) => r.theme === 'sushi_asian');
+      assert.ok(rec, 'expected a sushi_asian recommendation');
+      assert.equal(rec.action_type, 'Investigate', 'a bare cross-source merge (no genuine momentum) must cap Create at Investigate, but must not push a corroborated single post down to Watch');
+      assert.equal(rec.evidence_basis, 'mixed');
+    });
+
+    test('creator diversity across posts with missing/old publication dates still caps the candidate at Investigate', async () => {
+      const report = await db.getOrCreateReport(TODAY);
+      const oldDate = new Date(Date.now() - 60 * 86400000); // 60 days ago -- well outside the recency window
+      await insertSocialPost(report.id, {
+        theme: 'curry_night', sourceType: 'apify_reddit', contentHash: 'fixture-stale-diverse-1',
+        excerpt: 'Butter chicken curry meal prep, old post resurfacing', author: 'creator_one', publishedAt: oldDate
+      });
+      await insertSocialPost(report.id, {
+        theme: 'curry_night', sourceType: 'apify_tiktok', contentHash: 'fixture-stale-diverse-2',
+        excerpt: 'Butter chicken curry meal prep hack, no date info', author: 'creator_two', publishedAt: null
+      });
+      candidateAnalyst.analyzeCandidates = mergeAllForTheme('curry_night', { candidateName: 'Butter chicken curry meal prep', brandRelevance: 1 });
+
+      const result = await buildReport(report.id, TODAY);
+      assert.equal(result.recommendationsCreated, 1);
+
+      const bundle = await db.getReportBundle(report);
+      const rec = bundle.recommendations.find((r) => r.theme === 'curry_night');
+      assert.ok(rec, 'expected a curry_night recommendation');
+      assert.equal(rec.action_type, 'Investigate', 'real creator diversity on missing/old-dated posts must still cap at Investigate, never reach Create');
+      assert.equal(rec.evidence_basis, 'social');
+    });
+  });
+
+  describe('social-native candidate discovery: stored daily momentum observations (not yet used in scoring)', () => {
+    test('records new_post_count/new_creator_count/platform_count/dateable+recent counts for a social microtrend', async () => {
+      const report = await db.getOrCreateReport(TODAY);
+      await insertSocialPost(report.id, {
+        theme: 'lunchbox_snacks', sourceType: 'apify_reddit', contentHash: 'fixture-signal-1',
+        excerpt: 'Air fryer rice bites for lunchboxes, kids loved it', author: 'parent_a'
+      });
+      await insertSocialPost(report.id, {
+        theme: 'lunchbox_snacks', sourceType: 'apify_instagram', contentHash: 'fixture-signal-2',
+        excerpt: 'Air fryer rice bites reel for lunchbox inspo', author: 'parent_b'
+      });
+      candidateAnalyst.analyzeCandidates = mergeAllForTheme('lunchbox_snacks', { candidateName: 'Air fryer rice bites' });
+
+      await buildReport(report.id, TODAY);
+      const microtrends = await db.getMicrotrendsForReport(report.id);
+      const microtrendId = microtrends.find((m) => m.theme === 'lunchbox_snacks').id;
+
+      const signalRes = await db.pool.query('SELECT * FROM microtrend_social_signals WHERE microtrend_id = $1', [microtrendId]);
+      assert.equal(signalRes.rowCount, 1, 'exactly one signal row for this microtrend on this report');
+      const signal = signalRes.rows[0];
+      assert.equal(signal.new_post_count, 2, 'both posts are newly discovered on their first day');
+      assert.equal(signal.new_creator_count, 2, 'both authors are newly discovered on their first day');
+      assert.equal(signal.platform_count, 2, 'reddit + instagram = 2 distinct platforms today');
+      assert.equal(signal.total_post_count, 2);
+      assert.equal(signal.dateable_post_count, 1, 'only the reddit post is on a reliable-recency platform -- Instagram never counts as dateable');
+      assert.equal(signal.recent_post_count, 1, 'the one dateable post is also recent');
+    });
+
+    test('a same-day rebuild upserts the signal row rather than double-counting it', async () => {
+      const report = await db.getOrCreateReport(TODAY);
+      await insertSocialPost(report.id, {
+        theme: 'weeknight_dinners', sourceType: 'apify_reddit', contentHash: 'fixture-signal-rebuild-1',
+        excerpt: 'Kimchi fried rice, quick weeknight staple', author: 'cook_a'
+      });
+      candidateAnalyst.analyzeCandidates = mergeAllForTheme('weeknight_dinners', { candidateName: 'Kimchi fried rice' });
+
+      await buildReport(report.id, TODAY);
+      candidateAnalyst.analyzeCandidates = mergeAllForTheme('weeknight_dinners', { candidateName: 'Kimchi fried rice' });
+      await buildReport(report.id, TODAY); // simulate a second manual Refresh the same day
+
+      const signalRes = await db.pool.query(
+        `SELECT mss.* FROM microtrend_social_signals mss
+         JOIN microtrends m ON m.id = mss.microtrend_id
+         WHERE m.theme = $1`,
+        ['weeknight_dinners']
+      );
+      assert.equal(signalRes.rowCount, 1, 'a same-day rebuild must upsert the signal row, never duplicate it');
+      assert.equal(signalRes.rows[0].new_post_count, 1, 'rebuilding the same day must not inflate the new-post count');
+    });
+
+    test('a theme with zero social evidence gets no microtrend_social_signals row at all', async () => {
+      const report = await db.getOrCreateReport(TODAY);
+      const run = await db.recordProviderRun(report.id, { providerName: 'DataForSEO', sourceType: 'dataforseo_trends', status: 'live' });
+      await db.upsertSourceItem({
+        providerRunId: run.id, sourceType: 'dataforseo_trends', sourceName: 'DataForSEO',
+        contentHash: 'fixture-no-social-signal', title: 'sushi rice', queryOrTopic: 'sushi rice', theme: 'sushi_asian',
+        normalizedMetrics: { relatedQueries: { rising: [{ query: 'sushi rice bowl', value: 60 }], top: [] } },
+        dataStatus: 'live'
+      });
+      candidateAnalyst.analyzeCandidates = autoAssessAll({ candidateName: 'Sushi rice bowl' });
+      await buildReport(report.id, TODAY);
+
+      const signalRes = await db.pool.query(
+        `SELECT mss.* FROM microtrend_social_signals mss
+         JOIN microtrends m ON m.id = mss.microtrend_id
+         WHERE m.theme = $1`,
+        ['sushi_asian']
+      );
+      assert.equal(signalRes.rowCount, 0, 'a purely-search microtrend must never get a hollow all-zero social signal row');
     });
   });
 });

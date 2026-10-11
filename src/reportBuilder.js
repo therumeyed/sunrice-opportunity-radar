@@ -2,6 +2,7 @@ const {
   pool, insertSignal, insertRecommendation, linkEvidence,
   upsertThemeSnapshot, getPriorThemeSnapshots, getRecentRecommendationsForMicrotrend, getSameDayRecommendations,
   upsertMicrotrend, getMicrotrendObservationHistory, recordMicrotrendObservation, linkMicrotrendEvidence,
+  getMicrotrendSocialEvidenceHistory, recordMicrotrendSocialSignal,
   updateMicrotrendScore, setMicrotrendStatus, getActiveExclusions, getPositiveFeedbackExamples,
   countRecentMicrotrendRecommendations, getMicrotrendEvidence, setReportAiStatus, ensureIdeaExists
 } = require('./db');
@@ -9,10 +10,14 @@ const { ALL_TOPICS, evergreenBaselinesForTheme } = require('./topics');
 const { scoreOpportunity, confidenceFor, actionTypeFor } = require('./scoring');
 const { themeLifecycleFor } = require('./themeLifecycle');
 const { computeActionFingerprint, determineContinuityStatus } = require('./continuity');
-const { extractCandidates, socialCandidatesFor, isSocialSourceType, aggregateObservations, evidenceLinksFor } = require('./microtrendExtraction');
+const {
+  extractCandidates, socialCandidatesFor, isSocialSourceType, aggregateObservations, evidenceLinksFor,
+  reliableRecentCreatorCount, isReliableRecencyPlatform, isRecentReliablePost
+} = require('./microtrendExtraction');
 const { hasMaterialChange } = require('./microtrends');
 const {
-  scoreMicrotrend, qualifiesForRecommendation, confidenceForMicrotrend, actionTypeForMicrotrend, resolveSocialTier
+  scoreMicrotrend, qualifiesForRecommendation, confidenceForMicrotrend, actionTypeForMicrotrend,
+  resolveSocialTier, hasMomentumCorroboration
 } = require('./microtrendScoring');
 // Namespace import, not destructured -- reportBuilder.test.js monkeypatches
 // candidateAnalyst.analyzeCandidates on this shared module object to test
@@ -248,17 +253,37 @@ async function processThemeAssessments(opp, assessments, rawCandidateByClusterKe
 
     const allMembers = referencedCandidates.flatMap((c) => c.members);
     // isSocialOnly: every contributing member is a real social platform --
-    // if Claude merged in a search/Pinterest clusterKey for corroboration,
-    // this goes false and the social-only tier gate below never applies.
+    // if Claude merged in a search/Pinterest clusterKey, this goes false,
+    // but that alone no longer fully lifts the social-tier gate below --
+    // see hasMomentumCorroboration.
     const isSocialOnly = allMembers.every((m) => isSocialSourceType(m.sourceType));
-    const distinctCreatorCount = new Set(allMembers.map((m) => m.author).filter(Boolean)).size;
-    const socialMemberCount = allMembers.filter((m) => isSocialSourceType(m.sourceType)).length;
-    const evidenceBasis = isSocialOnly ? 'social' : socialMemberCount > 0 ? 'mixed' : 'search';
+    const socialMembersToday = allMembers.filter((m) => isSocialSourceType(m.sourceType));
+    const distinctCreatorCount = new Set(socialMembersToday.map((m) => m.author).filter(Boolean)).size;
+    const evidenceBasis = isSocialOnly ? 'social' : socialMembersToday.length > 0 ? 'mixed' : 'search';
     const fullHistory = await getMicrotrendObservationHistory(microtrend.id);
     const priorHistory = fullHistory.filter((h) => new Date(h.report_date).toISOString().slice(0, 10) < reportDate);
+    // Pre-today evidence, fetched BEFORE today's own links are written
+    // below -- the baseline new_post_count/new_creator_count are measured
+    // against.
+    const socialEvidenceHistory = socialMembersToday.length > 0
+      ? await getMicrotrendSocialEvidenceHistory(microtrend.id, reportDate)
+      : [];
     const todayObservations = aggregateObservations(allMembers);
     const distinctSourceCount = new Set(allMembers.map((m) => m.sourceType)).size;
     const uniqueSourceItemCount = new Set(allMembers.map((m) => m.sourceItemId)).size;
+    // Genuine momentum corroboration only ever comes from NON-social
+    // evidence (search/Pinterest) -- restrict both inputs to that slice so
+    // a social post's own classification/metric (always null, see
+    // socialCandidatesFor) can never accidentally count as "momentum".
+    const nonSocialTodayObservations = todayObservations.filter((o) => !isSocialSourceType(o.sourceType));
+    const nonSocialPriorHistory = priorHistory.filter((h) => !isSocialSourceType(h.source_type));
+    const momentumCorroborated = hasMomentumCorroboration({ nonSocialTodayObservations, nonSocialPriorHistory });
+    // Distinct creators counted ONLY from posts that are both reliably-
+    // dated and recent -- an Instagram post, or an old/undated one,
+    // simply doesn't add to this count rather than vetoing the whole
+    // candidate. This is exactly what resolveSocialTier's Create path
+    // spends (see microtrendScoring.js).
+    const recentCreatorCount = reliableRecentCreatorCount(allMembers, reportDate);
     // True first-seen (microtrends.first_seen_at, set once on first insert
     // and never overwritten) -- never an evidence item's own published_at.
     const daysOld = (new Date(reportDate) - new Date(microtrend.first_seen_at)) / 86400000;
@@ -284,6 +309,35 @@ async function processThemeAssessments(opp, assessments, rawCandidateByClusterKe
         uniqueCreatorCount: obs.uniqueCreatorCount
       });
     }
+
+    // Daily social-momentum observations -- stored now so there's real
+    // history by the time social velocity scoring is ever activated, but
+    // NOT read by scoring yet (see microtrendScoring.js). Only recorded
+    // when there's real social evidence today; a theme with zero social
+    // posts gets no row rather than a hollow all-zero one.
+    if (socialMembersToday.length > 0) {
+      const historicalPostIds = new Set(socialEvidenceHistory.map((r) => r.source_item_id));
+      const historicalAuthors = new Set(socialEvidenceHistory.map((r) => r.author).filter(Boolean));
+      const todayPostIds = new Set(socialMembersToday.map((m) => m.sourceItemId));
+      const todayAuthors = new Set(socialMembersToday.map((m) => m.author).filter(Boolean));
+      const newPostCount = [...todayPostIds].filter((id) => !historicalPostIds.has(id)).length;
+      const newCreatorCount = [...todayAuthors].filter((a) => !historicalAuthors.has(a)).length;
+      const platformCount = new Set(socialMembersToday.map((m) => m.sourceType)).size;
+      // dateable/recent are counted by distinct real post, not by member
+      // row, and missing/capped collection is simply absent here rather
+      // than counted as zero recent activity -- a theme with no social
+      // evidence today never reaches this block at all.
+      const dateablePosts = socialMembersToday.filter((m) => isReliableRecencyPlatform(m.sourceType) && m.publishedAt);
+      const recentPosts = socialMembersToday.filter((m) => isRecentReliablePost(m, reportDate));
+      await recordMicrotrendSocialSignal(reportId, {
+        microtrendId: microtrend.id,
+        newPostCount, newCreatorCount, platformCount,
+        totalPostCount: new Set(socialMembersToday.map((m) => m.sourceItemId)).size,
+        dateablePostCount: new Set(dateablePosts.map((m) => m.sourceItemId)).size,
+        recentPostCount: new Set(recentPosts.map((m) => m.sourceItemId)).size
+      });
+    }
+
     for (const link of evidenceLinksFor(allMembers)) {
       await linkMicrotrendEvidence(microtrend.id, reportId, link.sourceItemId, link.matchType);
     }
@@ -313,6 +367,7 @@ async function processThemeAssessments(opp, assessments, rawCandidateByClusterKe
     results.push({
       microtrend, assessment, allMembers, score, components, distinctSourceCount, uniqueSourceItemCount,
       isSocialOnly, distinctCreatorCount, evidenceBasis,
+      hasMomentumCorroboration: momentumCorroborated, recentCreatorCount,
       qualifies, hidden: exclusions.hiddenMicrotrendIds.has(microtrend.id),
       actionFingerprint, suppressed: exclusions.suppressedFingerprints.has(actionFingerprint)
     });
@@ -628,7 +683,8 @@ async function buildDisclaimerRecommendation({ reportId, rank, opp }) {
 async function buildCandidateRecommendation({ reportId, rank, opp, winner, reportDate, sameDayRec }) {
   const {
     microtrend, assessment, score, components, distinctSourceCount, actionFingerprint,
-    isSocialOnly, distinctCreatorCount, uniqueSourceItemCount, evidenceBasis
+    isSocialOnly, distinctCreatorCount, uniqueSourceItemCount, evidenceBasis,
+    hasMomentumCorroboration: momentumCorroborated, recentCreatorCount
   } = winner;
   const name = assessment.candidateName;
 
@@ -647,11 +703,15 @@ async function buildCandidateRecommendation({ reportId, rank, opp, winner, repor
   // actionTypeForMicrotrend decides Watch/Investigate/Create purely from
   // the deterministic score -- Claude's own proposedAction is the WHAT
   // (recommendedAction), never the tier. resolveSocialTier then applies a
-  // downgrade-only gate when the winning evidence is social-only (no
-  // search/Pinterest corroboration): Create needs creator diversity,
-  // Investigate needs multiple posts or creators -- see microtrendScoring.js.
+  // downgrade-only gate: genuine momentum corroboration (a real rising
+  // query, a Pinterest "growing" term, or a measured increase) fully lifts
+  // it, but a bare cross-source merge does not -- Create otherwise needs
+  // creator diversity AND demonstrably recent posts; a pure social-only
+  // candidate additionally needs multiple posts or creators just to clear
+  // Watch. See microtrendScoring.js.
   const actionType = resolveSocialTier(actionTypeForMicrotrend(score), {
-    isSocialOnly, distinctPostCount: uniqueSourceItemCount, distinctCreatorCount
+    isSocialOnly, hasMomentumCorroboration: momentumCorroborated, distinctPostCount: uniqueSourceItemCount,
+    distinctCreatorCount, reliableRecentCreatorCount: recentCreatorCount
   });
 
   const titleByAction = {

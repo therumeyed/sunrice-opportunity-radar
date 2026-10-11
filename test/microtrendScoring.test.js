@@ -2,7 +2,8 @@ const { test, describe } = require('node:test');
 const assert = require('node:assert/strict');
 const {
   WEIGHTS, scoreMicrotrend, qualifiesForRecommendation, confidenceForMicrotrend, actionTypeForMicrotrend,
-  resolveSocialTier, freshnessScore, velocityScore, noveltyScore, evidenceQualityScore
+  resolveSocialTier, hasMomentumCorroboration, socialObservationEligibility,
+  freshnessScore, velocityScore, noveltyScore, evidenceQualityScore
 } = require('../src/microtrendScoring');
 
 describe('WEIGHTS', () => {
@@ -151,35 +152,141 @@ describe('confidenceForMicrotrend / actionTypeForMicrotrend', () => {
 });
 
 describe('resolveSocialTier', () => {
-  test('never touches a non-social-only candidate -- search/Pinterest and mixed-evidence candidates are unaffected', () => {
-    assert.equal(resolveSocialTier('Create', { isSocialOnly: false, distinctPostCount: 1, distinctCreatorCount: 1 }), 'Create');
-  });
-
   test('a single credible post can still be Watch -- the gate never touches an already-Watch tier', () => {
     assert.equal(resolveSocialTier('Watch', { isSocialOnly: true, distinctPostCount: 1, distinctCreatorCount: 1 }), 'Watch');
   });
 
-  test('Investigate requires multiple posts or creators -- a single post downgrades to Watch', () => {
+  test('pure social, no corroboration: Investigate requires multiple posts or creators -- a single post downgrades to Watch', () => {
     assert.equal(resolveSocialTier('Investigate', { isSocialOnly: true, distinctPostCount: 1, distinctCreatorCount: 1 }), 'Watch');
   });
 
-  test('Investigate survives with multiple posts even from one creator', () => {
+  test('pure social: Investigate survives with multiple posts even from one creator', () => {
     assert.equal(resolveSocialTier('Investigate', { isSocialOnly: true, distinctPostCount: 3, distinctCreatorCount: 1 }), 'Investigate');
   });
 
-  test('Investigate survives with multiple creators even from few posts', () => {
+  test('pure social: Investigate survives with multiple creators even from few posts', () => {
     assert.equal(resolveSocialTier('Investigate', { isSocialOnly: true, distinctPostCount: 1, distinctCreatorCount: 2 }), 'Investigate');
   });
 
-  test('Create requires creator diversity -- without it, downgrades to Investigate (not all the way to Watch) when multiple posts exist', () => {
-    assert.equal(resolveSocialTier('Create', { isSocialOnly: true, distinctPostCount: 5, distinctCreatorCount: 1 }), 'Investigate');
+  test('pure social: Create requires reliable-recent creator diversity -- distinctCreatorCount alone (stale/undated) is not enough', () => {
+    assert.equal(resolveSocialTier('Create', {
+      isSocialOnly: true, distinctPostCount: 5, distinctCreatorCount: 3, reliableRecentCreatorCount: 0
+    }), 'Investigate');
   });
 
-  test('Create with neither creator diversity nor multiple posts cascades all the way down to Watch', () => {
+  test('pure social: Create with neither creator diversity nor multiple posts cascades all the way down to Watch', () => {
     assert.equal(resolveSocialTier('Create', { isSocialOnly: true, distinctPostCount: 1, distinctCreatorCount: 1 }), 'Watch');
   });
 
-  test('Create survives with real creator diversity', () => {
-    assert.equal(resolveSocialTier('Create', { isSocialOnly: true, distinctPostCount: 3, distinctCreatorCount: 3 }), 'Create');
+  test('pure social: Create survives with 2+ reliable-recent distinct creators', () => {
+    assert.equal(resolveSocialTier('Create', {
+      isSocialOnly: true, distinctPostCount: 3, distinctCreatorCount: 3, reliableRecentCreatorCount: 2
+    }), 'Create');
+  });
+
+  test('a single reliable-recent creator alone is not diversity -- still downgrades to Investigate', () => {
+    assert.equal(resolveSocialTier('Create', {
+      isSocialOnly: true, distinctPostCount: 3, distinctCreatorCount: 3, reliableRecentCreatorCount: 1
+    }), 'Investigate');
+  });
+
+  // Cross-source corroboration: a bare merge with search/Pinterest evidence
+  // is no longer enough on its own -- only GENUINE momentum (a real rising
+  // query, a Pinterest "growing" term, or a measured increase) fully lifts
+  // the gate. This is the exact behavior change the user asked for: "a
+  // candidate with one social post plus a non-rising top query should
+  // remain capped at Investigate."
+  test('weak (non-momentum) cross-source corroboration caps Create at Investigate, even for a single post with no creator diversity', () => {
+    assert.equal(resolveSocialTier('Create', {
+      isSocialOnly: false, hasMomentumCorroboration: false, distinctPostCount: 1, distinctCreatorCount: 1
+    }), 'Investigate');
+  });
+
+  test('weak cross-source corroboration still lets Investigate stand on a single post -- it is not pushed down to Watch', () => {
+    assert.equal(resolveSocialTier('Investigate', {
+      isSocialOnly: false, hasMomentumCorroboration: false, distinctPostCount: 1, distinctCreatorCount: 1
+    }), 'Investigate');
+  });
+
+  test('genuine momentum corroboration fully lifts the gate -- Create survives on a single post with no creator diversity', () => {
+    assert.equal(resolveSocialTier('Create', {
+      isSocialOnly: false, hasMomentumCorroboration: true, distinctPostCount: 1, distinctCreatorCount: 1
+    }), 'Create');
+  });
+
+  test('genuine momentum corroboration is irrelevant when the candidate is pure social-only (no non-social evidence to be genuine about)', () => {
+    // isSocialOnly stays true only when there is literally no non-social
+    // member, so hasMomentumCorroboration:true here is a defensive
+    // input-shape check, not a realistic caller state -- the gate must
+    // still apply the normal pure-social rules.
+    assert.equal(resolveSocialTier('Create', {
+      isSocialOnly: true, hasMomentumCorroboration: true, distinctPostCount: 1, distinctCreatorCount: 1
+    }), 'Watch');
+  });
+});
+
+describe('hasMomentumCorroboration', () => {
+  test('a Google rising query counts as genuine momentum', () => {
+    const result = hasMomentumCorroboration({
+      nonSocialTodayObservations: [{ sourceType: 'dataforseo_trends', metricType: 'rising_value', metricValue: 80, sourceNativeClassification: 'rising' }],
+      nonSocialPriorHistory: []
+    });
+    assert.equal(result, true);
+  });
+
+  test('a Pinterest "growing" classification counts as genuine momentum', () => {
+    const result = hasMomentumCorroboration({
+      nonSocialTodayObservations: [{ sourceType: 'apify_pinterest', metricType: 'pinterest_rank', metricValue: 1, sourceNativeClassification: 'growing' }],
+      nonSocialPriorHistory: []
+    });
+    assert.equal(result, true);
+  });
+
+  test('a bare "top" query with no rising/growing flag and no history is NOT genuine momentum', () => {
+    const result = hasMomentumCorroboration({
+      nonSocialTodayObservations: [{ sourceType: 'dataforseo_trends', metricType: 'top_value', metricValue: 50, sourceNativeClassification: 'top' }],
+      nonSocialPriorHistory: []
+    });
+    assert.equal(result, false);
+  });
+
+  test('a measured increase vs. real stored history counts as genuine momentum, even for a "top" query', () => {
+    const result = hasMomentumCorroboration({
+      nonSocialTodayObservations: [{ sourceType: 'dataforseo_trends', metricType: 'top_value', metricValue: 90, sourceNativeClassification: 'top' }],
+      nonSocialPriorHistory: [
+        { source_type: 'dataforseo_trends', metric_type: 'top_value', metric_value: 50 },
+        { source_type: 'dataforseo_trends', metric_type: 'top_value', metric_value: 50 }
+      ]
+    });
+    assert.equal(result, true);
+  });
+
+  test('a flat or declining numeric value vs. history is NOT genuine momentum', () => {
+    const result = hasMomentumCorroboration({
+      nonSocialTodayObservations: [{ sourceType: 'dataforseo_trends', metricType: 'top_value', metricValue: 50, sourceNativeClassification: 'top' }],
+      nonSocialPriorHistory: [{ source_type: 'dataforseo_trends', metric_type: 'top_value', metric_value: 50 }]
+    });
+    assert.equal(result, false);
+  });
+
+  test('no non-social evidence at all is NOT genuine momentum', () => {
+    assert.equal(hasMomentumCorroboration({ nonSocialTodayObservations: [], nonSocialPriorHistory: [] }), false);
+  });
+});
+
+describe('socialObservationEligibility', () => {
+  test('fewer than 3 observations is insufficient history', () => {
+    assert.equal(socialObservationEligibility(0), 'insufficient_history');
+    assert.equal(socialObservationEligibility(2), 'insufficient_history');
+  });
+
+  test('3 to 6 observations is preliminary direction only', () => {
+    assert.equal(socialObservationEligibility(3), 'preliminary');
+    assert.equal(socialObservationEligibility(6), 'preliminary');
+  });
+
+  test('7 or more observations is eligible for measured momentum scoring', () => {
+    assert.equal(socialObservationEligibility(7), 'eligible');
+    assert.equal(socialObservationEligibility(30), 'eligible');
   });
 });

@@ -37,14 +37,20 @@ async function searchReddit(topicQueries, sinceDate) {
   if (reason) return { status: 'awaiting_connection', items: [], error: reason };
 
   const actorId = process.env.APIFY_REDDIT_ACTOR_ID || 'trudax/reddit-scraper-lite';
+  const maxItems = 100; // the actor's own overall ceiling for this run -- see cap/rawItemCount below
   try {
     const { items, runId, datasetId } = await runActor(actorId, {
       startUrls: subreddits().map((sub) => ({ url: `https://www.reddit.com/r/${sub}/new/` })),
-      maxItems: 100,
+      maxItems,
       maxPostCount: 40,
       maxComments: 0,
       skipComments: true
     });
+    // Raw count BEFORE topic-matching filters it down, and the actor's own
+    // configured ceiling -- lets callers (ingest.js) tell "fewer matching
+    // posts today" apart from "the raw feed was truncated before matching
+    // even happened", which must never be read as declining interest.
+    const rawItemCount = (items || []).length;
 
     const matched = (items || [])
       .filter((d) => !d.parentId) // comments carry parentId, posts don't
@@ -67,7 +73,7 @@ async function searchReddit(topicQueries, sinceDate) {
           rawPayload: { ...d, apifyRunId: runId, apifyDatasetId: datasetId }
         }];
       });
-    return { status: 'live', items: matched };
+    return { status: 'live', items: matched, rawItemCount, cap: maxItems };
   } catch (err) {
     return { status: 'failed', items: [], error: err.message };
   }
@@ -84,13 +90,16 @@ async function searchTikTok(topicQueries, sinceDate) {
     ? process.env.APIFY_TIKTOK_SEARCH_TERMS.split(',').map((s) => s.trim()).filter(Boolean)
     : topicQueries);
 
+  const resultsPerPage = 20;
   try {
     const { items, runId, datasetId } = await runActor(actorId, {
       searchQueries,
-      resultsPerPage: 20,
+      resultsPerPage,
       shouldDownloadVideos: false,
       shouldDownloadCovers: false
     });
+    const rawItemCount = (items || []).length;
+    const cap = resultsPerPage * searchQueries.length; // up to resultsPerPage per search query
 
     const matched = (items || [])
       .filter((d) => !d.createTimeISO || new Date(d.createTimeISO) >= sinceDate)
@@ -114,7 +123,7 @@ async function searchTikTok(topicQueries, sinceDate) {
           rawPayload: { ...d, apifyRunId: runId, apifyDatasetId: datasetId }
         }];
       });
-    return { status: 'live', items: matched };
+    return { status: 'live', items: matched, rawItemCount, cap };
   } catch (err) {
     return { status: 'failed', items: [], error: err.message };
   }
@@ -132,12 +141,15 @@ async function searchInstagram(topicQueries, sinceDate) {
     ? process.env.APIFY_INSTAGRAM_HASHTAGS.split(',').map((h) => h.trim()).filter(Boolean)
     : topicQueries.map(slugifyHashtag)).slice(0, 10); // cap -- one actor call per hashtag on some plans
 
+  const limit = 30;
   try {
     const { items, runId, datasetId } = await runActor(actorId, {
       hashtags,
-      limit: 30,
+      limit,
       sortBy: 'recent'
     });
+    const rawItemCount = (items || []).length;
+    const cap = limit * hashtags.length; // up to limit per hashtag
 
     const matched = (items || [])
       .filter((d) => !d.publishedAt || new Date(d.publishedAt) >= sinceDate)
@@ -162,7 +174,7 @@ async function searchInstagram(topicQueries, sinceDate) {
           rawPayload: { ...d, apifyRunId: runId, apifyDatasetId: datasetId }
         }];
       });
-    return { status: 'live', items: matched };
+    return { status: 'live', items: matched, rawItemCount, cap };
   } catch (err) {
     return { status: 'failed', items: [], error: err.message };
   }

@@ -427,24 +427,40 @@ on equal footing with search/Pinterest candidates:
   (`uniqueCreatorCount` in `aggregateObservations`) -- never something
   Claude is asked to estimate.
 
-**Social-only tier gating (`resolveSocialTier` in
-`src/microtrendScoring.js`)** is a deterministic, downgrade-only gate
-applied *after* the normal score-driven Watch/Investigate/Create tier, and
-only when every contributing source is a real social platform
-(`isSocialOnly` -- if Claude merged in a search/Pinterest clusterKey, this
-is false and the gate never applies, which is exactly what "corroboration
-from another source" means in practice):
+**Social tier gating (`resolveSocialTier` in `src/microtrendScoring.js`)**
+is a deterministic, downgrade-only gate applied *after* the normal
+score-driven Watch/Investigate/Create tier. A real cross-source merge
+(Claude citing a search/Pinterest clusterKey alongside a social one,
+`isSocialOnly: false`) is **not** on its own enough to fully lift this
+gate -- only **genuine momentum corroboration**
+(`hasMomentumCorroboration`) does: a real Google *rising* query, a
+Pinterest "growing" classification, or a measured numeric increase
+against this candidate's own stored history. A bare baseline *top* query,
+or search/Pinterest evidence simply being present, corroborates relevance
+but is never read as momentum:
 - **Watch** is always reachable from a single credible post; the gate
   never touches an already-Watch tier.
-- **Investigate** needs multiple real posts or multiple creators -- a
-  single post, however credible, downgrades to Watch.
-- **Create** additionally needs creator diversity (2+ distinct real
-  authors). "Measurable momentum" and "corroboration from another source"
-  remain valid alternatives in principle, but a verified engagement metric
-  for social platforms doesn't exist yet in this system -- the same
-  caution already applied to Pinterest's own rank/count fields -- so for a
-  *pure* social-only candidate, creator diversity is currently the only
-  satisfiable path to Create.
+- **Investigate** stands on a single post the moment there's ANY real
+  corroboration from another source, genuine momentum or not -- a social-
+  only candidate (no corroboration at all) still needs multiple real
+  posts or multiple creators to clear Watch in the first place.
+- **Create** needs genuine momentum corroboration (full bypass), OR
+  creator diversity where the diverse creators are themselves
+  demonstrably recent (`reliableRecentCreatorCount` -- 2+ distinct
+  authors counted *only* from posts on a reliable-recency platform with a
+  real, recent `publishedAt`). Reddit and TikTok give a real API
+  timestamp; Instagram's hashtag-search actor doesn't reliably, so an
+  Instagram post never counts toward this, though it also never vetoes
+  the others -- it just carries no weight. Old or undated evidence can
+  never earn Create through creator diversity alone, however many
+  distinct authors it has.
+
+Concretely: *a single social post plus a non-rising "top" query
+corroborates enough to reach Investigate, but is capped there -- it can
+never automatically become a Create recommendation.* Verified engagement
+counts (views/likes) are still never used for social momentum, same
+caution as Pinterest's rank/count fields -- see "Stored but not yet
+scored" below for how social momentum is meant to be measured instead.
 
 **`evidence_basis` (`'search' | 'social' | 'mixed'`)** is a write-time
 snapshot on every recommendation (and, recomputed for display, on every
@@ -454,6 +470,41 @@ a "Social-first signal" badge and a `mixed` one with "Social + search", so
 a social-only find is never presented as if it were broader search
 demand it never had. The common `search` case gets no badge at all, to
 keep that case visually quiet.
+
+**Stored but not yet scored (`microtrend_social_signals`, `provider_runs`
+collection-quality columns):** verified social momentum is deliberately
+*not* built from engagement counts (views/likes have no confirmed scale,
+same caution as Pinterest's rank/count fields) -- it's meant to come from
+this dashboard's own repeated observations instead, once there's enough
+of them. From day one, every report with real social evidence writes one
+`microtrend_social_signals` row per (report, microtrend):
+`new_post_count`/`new_creator_count` (genuine discovery counts -- a post
+or creator already linked to this microtrend on an earlier `report_date`
+never counts again), `platform_count` (distinct real platforms today),
+and `total_post_count`/`dateable_post_count`/`recent_post_count` kept as
+three separate numbers rather than one collapsed ratio, so "0 recent
+posts because there were none" never reads the same as "0 recent posts
+because we couldn't reliably tell" -- Instagram posts are never counted
+as dateable, so a candidate resting mostly on Instagram evidence will
+show a low `dateable_post_count` relative to `total_post_count`, which
+must read as lower confidence, never as "declining". `provider_runs` also
+now records `raw_item_count` (the Apify actor's raw result count *before*
+topic-matching filtered it down) and `hit_retrieval_cap` (whether that raw
+count met the actor's own configured ceiling), so a day with fewer
+matching posts can be told apart from a day where the source's own
+retrieval cap simply truncated the feed before matching ever happened --
+neither of those is read as declining interest.
+
+None of this is read by `scoreMicrotrend`, `hasMomentumCorroboration`, or
+`resolveSocialTier` yet -- acceleration in new-post/new-creator rates is
+meant to be derived from this stored history once it exists, not computed
+today. `socialObservationEligibility` (in `microtrendScoring.js`)
+classifies how much history a microtrend has
+(`getMicrotrendSocialSignalHistory`) purely for later use: fewer than 3
+daily observations is `insufficient_history`, 3-6 is `preliminary`, 7+ is
+`eligible` -- the day real social velocity scoring is switched on, this is
+the gate that decides whether it may contribute at all for a given
+microtrend.
 
 **Scoring (`src/microtrendScoring.js`)** is a separate deterministic
 formula from theme-level `scoring.js` -- freshness 20% / velocity 25% /

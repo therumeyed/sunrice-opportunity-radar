@@ -148,31 +148,86 @@ function actionTypeForMicrotrend(score) {
   return 'Watch';
 }
 
+// Whether non-social (search/Pinterest) evidence shows GENUINE momentum --
+// a Google rising query, a Pinterest "growing" classification, or a real
+// measured increase vs. this candidate's own stored history. A bare
+// baseline "top" query, or search/Pinterest evidence simply being present
+// at all, does NOT count: it can corroborate relevance (see
+// resolveSocialTier's Investigate floor), but must never alone turn a
+// single social post into a Create recommendation. Callers pass only the
+// NON-social slice of todayObservations/observationHistory -- this
+// function has no opinion on social evidence at all.
+function hasMomentumCorroboration({ nonSocialTodayObservations = [], nonSocialPriorHistory = [] }) {
+  const hasRisingOrGrowingFlag = nonSocialTodayObservations.some((o) => {
+    const c = (o.sourceNativeClassification || '').toLowerCase();
+    return c.includes('rising') || c.includes('growing');
+  });
+  if (hasRisingOrGrowingFlag) return true;
+
+  for (const obs of nonSocialTodayObservations) {
+    if (typeof obs.metricValue !== 'number') continue;
+    const priorNumeric = nonSocialPriorHistory.filter(
+      (h) => h.source_type === obs.sourceType && h.metric_type === obs.metricType && h.metric_value != null
+    );
+    if (priorNumeric.length === 0) continue;
+    const priorAvg = priorNumeric.reduce((sum, h) => sum + Number(h.metric_value), 0) / priorNumeric.length;
+    if (priorAvg > 0 && obs.metricValue > priorAvg) return true;
+  }
+  return false;
+}
+
 // Social evidence (real Reddit/TikTok/Instagram posts) has no verified
 // engagement metric -- a play count or like count's real scale/meaning
-// isn't confirmed, same caution as Pinterest's rank/count fields -- so a
-// social-only candidate can never earn "measurable momentum" the way a
-// real DataForSEO rising_value can. This gate is deliberately
-// downgrade-only, applied AFTER the score-driven tier above, and only
-// when the candidate is social-only (every contributing source_type is a
-// real social platform, nothing from search/Pinterest):
-//   - Create requires creator diversity (2+ distinct real authors) --
-//     without it, and with no cross-source corroboration (which would
-//     have made isSocialOnly false in the first place), downgrade to
-//     Investigate.
-//   - Investigate requires multiple posts or multiple creators -- a
-//     single post, however credible, downgrades (further) to Watch.
-//   - Watch is always reachable from a single credible post; this gate
-//     never touches an already-Watch tier.
-function resolveSocialTier(tier, { isSocialOnly, distinctPostCount = 0, distinctCreatorCount = 0 }) {
-  if (!isSocialOnly) return tier;
+// isn't confirmed, same caution as Pinterest's rank/count fields -- so
+// "measurable momentum" for social evidence is built from our own repeated
+// observations instead (new posts/creators per day, acceleration,
+// platform spread -- see microtrend_social_signals / db.js), not
+// engagement counts, and isn't activated in this formula yet regardless
+// (see socialObservationEligibility below). This gate is deliberately
+// downgrade-only, applied AFTER the score-driven tier above:
+//   - Genuine momentum corroboration from search/Pinterest (hasMomentum-
+//     Corroboration) fully lifts the gate, same as before -- that's what
+//     "corroboration from another source" means for Create in practice.
+//   - Without genuine momentum, a social-only candidate (isSocialOnly) OR
+//     one merged with only WEAK search/Pinterest corroboration (a bare
+//     "top" query, say) still has its Create tier capped: Create needs
+//     creator diversity among posts that are ALSO demonstrably recent
+//     (reliableRecentCreatorCount, distinct authors counted only from
+//     posts on a reliable-recency platform with a real, recent
+//     publishedAt -- see microtrendExtraction.js) -- without 2+ such
+//     creators, downgrade to Investigate. An Instagram post (no reliably
+//     accurate publication date) simply never contributes to this count;
+//     it doesn't veto the others, it just carries no weight here.
+//   - A PURE social-only candidate (no corroboration at all) additionally
+//     needs multiple posts or multiple creators just to clear Watch --
+//     weak corroboration from another source is itself enough to let
+//     Investigate stand on a single post (it just can't reach Create
+//     without genuine momentum or recent creator diversity, handled
+//     above); Watch is always reachable from a single credible post.
+function resolveSocialTier(tier, {
+  isSocialOnly, hasMomentumCorroboration: genuineMomentum = false,
+  distinctPostCount = 0, distinctCreatorCount = 0, reliableRecentCreatorCount = 0
+}) {
+  if (!isSocialOnly && genuineMomentum) return tier;
+
   let resolved = tier;
-  if (resolved === 'Create' && distinctCreatorCount < 2) resolved = 'Investigate';
-  if (resolved === 'Investigate' && distinctPostCount < 2 && distinctCreatorCount < 2) resolved = 'Watch';
+  if (resolved === 'Create' && reliableRecentCreatorCount < 2) resolved = 'Investigate';
+  if (resolved === 'Investigate' && isSocialOnly && distinctPostCount < 2 && distinctCreatorCount < 2) resolved = 'Watch';
   return resolved;
+}
+
+// Classifies how much stored microtrend_social_signals history a
+// microtrend has -- purely descriptive, read by nothing in this formula
+// yet. The day it's wired into scoring, this is the gate that decides
+// whether social velocity may contribute at all.
+function socialObservationEligibility(observationCount) {
+  if (observationCount < 3) return 'insufficient_history';
+  if (observationCount <= 6) return 'preliminary';
+  return 'eligible';
 }
 
 module.exports = {
   WEIGHTS, scoreMicrotrend, qualifiesForRecommendation, confidenceForMicrotrend, actionTypeForMicrotrend,
-  resolveSocialTier, freshnessScore, velocityScore, noveltyScore, evidenceQualityScore
+  resolveSocialTier, hasMomentumCorroboration, socialObservationEligibility,
+  freshnessScore, velocityScore, noveltyScore, evidenceQualityScore
 };

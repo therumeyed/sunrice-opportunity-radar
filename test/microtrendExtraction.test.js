@@ -1,6 +1,9 @@
 const { test, describe } = require('node:test');
 const assert = require('node:assert/strict');
-const { extractCandidates, socialCandidatesFor, aggregateObservations, evidenceLinksFor } = require('../src/microtrendExtraction');
+const {
+  extractCandidates, socialCandidatesFor, aggregateObservations, evidenceLinksFor,
+  RECENCY_WINDOW_DAYS, isReliableRecencyPlatform, isRecentReliablePost, reliableRecentCreatorCount
+} = require('../src/microtrendExtraction');
 
 function searchItem(id, rising = [], top = []) {
   return { id, normalized_metrics: { relatedQueries: { rising, top } } };
@@ -10,8 +13,8 @@ function pinterestItem(id, title, trendType, rank) {
   return { id, title, raw_metrics: { trendType, rank } };
 }
 
-function socialPost(id, excerpt, author) {
-  return { id, excerpt, author };
+function socialPost(id, excerpt, author, publishedAt = null) {
+  return { id, excerpt, author, published_at: publishedAt };
 }
 
 describe('extractCandidates', () => {
@@ -99,6 +102,79 @@ describe('socialCandidatesFor', () => {
   test('Pinterest is never treated as a social post source here', () => {
     const candidates = socialCandidatesFor('rice_basics', { pinterest: [socialPost(1, 'rice bowl trend', null)] });
     assert.deepEqual(candidates, []);
+  });
+
+  test('carries the real post\'s own publishedAt through to the member, for recency gating downstream', () => {
+    const when = new Date('2026-01-01T00:00:00Z');
+    const candidates = socialCandidatesFor('weeknight_dinners', { reddit: [socialPost(1, 'kimchi fried rice', 'a', when)] });
+    assert.deepEqual(candidates[0].members[0].publishedAt, when);
+  });
+
+  test('a post with no publishedAt carries a null member.publishedAt, never a fabricated date', () => {
+    const candidates = socialCandidatesFor('weeknight_dinners', { reddit: [socialPost(1, 'kimchi fried rice', 'a')] });
+    assert.equal(candidates[0].members[0].publishedAt, null);
+  });
+});
+
+describe('isReliableRecencyPlatform / isRecentReliablePost / reliableRecentCreatorCount', () => {
+  test('Reddit and TikTok are reliable recency platforms; Instagram is not', () => {
+    assert.equal(isReliableRecencyPlatform('apify_reddit'), true);
+    assert.equal(isReliableRecencyPlatform('apify_tiktok'), true);
+    assert.equal(isReliableRecencyPlatform('apify_instagram'), false);
+  });
+
+  test('a recent Reddit/TikTok post with a real publishedAt is a reliable recent post', () => {
+    const asOf = '2026-01-15';
+    const member = { sourceType: 'apify_reddit', publishedAt: new Date('2026-01-10') };
+    assert.equal(isRecentReliablePost(member, asOf), true);
+  });
+
+  test('a Reddit post older than the recency window is not recent', () => {
+    const asOf = '2026-01-15';
+    const member = { sourceType: 'apify_reddit', publishedAt: new Date('2025-12-01') };
+    assert.ok((new Date(asOf) - new Date('2025-12-01')) / 86400000 > RECENCY_WINDOW_DAYS);
+    assert.equal(isRecentReliablePost(member, asOf), false);
+  });
+
+  test('a missing publishedAt is never treated as recent', () => {
+    assert.equal(isRecentReliablePost({ sourceType: 'apify_reddit', publishedAt: null }, '2026-01-15'), false);
+  });
+
+  test('an Instagram post is never "recent", however fresh its own publishedAt claims to be', () => {
+    const member = { sourceType: 'apify_instagram', publishedAt: new Date('2026-01-15') };
+    assert.equal(isRecentReliablePost(member, '2026-01-15'), false);
+  });
+
+  test('reliableRecentCreatorCount counts distinct authors only from recent+reliable posts', () => {
+    const asOf = '2026-01-15';
+    const members = [
+      { sourceType: 'apify_reddit', publishedAt: new Date('2026-01-10'), author: 'a' },
+      { sourceType: 'apify_tiktok', publishedAt: new Date('2026-01-12'), author: 'b' }
+    ];
+    assert.equal(reliableRecentCreatorCount(members, asOf), 2);
+  });
+
+  test('an Instagram or stale/undated post never contributes to the count, but also never vetoes the others', () => {
+    const asOf = '2026-01-15';
+    const members = [
+      { sourceType: 'apify_reddit', publishedAt: new Date('2026-01-10'), author: 'a' },
+      { sourceType: 'apify_instagram', publishedAt: new Date('2026-01-14'), author: 'b' }, // unreliable platform
+      { sourceType: 'apify_reddit', publishedAt: new Date('2025-12-01'), author: 'c' } // too old
+    ];
+    assert.equal(reliableRecentCreatorCount(members, asOf), 1, 'only the one genuinely recent+reliable author counts');
+  });
+
+  test('is 0 when there is no social evidence at all', () => {
+    assert.equal(reliableRecentCreatorCount([{ sourceType: 'dataforseo_trends', publishedAt: new Date(), author: null }], '2026-01-15'), 0);
+  });
+
+  test('the same author appearing on multiple recent+reliable posts counts once', () => {
+    const asOf = '2026-01-15';
+    const members = [
+      { sourceType: 'apify_reddit', publishedAt: new Date('2026-01-10'), author: 'a' },
+      { sourceType: 'apify_tiktok', publishedAt: new Date('2026-01-12'), author: 'a' }
+    ];
+    assert.equal(reliableRecentCreatorCount(members, asOf), 1);
   });
 });
 

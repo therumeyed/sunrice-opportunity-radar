@@ -159,12 +159,21 @@ async function collectSocial(report, reportDate, sinceDate) {
 
   for (const platform of platforms) {
     const result = await platform.fn(queries, sinceDate);
+    // rawItemCount/cap are only returned by the 3 real social search
+    // functions (not Pinterest's own trend-list search) -- hitRetrievalCap
+    // stays null when either is absent, never defaulted to false, so
+    // "we don't know" is never recorded as "no, it wasn't capped".
+    const hitRetrievalCap = typeof result.cap === 'number' && typeof result.rawItemCount === 'number'
+      ? result.rawItemCount >= result.cap
+      : null;
     const run = await recordProviderRun(report.id, {
       providerName: platform.sourceName,
       sourceType: platform.sourceType,
       status: result.status,
       inputParams: { queries },
-      error: result.error
+      error: result.error,
+      rawItemCount: typeof result.rawItemCount === 'number' ? result.rawItemCount : null,
+      hitRetrievalCap
     });
     if (result.status === 'live') {
       for (const item of result.items) {

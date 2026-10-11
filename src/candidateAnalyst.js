@@ -232,7 +232,14 @@ async function callOnce(prompt) {
     },
     body: JSON.stringify({
       model: MODEL,
-      max_tokens: 4000,
+      // Raised from 4000 -- social-native discovery (one candidate per real
+      // Reddit/TikTok/Instagram post, un-clustered) can put far more
+      // candidates in a single batch than search/Pinterest alone ever did,
+      // and a response cut off mid-array by hitting max_tokens is NOT a
+      // transient failure: it fails identically on the retry too (the same
+      // batch, the same length), so "AI analysis unavailable" could
+      // otherwise become the everyday state rather than a real exception.
+      max_tokens: 8192,
       messages: [{ role: 'user', content: prompt }]
     })
   });
@@ -240,6 +247,13 @@ async function callOnce(prompt) {
   const data = await res.json();
   const text = (data.content?.[0]?.text || '').trim();
   if (!text) throw new Error('Anthropic candidate-analysis call returned empty content');
+  // stop_reason 'max_tokens' means the response was cut off mid-array --
+  // surfaced explicitly rather than left to be inferred from a cryptic
+  // JSON parse error, since it's a systematic "the batch is too big for
+  // this ceiling" problem, not a one-off fluke a bare retry will fix.
+  if (data.stop_reason === 'max_tokens') {
+    throw new Error('response was truncated at max_tokens -- the batch likely has too many candidates for the current ceiling');
+  }
   return text;
 }
 

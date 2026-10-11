@@ -50,6 +50,17 @@ async function initSchema() {
       error TEXT
     );
     CREATE INDEX IF NOT EXISTS idx_provider_runs_report ON provider_runs(report_id);
+    -- Collection-quality context for a social (Apify) provider run --
+    -- raw_item_count is the actor's own raw result count BEFORE
+    -- topic-matching filtered it down; hit_retrieval_cap flags when that
+    -- raw count met/exceeded the actor's own configured ceiling for that
+    -- run. Needed so anything reading social-momentum history later can
+    -- tell "this source genuinely returned fewer matching posts today"
+    -- apart from "this source's own retrieval cap truncated the raw feed
+    -- before matching even happened" -- the latter must never be read as
+    -- declining interest.
+    ALTER TABLE provider_runs ADD COLUMN IF NOT EXISTS raw_item_count INTEGER;
+    ALTER TABLE provider_runs ADD COLUMN IF NOT EXISTS hit_retrieval_cap BOOLEAN;
 
     -- Raw evidence: every item this dashboard ever cites lives here, in full,
     -- never trimmed to just what a recommendation needed. content_hash is
@@ -248,6 +259,40 @@ async function initSchema() {
       UNIQUE(microtrend_id, report_id, source_item_id)
     );
     CREATE INDEX IF NOT EXISTS idx_microtrend_evidence_microtrend ON microtrend_evidence(microtrend_id);
+
+    -- Daily social-momentum observations -- stored from day one so there's
+    -- real history by the time social velocity scoring is ever turned on,
+    -- but NOT read by scoring yet (see microtrendScoring.js's
+    -- resolveSocialTier and hasMomentumCorroboration, which only use
+    -- today's own post/creator counts and today's search/Pinterest
+    -- evidence -- never this table). One row per (report, microtrend),
+    -- upserted on a same-day rebuild same as microtrend_observations.
+    -- new_post_count/new_creator_count are genuine discovery counts -- a
+    -- post or creator already linked to this microtrend on an earlier
+    -- report_date never counts again, even if it reappears in today's
+    -- matched evidence. recent_post_count/dateable_post_count are kept
+    -- separate from total_post_count (never collapsed into one ratio here)
+    -- so a future reader can tell "0 recent posts because there were none"
+    -- apart from "0 recent posts because we couldn't reliably tell" --
+    -- Instagram posts are never counted as dateable (no reliably accurate
+    -- publication date from that source today), so a candidate resting
+    -- mostly on Instagram evidence will show a low dateable_post_count
+    -- relative to total_post_count, which must read as lower confidence,
+    -- never as "old" or "declining".
+    CREATE TABLE IF NOT EXISTS microtrend_social_signals (
+      id SERIAL PRIMARY KEY,
+      report_id INTEGER NOT NULL REFERENCES reports(id) ON DELETE CASCADE,
+      microtrend_id INTEGER NOT NULL REFERENCES microtrends(id) ON DELETE CASCADE,
+      new_post_count INTEGER NOT NULL DEFAULT 0,
+      new_creator_count INTEGER NOT NULL DEFAULT 0,
+      platform_count INTEGER NOT NULL DEFAULT 0,
+      total_post_count INTEGER NOT NULL DEFAULT 0,
+      dateable_post_count INTEGER NOT NULL DEFAULT 0,
+      recent_post_count INTEGER NOT NULL DEFAULT 0,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      UNIQUE(report_id, microtrend_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_microtrend_social_signals_microtrend ON microtrend_social_signals(microtrend_id);
 
     -- Additive: the daily recommendation unit is now a microtrend, not a
     -- theme directly. microtrend_id is nullable -- the fixed multicultural
@@ -461,8 +506,8 @@ async function listReportDates(fromDate, toDate) {
 
 async function recordProviderRun(reportId, run) {
   const res = await pool.query(
-    `INSERT INTO provider_runs (report_id, provider_name, source_type, status, finished_at, task_id, input_params, cost, error)
-     VALUES ($1,$2,$3,$4, CASE WHEN $4 IN ('live','cached','imported') OR $4 = 'failed' THEN now() ELSE NULL END, $5,$6,$7,$8)
+    `INSERT INTO provider_runs (report_id, provider_name, source_type, status, finished_at, task_id, input_params, cost, error, raw_item_count, hit_retrieval_cap)
+     VALUES ($1,$2,$3,$4, CASE WHEN $4 IN ('live','cached','imported') OR $4 = 'failed' THEN now() ELSE NULL END, $5,$6,$7,$8,$9,$10)
      RETURNING *`,
     [
       reportId,
@@ -472,7 +517,9 @@ async function recordProviderRun(reportId, run) {
       run.taskId || null,
       run.inputParams ? JSON.stringify(run.inputParams) : null,
       typeof run.cost === 'number' ? run.cost : null,
-      run.error || null
+      run.error || null,
+      typeof run.rawItemCount === 'number' ? run.rawItemCount : null,
+      typeof run.hitRetrievalCap === 'boolean' ? run.hitRetrievalCap : null
     ]
   );
   return res.rows[0];
@@ -700,6 +747,63 @@ async function linkMicrotrendEvidence(microtrendId, reportId, sourceItemId, matc
      VALUES ($1,$2,$3,$4) ON CONFLICT (microtrend_id, report_id, source_item_id) DO NOTHING`,
     [microtrendId, reportId, sourceItemId, matchType]
   );
+}
+
+// Every real social post/author this microtrend has EVER had linked as
+// evidence, strictly BEFORE reportDate -- the baseline reportBuilder.js
+// compares today's social members against to compute genuine
+// new_post_count/new_creator_count. Scoped to this microtrend_id, same
+// "history is per-identity, not per-real-world-post" caveat as every other
+// historical lookup in this file (getMicrotrendObservationHistory
+// included) -- if Claude's clustering moves a post under a different
+// canonical microtrend on a later day, that post's earlier history travels
+// with the OLD microtrend_id, not the new one.
+async function getMicrotrendSocialEvidenceHistory(microtrendId, reportDate) {
+  const res = await pool.query(
+    `SELECT DISTINCT si.id AS source_item_id, si.author
+     FROM microtrend_evidence me
+     JOIN reports r ON r.id = me.report_id
+     JOIN source_items si ON si.id = me.source_item_id
+     WHERE me.microtrend_id = $1 AND r.report_date < $2
+       AND si.source_type IN ('apify_reddit','apify_tiktok','apify_instagram')`,
+    [microtrendId, reportDate]
+  );
+  return res.rows;
+}
+
+// Upserted on a same-day rebuild same as recordMicrotrendObservation --
+// see the microtrend_social_signals table comment for what each field
+// means and why social velocity scoring doesn't read this yet.
+async function recordMicrotrendSocialSignal(reportId, s) {
+  const res = await pool.query(
+    `INSERT INTO microtrend_social_signals
+       (report_id, microtrend_id, new_post_count, new_creator_count, platform_count, total_post_count, dateable_post_count, recent_post_count)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+     ON CONFLICT (report_id, microtrend_id) DO UPDATE SET
+       new_post_count = EXCLUDED.new_post_count,
+       new_creator_count = EXCLUDED.new_creator_count,
+       platform_count = EXCLUDED.platform_count,
+       total_post_count = EXCLUDED.total_post_count,
+       dateable_post_count = EXCLUDED.dateable_post_count,
+       recent_post_count = EXCLUDED.recent_post_count
+     RETURNING *`,
+    [reportId, s.microtrendId, s.newPostCount || 0, s.newCreatorCount || 0, s.platformCount || 0, s.totalPostCount || 0, s.dateablePostCount || 0, s.recentPostCount || 0]
+  );
+  return res.rows[0];
+}
+
+// Full daily history, oldest first -- not read by scoring today; this is
+// the raw material a future social-velocity formula (and
+// socialObservationEligibility's day-count check) will read once there's
+// enough of it.
+async function getMicrotrendSocialSignalHistory(microtrendId) {
+  const res = await pool.query(
+    `SELECT mss.*, r.report_date FROM microtrend_social_signals mss
+     JOIN reports r ON r.id = mss.report_id
+     WHERE mss.microtrend_id = $1 ORDER BY r.report_date ASC`,
+    [microtrendId]
+  );
+  return res.rows;
 }
 
 async function getMicrotrendEvidence(microtrendId, reportId) {
@@ -1340,6 +1444,9 @@ module.exports = {
   getMicrotrendObservationHistory,
   recordMicrotrendObservation,
   linkMicrotrendEvidence,
+  getMicrotrendSocialEvidenceHistory,
+  recordMicrotrendSocialSignal,
+  getMicrotrendSocialSignalHistory,
   getMicrotrendEvidence,
   getRecommendationById,
   insertFeedback,

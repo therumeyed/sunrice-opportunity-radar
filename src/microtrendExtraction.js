@@ -93,12 +93,60 @@ function socialCandidatesFor(theme, socialItemsByPlatform) {
         clusterKey: `${theme}::social::${item.id}`,
         members: [{
           sourceItemId: item.id, sourceType: platform, matchType: 'social_post',
-          metricType: null, metricValue: null, sourceNativeClassification: null, author: item.author || null
+          metricType: null, metricValue: null, sourceNativeClassification: null, author: item.author || null,
+          publishedAt: item.published_at || null
         }]
       });
     }
   }
   return candidates;
+}
+
+// No exact cutoff was specified for "demonstrably recent" -- this uses the
+// same 14-day window noveltyScore already treats as "recent" elsewhere in
+// this codebase, pending real tuning once the observation period gives
+// real data to tune against.
+const RECENCY_WINDOW_DAYS = 14;
+
+// Reddit/TikTok give a real, API-sourced publish timestamp. Instagram's
+// hashtag-search actor does not reliably -- posts can come back with a
+// missing or stale publishedAt that this dashboard has no way to verify,
+// so Instagram evidence is never treated as "demonstrably recent" for
+// gating purposes, however recent its own publishedAt claims to be.
+function isReliableRecencyPlatform(sourceType) {
+  return sourceType === 'apify_reddit' || sourceType === 'apify_tiktok';
+}
+
+// reportDate is always a Melbourne CALENDAR-DATE string ("YYYY-MM-DD"),
+// while a post's real publishedAt is a precise UTC timestamp -- naively
+// diffing new Date(reportDate) (parsed as UTC midnight) against that
+// timestamp would make a post published later in the Melbourne day than
+// UTC midnight look like it was published in the "future" (a negative
+// age), even though it's unambiguously the same day. Normalizing both
+// sides to their Melbourne calendar date first (same convention
+// getTodayItems already uses) avoids that skew entirely.
+function melbourneDateOnly(dateLike) {
+  return new Intl.DateTimeFormat('en-CA', { timeZone: 'Australia/Melbourne' }).format(new Date(dateLike));
+}
+
+function isRecentReliablePost(member, asOfDate) {
+  if (!isReliableRecencyPlatform(member.sourceType) || !member.publishedAt) return false;
+  const ageDays = (new Date(melbourneDateOnly(asOfDate)) - new Date(melbourneDateOnly(member.publishedAt))) / 86400000;
+  return ageDays >= 0 && ageDays <= RECENCY_WINDOW_DAYS;
+}
+
+// Distinct real authors counted ONLY from posts that are both on a
+// reliable-recency platform and demonstrably recent (isRecentReliablePost)
+// -- this is what resolveSocialTier's Create path actually spends. An old
+// or undated post, or any Instagram post (no reliable publication date),
+// simply never contributes to this count: it doesn't disqualify the
+// candidate, it just carries no weight toward "recent creator diversity",
+// per "Instagram results without reliable recency should carry lower
+// momentum confidence than sources with reliable publication dates."
+function reliableRecentCreatorCount(members, asOfDate) {
+  return new Set(
+    members.filter((m) => isRecentReliablePost(m, asOfDate)).map((m) => m.author).filter(Boolean)
+  ).size;
 }
 
 // Most-frequent raw wording in the cluster is the one shown/stored --
@@ -188,4 +236,7 @@ function evidenceLinksFor(members) {
   return links;
 }
 
-module.exports = { extractCandidates, socialCandidatesFor, isSocialSourceType, SOCIAL_SOURCE_TYPES, aggregateObservations, evidenceLinksFor };
+module.exports = {
+  extractCandidates, socialCandidatesFor, isSocialSourceType, SOCIAL_SOURCE_TYPES, aggregateObservations, evidenceLinksFor,
+  RECENCY_WINDOW_DAYS, isReliableRecencyPlatform, isRecentReliablePost, reliableRecentCreatorCount
+};
