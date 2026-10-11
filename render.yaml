@@ -31,6 +31,8 @@ envVarGroups:
         sync: false
       - key: ADMIN_TOKEN
         generateValue: true
+      - key: EDITOR_TOKEN
+        generateValue: true
 
 services:
   - type: web

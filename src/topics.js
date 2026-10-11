@@ -16,7 +16,16 @@ const TOPICS = [
   // for a rice brand -- everyone who buys rice eventually searches these --
   // so it carries the top editorial relevance weight below, above
   // lunchbox_snacks and well above multicultural's hard-locked weight.
-  { theme: 'rice_basics', label: 'Rice cooking & prep', queries: ['cook rice', 'wash rice', 'rice cooker', 'rice types'] },
+  {
+    theme: 'rice_basics',
+    label: 'Rice cooking & prep',
+    queries: ['cook rice', 'wash rice', 'rice cooker', 'rice types'],
+    // Evergreen "how do I do the basics" phrasing -- read by
+    // microtrendExtraction.js so a question like "how to cook rice in a
+    // saucepan" classifies as macro (the baseline), never as a microtrend
+    // just because it's a long or specific-sounding phrase.
+    evergreenBaselines: ['how to cook rice', 'how to wash rice', 'how long to cook rice', 'rice to water ratio']
+  },
   { theme: 'weeknight_dinners', label: 'Weeknight dinners', queries: ['fried rice', 'rice recipes', 'dinner ideas'] },
   // "curry" alone is ambiguous (Steph/Stephen/Seth/Dell Curry, NBA) --
   // `exclude` is read by apifySocial.js to reject a social match that also
@@ -30,7 +39,12 @@ const TOPICS = [
   },
   { theme: 'healthy_eating', label: 'Healthy eating', queries: ['low gi', 'brown rice', 'protein snacks'] },
   { theme: 'lunchbox_snacks', label: 'Lunchbox & snacks', queries: ['rice cakes', 'kids snacks', 'lunchbox snacks'] },
-  { theme: 'sushi_asian', label: 'Sushi & Asian cooking', queries: ['sushi', 'sushi rice', 'japanese food'] },
+  {
+    theme: 'sushi_asian',
+    label: 'Sushi & Asian cooking',
+    queries: ['sushi', 'sushi rice', 'japanese food'],
+    evergreenBaselines: ['how to cook sushi rice', 'how to make sushi rice', 'how to make sushi at home']
+  },
   // Genuinely mainstream, fixed-date Australian occasions only -- a
   // shifting/non-Gregorian cultural or religious occasion belongs under
   // Multicultural discovery below, never here, because this theme can
@@ -68,4 +82,11 @@ function excludeForQuery(query) {
   return hit?.exclude || [];
 }
 
-module.exports = { TOPICS, MULTICULTURAL_THEME, ALL_TOPICS, allQueries, themeForQuery, excludeForQuery };
+function evergreenBaselinesForTheme(theme) {
+  const hit = ALL_TOPICS.find((t) => t.theme === theme);
+  return hit?.evergreenBaselines || [];
+}
+
+module.exports = {
+  TOPICS, MULTICULTURAL_THEME, ALL_TOPICS, allQueries, themeForQuery, excludeForQuery, evergreenBaselinesForTheme
+};

@@ -12,7 +12,9 @@ range and content themes.
 - **Social trends** -- Reddit, TikTok, Instagram and Pinterest Trends via Apify, each independently feature-flagged.
 - **Google News RSS** -- free, no API key, feeds evidence and rationale (no separate News panel; it's not a source_type with its own signal, just extra corroborating evidence).
 - **Today screen** -- top 3 evidence-backed recommendations, evidence drawer, History (by-date report browsing), filters (theme/audience/state) persisted in the URL.
-- **Deterministic scoring** -- freshness 25% / velocity 25% / cross-source agreement 20% / relevance 20% / seasonal fit 10%. No LLM touches the numbers; only the score components decide what gets shown, in what order, with what confidence.
+- **Microtrend discovery** -- each of today's 3 slots is a specific, evidence-backed microtrend inside a theme when one qualifies, not just the theme itself (section 5c); "What's emerging" surfaces every real microtrend tracked today that didn't win a slot.
+- **Recommendation feedback** -- Useful / Already covered / Not relevant / Don't show again, each a precise deterministic exclusion rule, plus a Hidden & covered items manager with Undo (section 5c).
+- **Deterministic scoring** -- freshness 25% / velocity 25% / cross-source agreement 20% / relevance 20% / seasonal fit 10% at the theme level, a separate microtrend-level formula underneath (section 5c). No LLM touches either set of numbers; only the score components decide what gets shown, in what order, with what confidence.
 
 ## What's deliberately not built yet
 
@@ -328,6 +330,114 @@ obvious case of clicking Refresh twice in a row; the real enforcement is
 always `ingest.js`'s own acquire, since the peek-then-spawn has an
 unavoidable small race window.
 
+## 5c. Microtrend discovery and feedback
+
+The daily recommendation unit changed from "a theme" to "a specific,
+evidence-backed microtrend inside a theme" -- everything in 5a/5b above
+(theme snapshots, lifecycle, theme-level recommendation memory) is kept
+exactly as it was and still drives the "National theme momentum" section;
+this is an additional layer underneath the top-3 slots, not a replacement
+for it.
+
+**Candidate extraction (`src/microtrendExtraction.js`)** pulls real
+candidate phrases only from evidence that can name a specific `source_items`
+row as proof: each `dataforseo_trends` row's own rising/top related
+queries, and each matched Pinterest trend-list row's own term. News and
+real social posts (Reddit/TikTok/Instagram) stay corroboration only -- there
+is no reliable way to pull a specific emerging phrase out of a post/article
+body without an LLM inventing one, which this explicitly never does.
+
+**Normalization, clustering, classification (`src/microtrends.js`)** is
+deterministic text processing, no vector database or embeddings: lowercase
++ punctuation-strip + singularize + a small synonym map produces a
+`normalized_key`; near-duplicates cluster via stopword-filtered token
+overlap. Each cluster classifies as:
+- **macro** -- identical (post-normalization) to the theme's own seed query
+  or an editorial evergreen-baseline phrase (`evergreenBaselines` in
+  `src/topics.js`, e.g. "how to cook sushi rice" under Sushi & Asian
+  cooking). Macros are suppressed for 30 days after first being shown,
+  unless something genuinely changes (a new contributing source type, or a
+  verified acceleration past anything seen before) -- otherwise every report
+  would "discover" the same evergreen basics every single day.
+- **seasonal** -- tied to a known dated occasion, regardless of theme.
+- **micro** -- everything else. The default is specificity: nothing is
+  treated as a microtrend just because it's a long or unusual-sounding
+  phrase, and nothing evergreen is promoted to "trend" status just because
+  it happened to phrase itself as a question.
+
+**Scoring (`src/microtrendScoring.js`)** is a separate deterministic formula
+from theme-level `scoring.js` -- freshness 20% / velocity 25% / agreement
+20% / relevance 15% / novelty 10% / evidence quality 10%, same "every
+component is a plain 0-1 input, weights sum to 1" auditability rule. Novelty
+specifically decays the more times this exact microtrend has already won a
+recommendation slot, so a strong microtrend that keeps winning on its own
+merits doesn't also get credited as "new" forever. Velocity only trusts a
+real number from DataForSEO's rising-query value (Pinterest's rank/count
+fields have no confirmed scale, same caution as section 3a) -- without one,
+it falls back to the source's own rising/growing classification flag.
+Microtrends never compete across themes for a slot: each of the existing
+top-3 theme slots tries to fill itself with that theme's own best-qualifying
+microtrend first, falling back to the theme-level recommendation (now
+tagged `recommendation_kind: 'baseline_opportunity'`) only when none exists
+or qualifies -- this keeps the existing theme-ranking mechanism as the
+safety net rather than risking an unfamiliar cross-theme reshuffle.
+
+**Every microtrend observed today, win or not**, gets persisted
+(`microtrends` / `microtrend_observations` / `microtrend_evidence`, plus a
+recomputed `last_score`) -- this is what powers **"What's emerging"**, a new
+section between today's 3 priorities and theme momentum: real microtrends
+tracked today that didn't win a slot, ranked purely by their own score,
+never padded.
+
+**Feedback (`src/feedback.js`, `recommendation_feedback` table)** is used
+only as explicit, named exclusion rules -- never silent material for an LLM
+to infer a hidden preference profile from:
+- **Useful** -- no suppression; stored as a positive example shown directly
+  and transparently to the LLM strategist for style/channel reference on
+  future recommendations for that theme (never a reason to repeat an idea
+  outright). Every 10 new "useful" examples should trigger a human-reviewed
+  summary before anything acts on the pattern (`needsBrandPreferenceReview`)
+  -- the summary itself is plain counts, never an LLM-inferred profile.
+- **Already covered** / **Don't show this idea again** -- both suppress by
+  the specific `action_fingerprint` (the proposed products/channel/format/
+  angle), not the underlying microtrend, so a genuinely different angle on
+  the same real microtrend is never blocked. When no real LLM action ever
+  existed to fingerprint (no API key, a failed call, a rejected response),
+  there's no finer-grained "angle" to suppress than the microtrend's own
+  deterministic recommendation, so this correctly falls back to hiding the
+  whole microtrend instead of silently staying eligible forever.
+- **Not relevant** -- hides the whole microtrend cluster permanently.
+
+`recommendation_feedback.recommendation_id` is nullable with
+`ON DELETE SET NULL`, deliberately not `CASCADE` -- `buildReport()` deletes
+and rebuilds a report's recommendations on every same-day re-run (a normal,
+supported operation), and a `CASCADE` here would silently destroy every
+feedback decision recorded against that day's recommendations the moment
+someone clicks Refresh again. `microtrend_id`/`action_fingerprint` are
+stored directly on the feedback row specifically so the exclusion rules
+never need a live `recommendation_id` to keep working.
+
+Feedback-writing endpoints (`POST /api/recommendations/:id/feedback`,
+`POST /api/feedback/:id/undo`) are gated behind `EDITOR_TOKEN` -- same
+session-scoped UX as `ADMIN_TOKEN` (browser prompt, `sessionStorage`, never
+written to the report JSON or any source file), but a separate token, since
+feedback is a distinct, lower-risk write than triggering a paid ingest run.
+Reading feedback (`GET /api/feedback/active`, the "Hidden & covered items"
+manager on the dashboard) stays public, same as every other report read.
+
+**Two semantic contradictions fixed in this round:**
+- A theme's "recommended N times in the last 14 days" count used to differ
+  by one depending on which part of the dashboard showed it (the theme
+  momentum card counted today's own just-created recommendation; the
+  priority card's own count didn't) -- both now mean the same thing,
+  appearances strictly before today.
+- `action_type: 'Create'` could be shown with no concrete action behind it
+  whenever the LLM strategist didn't run -- the LLM's own validated
+  `recommendedAction` field is now actually stored and surfaced ("Do this:
+  ..." on the card), and `Create` deterministically downgrades to
+  `Investigate` whenever no real `recommendedAction` exists, rather than
+  asserting a verdict this system can't back with anything specific.
+
 ## 6. Deploy to Render
 
 `render.yaml` provisions a web service, a daily cron job (ingestion), and
@@ -355,6 +465,11 @@ curl -X POST -H "Authorization: Bearer <ADMIN_TOKEN>" https://<your-service>.onr
 
 On Render, `ADMIN_TOKEN` is auto-generated -- find it under the web
 service's Environment tab.
+
+`EDITOR_TOKEN` works the same way for the feedback-writing endpoints (see
+section 5c) -- the dashboard's feedback buttons and the Hidden & covered
+items manager's Undo prompt for it the same way, and it's also
+auto-generated on Render under the same Environment tab.
 
 ## 8. Extending later
 

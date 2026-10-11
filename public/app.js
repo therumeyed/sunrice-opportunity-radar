@@ -7,8 +7,25 @@
     historyMonth: new Date(),
     reportDates: new Set(),
     currentBundle: null,
-    themeLabels: {}
+    themeLabels: {},
+    feedbackReasons: null
   };
+
+  // Session-scoped editor token, same UX as the existing ADMIN_TOKEN prompt
+  // (browser prompt(), Bearer header, sessionStorage) -- never written into
+  // the report JSON or any source file. A separate token from ADMIN_TOKEN:
+  // feedback is a distinct, lower-risk write than triggering a paid ingest run.
+  function getEditorToken() {
+    let token = sessionStorage.getItem('bd-editor-token');
+    if (!token) {
+      token = window.prompt('Editor token to record feedback:');
+      if (token) sessionStorage.setItem('bd-editor-token', token);
+    }
+    return token;
+  }
+  function clearEditorToken() {
+    sessionStorage.removeItem('bd-editor-token');
+  }
 
   function readUrl() {
     const params = new URLSearchParams(location.search);
@@ -97,6 +114,7 @@
   function renderNoReport() {
     qs('#bd-report-date').textContent = 'No completed report for this date yet';
     qs('#bd-priorities').innerHTML = `<p class="bd-empty-hero">Nothing to show. Run ingestion, or pick a different date from History.</p>`;
+    qs('#bd-emerging-list').innerHTML = '<div class="bd-empty">No data</div>';
     qs('#bd-theme-trends').innerHTML = '<div class="bd-empty">No data</div>';
     qs('#bd-search-bars').innerHTML = '<div class="bd-empty">No data</div>';
     qs('#bd-search-nuggets').innerHTML = '<div class="bd-empty">No data</div>';
@@ -108,6 +126,7 @@
     qs('#bd-report-date').textContent = `${fmtDate(bundle.report.date)} · National view`;
     qs('#bd-updated-status').textContent = bundle.report.generatedAt ? `Updated ${fmtDateTime(bundle.report.generatedAt)}` : '';
     renderPriorities(bundle.recommendations);
+    renderEmerging(bundle.microtrendsEmerging || []);
     renderThemeTrends(bundle.themeTrends || []);
     renderSearchDemand(bundle.signals.filter((s) => s.signalType === 'search_topic'));
     renderSocialSignals(bundle.signals.filter((s) => s.signalType === 'social_topic'));
@@ -134,6 +153,15 @@
     return `<span class="bd-continuity ${escapeHtml(status)}">${escapeHtml(CONTINUITY_LABELS[status])}</span>`;
   }
 
+  // Purely informational -- tells the reader WHERE today's idea came from
+  // (a specific microtrend vs. the theme-level safety net vs. a disclaimer
+  // needing human review), never affects ranking or wording of the ask.
+  const KIND_LABELS = { microtrend: 'Specific microtrend', baseline_opportunity: 'Theme opportunity', theme_disclaimer: 'Needs human review' };
+  function kindBadge(kind) {
+    if (!kind || !KIND_LABELS[kind]) return '';
+    return `<span class="bd-kind-badge ${escapeHtml(kind)}">${escapeHtml(KIND_LABELS[kind])}</span>`;
+  }
+
   function renderPriorities(recommendations) {
     const el = qs('#bd-priorities');
     if (recommendations.length === 0) {
@@ -146,21 +174,52 @@
       return `
       <article class="bd-priority">
         <div class="bd-priority-no">0${i + 1} · ${r.actionType.toUpperCase()}</div>
+        ${kindBadge(r.recommendationKind)}
         <h3>${escapeHtml(r.opportunityName || r.title)}</h3>
         <div class="bd-pill" style="display:inline-block;margin-bottom:6px;">${escapeHtml(categoryLabel)}</div>
         ${continuityBadge(r.continuityStatus)}
         ${momentumBadge(r.momentumSources)}
         <p>${escapeHtml(r.rationale)}</p>
+        ${r.recommendedAction ? `<p class="bd-change-note" style="font-style:normal;"><strong>Do this:</strong> ${escapeHtml(r.recommendedAction)}</p>` : ''}
         ${changeNote ? `<p class="bd-change-note">${escapeHtml(changeNote)}</p>` : ''}
         ${r.continuityMeta?.appearances14d ? `<p class="bd-change-note">Recommended ${r.continuityMeta.appearances14d} time${r.continuityMeta.appearances14d === 1 ? '' : 's'} in the last 14 days${r.continuityMeta.previousRecommendationDate ? `, last on ${escapeHtml(r.continuityMeta.previousRecommendationDate)}` : ''}.</p>` : ''}
         <div class="bd-priority-meta">
           <span class="bd-pill">${escapeHtml(r.state || 'National')} · ${escapeHtml(r.audience || 'General')} · ${escapeHtml(r.confidence.replace('_', ' '))}</span>
           <button class="bd-proof" type="button" data-rec-id="${r.id}">View evidence &rarr;</button>
         </div>
+        <div class="bd-feedback-row">
+          <button class="bd-feedback-btn" type="button" data-feedback-rec="${r.id}" data-feedback-type="useful">Useful</button>
+          <button class="bd-feedback-btn" type="button" data-feedback-rec="${r.id}" data-feedback-type="already_covered">Already covered</button>
+          <button class="bd-feedback-btn" type="button" data-feedback-rec="${r.id}" data-feedback-type="not_relevant">Not relevant</button>
+          <button class="bd-feedback-btn" type="button" data-feedback-rec="${r.id}" data-feedback-type="dont_show_again">Don't show again</button>
+        </div>
       </article>
     `;
     }).join('');
     el.querySelectorAll('[data-rec-id]').forEach((btn) => btn.addEventListener('click', () => openEvidence(btn.dataset.recId)));
+    el.querySelectorAll('[data-feedback-rec]').forEach((btn) => btn.addEventListener('click', () => openFeedbackForm(btn.dataset.feedbackRec, btn.dataset.feedbackType)));
+  }
+
+  // --- "What's emerging" (brief: between "today's priorities" and theme
+  // momentum) -- real microtrends tracked today that haven't won a slot,
+  // sorted purely by their own deterministic score.
+  function renderEmerging(microtrends) {
+    const el = qs('#bd-emerging-list');
+    if (microtrends.length === 0) {
+      el.innerHTML = '<div class="bd-empty">Nothing new emerging right now under the current filters.</div>';
+      return;
+    }
+    el.innerHTML = microtrends.slice(0, 12).map((m) => `
+      <div class="bd-emerging-card">
+        <div class="bd-emerging-top">
+          <h4>${escapeHtml(m.displayName)}</h4>
+          <span class="bd-candidate-type ${escapeHtml(m.candidateType)}">${escapeHtml(m.candidateType)}</span>
+        </div>
+        <div class="bd-emerging-meta">
+          ${escapeHtml(m.label)} · score <strong>${m.score != null ? Math.round(m.score) : '—'}</strong> · ${m.todayEvidenceCount} evidence item${m.todayEvidenceCount === 1 ? '' : 's'}
+        </div>
+      </div>
+    `).join('');
   }
 
   const LIFECYCLE_LABELS = {
@@ -335,6 +394,131 @@
     qs('#bd-proof-scrim').hidden = true;
   }
 
+  // --- Feedback form ------------------------------------------------------
+  const FEEDBACK_TYPE_LABELS = { useful: 'Useful', already_covered: 'Already covered', not_relevant: 'Not relevant', dont_show_again: "Don't show this idea again" };
+
+  async function loadFeedbackReasons() {
+    if (state.feedbackReasons) return state.feedbackReasons;
+    const res = await fetch('/api/feedback/reasons');
+    state.feedbackReasons = await res.json();
+    return state.feedbackReasons;
+  }
+
+  async function openFeedbackForm(recId, feedbackType) {
+    const reasonsData = await loadFeedbackReasons();
+    const reasons = reasonsData.reasonsByType[feedbackType] || [];
+    const needsContentDetails = feedbackType === 'already_covered';
+
+    qs('#bd-feedback-title').textContent = FEEDBACK_TYPE_LABELS[feedbackType] || feedbackType;
+    qs('#bd-feedback-form').innerHTML = `
+      ${reasons.length > 0 ? `
+      <div class="bd-feedback-field">
+        <label for="bd-feedback-reason">Reason</label>
+        <select id="bd-feedback-reason">
+          ${reasons.map((r) => `<option value="${escapeHtml(r)}">${escapeHtml(r)}</option>`).join('')}
+          <option value="Other">Other (add a note)</option>
+        </select>
+      </div>` : ''}
+      ${needsContentDetails ? `
+      <div class="bd-feedback-field">
+        <label for="bd-feedback-url">Where this already lives (optional)</label>
+        <input id="bd-feedback-url" type="url" placeholder="https://...">
+      </div>
+      <div class="bd-feedback-field">
+        <label for="bd-feedback-status">Status</label>
+        <select id="bd-feedback-status">
+          <option value="published">Published</option>
+          <option value="planned">Planned</option>
+        </select>
+      </div>` : ''}
+      <div class="bd-feedback-field">
+        <label for="bd-feedback-note">Note (required if "Other")</label>
+        <textarea id="bd-feedback-note" rows="3"></textarea>
+      </div>
+      <button class="bd-feedback-submit" type="button" id="bd-feedback-submit">Save feedback</button>
+      <p id="bd-feedback-error" style="color:var(--bd-red);font-size:11px;"></p>
+    `;
+
+    qs('#bd-feedback-submit').addEventListener('click', () => submitFeedback(recId, feedbackType));
+    qs('#bd-feedback-scrim').hidden = false;
+    qs('#bd-feedback-close').focus();
+  }
+
+  function closeFeedbackForm() {
+    qs('#bd-feedback-scrim').hidden = true;
+  }
+
+  async function submitFeedback(recId, feedbackType) {
+    const token = getEditorToken();
+    if (!token) return;
+    const payload = {
+      feedbackType,
+      reason: qs('#bd-feedback-reason')?.value || undefined,
+      existingContentUrl: qs('#bd-feedback-url')?.value || undefined,
+      contentStatus: qs('#bd-feedback-status')?.value || undefined,
+      note: qs('#bd-feedback-note')?.value || undefined
+    };
+    const res = await fetch(`/api/recommendations/${recId}/feedback`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify(payload)
+    });
+    if (res.status === 403) {
+      clearEditorToken();
+      qs('#bd-feedback-error').textContent = 'Editor token rejected -- try again.';
+      return;
+    }
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      qs('#bd-feedback-error').textContent = body.error || 'Could not save feedback.';
+      return;
+    }
+    closeFeedbackForm();
+    loadReport(); // re-fetch so a now-excluded idea/microtrend disappears immediately
+  }
+
+  // --- Hidden & covered items manager -------------------------------------
+  async function openFeedbackManager() {
+    qs('#bd-manager-scrim').hidden = false;
+    qs('#bd-manager-close').focus();
+    await renderFeedbackManager();
+  }
+
+  function closeFeedbackManager() {
+    qs('#bd-manager-scrim').hidden = true;
+  }
+
+  async function renderFeedbackManager() {
+    const list = qs('#bd-manager-list');
+    list.innerHTML = '<div class="bd-empty">Loading…</div>';
+    const res = await fetch('/api/feedback/active');
+    const { feedback } = await res.json();
+    if (feedback.length === 0) {
+      list.innerHTML = '<div class="bd-empty">Nothing hidden, covered, or dismissed right now.</div>';
+      return;
+    }
+    list.innerHTML = feedback.map((f) => `
+      <div class="bd-manager-row">
+        <div>
+          <strong>${escapeHtml(f.microtrendDisplayName || f.opportunityName || f.theme || 'Untitled')}</strong>
+          <span>${escapeHtml(FEEDBACK_TYPE_LABELS[f.feedbackType] || f.feedbackType)}${f.reason ? ` · ${escapeHtml(f.reason)}` : ''} · ${escapeHtml(fmtDateTime(f.createdAt))}</span>
+        </div>
+        <button class="bd-manager-undo" type="button" data-undo-id="${f.id}">Undo</button>
+      </div>
+    `).join('');
+    list.querySelectorAll('[data-undo-id]').forEach((btn) => btn.addEventListener('click', () => undoFeedback(btn.dataset.undoId)));
+  }
+
+  async function undoFeedback(feedbackId) {
+    const token = getEditorToken();
+    if (!token) return;
+    const res = await fetch(`/api/feedback/${feedbackId}/undo`, { method: 'POST', headers: { Authorization: `Bearer ${token}` } });
+    if (res.status === 403) { clearEditorToken(); alert('Editor token rejected -- try again.'); return; }
+    if (!res.ok) { alert('Could not undo this feedback.'); return; }
+    await renderFeedbackManager();
+    loadReport(); // the un-excluded idea/microtrend can reappear immediately
+  }
+
   // --- History popover ----------------------------------------------
   async function loadHistoryMonth() {
     const y = state.historyMonth.getFullYear();
@@ -423,6 +607,13 @@
     qs('#bd-proof-close').addEventListener('click', closeEvidence);
     qs('#bd-proof-scrim').addEventListener('click', (e) => { if (e.target.id === 'bd-proof-scrim') closeEvidence(); });
 
+    qs('#bd-feedback-close').addEventListener('click', closeFeedbackForm);
+    qs('#bd-feedback-scrim').addEventListener('click', (e) => { if (e.target.id === 'bd-feedback-scrim') closeFeedbackForm(); });
+
+    qs('#bd-feedback-manager-button').addEventListener('click', openFeedbackManager);
+    qs('#bd-manager-close').addEventListener('click', closeFeedbackManager);
+    qs('#bd-manager-scrim').addEventListener('click', (e) => { if (e.target.id === 'bd-manager-scrim') closeFeedbackManager(); });
+
     document.addEventListener('click', (e) => {
       const popover = qs('#bd-history-popover');
       const button = qs('#bd-history-button');
@@ -432,6 +623,8 @@
       if (e.key !== 'Escape') return;
       if (!qs('#bd-history-popover').hidden) closeHistory();
       if (!qs('#bd-proof-scrim').hidden) { closeEvidence(); qs('#bd-refresh-button').blur(); }
+      if (!qs('#bd-feedback-scrim').hidden) closeFeedbackForm();
+      if (!qs('#bd-manager-scrim').hidden) closeFeedbackManager();
     });
   }
 

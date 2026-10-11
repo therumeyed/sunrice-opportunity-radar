@@ -181,3 +181,35 @@ a { color: var(--bd-red); }
 @media (max-width: 860px) {
   .bd-theme-trends { grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); }
 }
+
+/* --- Microtrend kind badges, feedback controls, Emerging, manager ------ */
+.bd-link-btn { border: 0; background: transparent; color: #ffffff; font-size: 10px; text-decoration: underline; text-underline-offset: 3px; padding: 0; display: inline-block; margin-top: 4px; }
+.bd-kind-badge { border-radius: 999px; padding: 3px 8px; font-size: 9px; font-weight: 600; text-transform: uppercase; letter-spacing: .04em; display: inline-block; margin: 0 0 6px; background: rgba(255,255,255,.14); color: #ffffff; }
+.bd-kind-badge.baseline_opportunity { background: rgba(255,255,255,.08); color: #f4ded5; }
+.bd-feedback-row { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 10px; }
+.bd-feedback-btn { border: 1px solid rgba(255,255,255,.3); background: transparent; color: #ffffff; border-radius: 7px; padding: 5px 8px; font-size: 10px; }
+.bd-feedback-btn:hover { background: rgba(255,255,255,.12); }
+
+.bd-emerging-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 12px; }
+.bd-emerging-card { border: 1px solid var(--bd-line); border-radius: 12px; padding: 13px; background: var(--bd-panel-2); }
+.bd-emerging-top { display: flex; justify-content: space-between; align-items: start; gap: 8px; margin-bottom: 6px; }
+.bd-emerging-card h4 { font-size: 13px; margin: 0; font-family: Georgia, serif; font-weight: 600; line-height: 1.25; }
+.bd-candidate-type { border-radius: 999px; padding: 3px 8px; font-size: 9px; font-weight: 600; text-transform: uppercase; letter-spacing: .04em; white-space: nowrap; }
+.bd-candidate-type.micro { color: var(--bd-green); background: var(--bd-green-soft); }
+.bd-candidate-type.macro { color: var(--bd-muted); background: var(--bd-line); }
+.bd-candidate-type.seasonal { color: var(--bd-amber); background: var(--bd-amber-soft); }
+.bd-emerging-meta { font-size: 10px; color: var(--bd-muted); line-height: 1.6; margin: 4px 0; }
+.bd-emerging-meta strong { color: var(--bd-ink); }
+
+.bd-feedback-field { margin: 14px 0; }
+.bd-feedback-field label { display: block; font-size: 11px; color: var(--bd-muted); margin-bottom: 5px; }
+.bd-feedback-field select, .bd-feedback-field input, .bd-feedback-field textarea {
+  width: 100%; color: var(--bd-ink); background: var(--bd-panel); border: 1px solid var(--bd-line); border-radius: 8px; padding: 8px 9px; font-size: 12px; font-family: inherit;
+}
+.bd-feedback-submit { border: 0; background: var(--bd-red); color: #fff; border-radius: 9px; padding: 9px 14px; font-size: 12px; margin-top: 8px; }
+
+.bd-manager-row { border-top: 1px solid var(--bd-line); padding: 12px 0; display: flex; justify-content: space-between; align-items: start; gap: 10px; }
+.bd-manager-row:first-child { border-top: 0; padding-top: 0; }
+.bd-manager-row strong { font-size: 12px; display: block; }
+.bd-manager-row span { color: var(--bd-muted); font-size: 10px; display: block; margin-top: 3px; line-height: 1.4; }
+.bd-manager-undo { border: 1px solid var(--bd-line); background: var(--bd-panel-2); border-radius: 7px; padding: 6px 9px; font-size: 10px; white-space: nowrap; }

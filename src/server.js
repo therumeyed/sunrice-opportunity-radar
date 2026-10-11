@@ -4,10 +4,12 @@ const path = require('path');
 const { spawn } = require('child_process');
 const {
   pool, initSchemaWithRetry, getReportByDate, getLatestReport, listReportDates, getReportBundle,
-  tryAcquireIngestLock, releaseIngestLock
+  tryAcquireIngestLock, releaseIngestLock, getRecommendationById, insertFeedback, restoreFeedback, listActiveFeedback,
+  getActiveExclusions
 } = require('./db');
 const { ALL_TOPICS } = require('./topics');
 const { peakingEligible } = require('./themeLifecycle');
+const { FEEDBACK_TYPES, REASONS_BY_TYPE, validateFeedbackInput } = require('./feedback');
 
 const app = express();
 app.use(express.static(path.join(__dirname, '..', 'public')));
@@ -31,27 +33,82 @@ function requireAdmin(req, res, next) {
   next();
 }
 
+// Same session-scoped-token UX as ADMIN_TOKEN (browser prompt(), Bearer
+// header, sessionStorage on the frontend) but a separate token and a
+// separate env var -- feedback is a distinct, lower-risk write than
+// triggering a paid ingest run, and read access to feedback (the
+// hidden/covered-items manager) stays public same as every other report
+// read in this app; only the mutations below are gated.
+function requireEditor(req, res, next) {
+  const token = req.get('Authorization')?.replace(/^Bearer\s+/i, '');
+  if (!process.env.EDITOR_TOKEN || token !== process.env.EDITOR_TOKEN) {
+    return res.status(403).json({ error: 'forbidden' });
+  }
+  next();
+}
+
+function serializeFeedback(row) {
+  return {
+    id: row.id,
+    recommendationId: row.recommendation_id,
+    microtrendId: row.microtrend_id,
+    microtrendDisplayName: row.microtrend_display_name || null,
+    theme: row.theme || null,
+    opportunityName: row.opportunity_name || null,
+    actionFingerprint: row.action_fingerprint,
+    feedbackType: row.feedback_type,
+    reason: row.reason,
+    existingContentUrl: row.existing_content_url,
+    note: row.note,
+    contentStatus: row.content_status,
+    createdAt: row.created_at,
+    reversedAt: row.reversed_at
+  };
+}
+
 function applyFilters(bundle, query) {
   const { theme, audience, state, lifecycle } = query;
   let recommendations = bundle.recommendations;
   let signals = bundle.signals;
   let themeTrends = bundle.themeTrends;
+  let microtrends = bundle.microtrends;
 
   if (theme) {
     recommendations = recommendations.filter((r) => r.theme === theme);
     signals = signals.filter((s) => s.theme === theme);
     themeTrends = themeTrends.filter((t) => t.theme === theme);
+    microtrends = microtrends.filter((m) => m.theme === theme);
   }
   if (audience) recommendations = recommendations.filter((r) => r.audience === audience);
   if (state) recommendations = recommendations.filter((r) => r.state === state || r.state === 'National');
   if (lifecycle) signals = signals.filter((s) => s.lifecycle === lifecycle);
-  // audience/state deliberately never filter themeTrends -- it's national
-  // theme momentum, not truly calculated per audience/state.
+  // audience/state deliberately never filter themeTrends/microtrends --
+  // neither is truly calculated per audience/state; the theme filter
+  // narrows both, nothing else does.
 
-  return { ...bundle, recommendations, signals, themeTrends };
+  return { ...bundle, recommendations, signals, themeTrends, microtrends };
 }
 
-function serializeBundle(bundle) {
+function serializeMicrotrend(m) {
+  return {
+    id: m.id,
+    theme: m.theme,
+    displayName: m.display_name,
+    sourceWording: m.source_wording,
+    candidateType: m.candidate_type,
+    status: m.status,
+    firstSeenAt: m.first_seen_at,
+    lastSeenAt: m.last_seen_at,
+    score: m.last_score != null ? Number(m.last_score) : null,
+    scoreComponents: m.last_score_components,
+    todayObservations: m.today_observations || [],
+    todayEvidenceCount: Number(m.today_evidence_count) || 0
+  };
+}
+
+async function serializeBundle(bundle) {
+  const exclusions = await getActiveExclusions();
+  const winningMicrotrendIds = new Set(bundle.recommendations.filter((r) => r.microtrend_id).map((r) => r.microtrend_id));
   return {
     report: {
       date: bundle.report.report_date,
@@ -77,6 +134,9 @@ function serializeBundle(bundle) {
       opportunityName: r.opportunity_name || r.title,
       continuityStatus: r.continuity_status,
       continuityMeta: r.continuity_meta,
+      recommendationKind: r.recommendation_kind,
+      microtrendId: r.microtrend_id,
+      recommendedAction: r.recommended_action,
       evidence: r.evidence.map((e) => ({
         id: e.id,
         note: e.note,
@@ -131,6 +191,15 @@ function serializeBundle(bundle) {
       label: THEME_LABEL_BY_KEY[t.theme] || t.theme,
       peakingEligible: peakingEligible(t.observationCount)
     })),
+    // "What's emerging" (brief: the dashboard's second tier, between
+    // "what to act on today" and theme-level momentum) -- every real
+    // microtrend observed today that did NOT win a recommendation slot,
+    // and isn't hidden by "not relevant" feedback, sorted by its own
+    // deterministic score. Never padded, never re-ranked by an LLM.
+    microtrendsEmerging: (bundle.microtrends || [])
+      .filter((m) => !winningMicrotrendIds.has(m.id) && !exclusions.hiddenMicrotrendIds.has(m.id))
+      .sort((a, b) => Number(b.last_score || 0) - Number(a.last_score || 0))
+      .map((m) => ({ ...serializeMicrotrend(m), label: THEME_LABEL_BY_KEY[m.theme] || m.theme })),
     featureFlags: FEATURE_FLAGS
   };
 }
@@ -150,7 +219,7 @@ app.get('/api/reports/latest', async (req, res) => {
   const report = await getLatestReport();
   if (!report) return res.status(404).json({ error: 'no completed reports yet' });
   const bundle = await getReportBundle(report);
-  res.json(serializeBundle(applyFilters(bundle, req.query)));
+  res.json(await serializeBundle(applyFilters(bundle, req.query)));
 });
 
 app.get('/api/reports/dates', async (req, res) => {
@@ -164,7 +233,62 @@ app.get('/api/reports/:date', async (req, res) => {
   const report = await getReportByDate(req.params.date);
   if (!report) return res.status(404).json({ error: `no completed report for ${req.params.date}` });
   const bundle = await getReportBundle(report);
-  res.json(serializeBundle(applyFilters(bundle, req.query)));
+  res.json(await serializeBundle(applyFilters(bundle, req.query)));
+});
+
+app.use(express.json());
+
+// Static reason-list metadata (brief: "reason lists") -- public, no token,
+// same as /api/meta. The frontend's feedback dropdowns are populated from
+// this rather than a hard-coded copy, so adding a reason here is the only
+// place that needs editing.
+app.get('/api/feedback/reasons', (req, res) => {
+  res.json({ feedbackTypes: FEEDBACK_TYPES, reasonsByType: REASONS_BY_TYPE });
+});
+
+// The hidden/covered-items manager's data source -- read access is public,
+// matching every other report read in this app; only creating/undoing
+// feedback is gated behind EDITOR_TOKEN below. ?type=already_covered etc.
+// to narrow; omitted returns every active (non-reversed) row.
+app.get('/api/feedback/active', async (req, res) => {
+  const types = req.query.type ? [req.query.type] : null;
+  const rows = await listActiveFeedback(types);
+  res.json({ feedback: rows.map(serializeFeedback) });
+});
+
+// Writing feedback is a product mutation (the brief's explicit reason for
+// gating it behind EDITOR_TOKEN): microtrendId/actionFingerprint are read
+// from the recommendation this feedback is actually about, never trusted
+// from the client, so a stale or forged value can't corrupt the exclusion
+// rules deriveExclusions() depends on.
+app.post('/api/recommendations/:id/feedback', requireEditor, async (req, res) => {
+  const recommendation = await getRecommendationById(req.params.id);
+  if (!recommendation) return res.status(404).json({ error: `no recommendation with id ${req.params.id}` });
+
+  const { feedbackType, reason, note, existingContentUrl, contentStatus } = req.body || {};
+  const validation = validateFeedbackInput(feedbackType, { reason, note, contentStatus });
+  if (!validation.valid) return res.status(400).json({ error: validation.error });
+
+  const row = await insertFeedback({
+    recommendationId: recommendation.id,
+    microtrendId: recommendation.microtrend_id,
+    actionFingerprint: recommendation.action_fingerprint,
+    feedbackType,
+    reason,
+    note,
+    existingContentUrl,
+    contentStatus
+  });
+  res.status(201).json({ feedback: serializeFeedback(row) });
+});
+
+// Undo: never a hard delete -- reversed_at is set so the exclusion this
+// feedback created stops applying (deriveExclusions only reads rows where
+// reversed_at IS NULL) while the original decision stays in the audit trail.
+app.post('/api/feedback/:id/undo', requireEditor, async (req, res) => {
+  const row = await restoreFeedback(req.params.id);
+  if (!row) return res.status(404).json({ error: `no active feedback with id ${req.params.id}` });
+  res.json({ feedback: serializeFeedback(row) });
 });
 
 // Fire-and-forget: an ingestion run can take several minutes (bounded Apify

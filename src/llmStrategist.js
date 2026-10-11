@@ -55,6 +55,31 @@ function buildRegionList(interestByRegion) {
   return interestByRegion.map((r) => `- ${r.region}: ${r.value} [metricType: regional_interest_index, 0-100, relative to this topic's own scale only]`).join('\n');
 }
 
+const CANDIDATE_TYPE_LABELS = {
+  macro: 'an evergreen baseline topic for this theme (not a new or emerging idea -- only worth flagging if something genuinely changed)',
+  micro: 'a specific, more narrow idea emerging inside this theme',
+  seasonal: 'tied to a known seasonal/cultural occasion'
+};
+
+function buildMicrotrendBlock(microtrend) {
+  if (!microtrend) return null;
+  return `This recommendation is about ONE SPECIFIC microtrend inside the theme below, not the theme as a whole.
+Microtrend: "${microtrend.displayName}" (as it actually appeared in the evidence: "${microtrend.sourceWording}")
+What this microtrend is: ${CANDIDATE_TYPE_LABELS[microtrend.candidateType] || microtrend.candidateType}
+Ground opportunityName and recommendedAction specifically in THIS microtrend, not a generic restatement of the theme.`;
+}
+
+// Past "useful" feedback shown to the model directly and transparently, as
+// real stored history it can read -- never a hidden inferred profile. Style/
+// channel reference only; the hard rules below still require every claim to
+// be grounded in TODAY's real evidence, so this can't become a reason to
+// just repeat a past idea outright.
+function buildPositiveExamplesBlock(positiveExamples = []) {
+  if (positiveExamples.length === 0) return null;
+  const lines = positiveExamples.map((ex) => `- "${ex.opportunity_name}" via ${ex.suggested_channel || '(no channel recorded)'}`).join('\n');
+  return `The team has previously marked these past recommendations for this theme as useful (style/channel reference only -- never a reason to repeat the same idea, and every claim below must still be grounded in today's real evidence):\n${lines}`;
+}
+
 function buildMemoryBlock({ recentRecs, sameDayRec, lifecycle, daysActive, scoreChange, newSources, lostSources }) {
   const lines = [];
   if (sameDayRec) {
@@ -76,7 +101,7 @@ function buildPrompt(opportunity) {
   const {
     themeLabel, actionType, distinctSourceCount, risingQueries, topQueries, interestByRegion, socialExamples,
     momentumSources = [], recentRecs = [], sameDayRec = null, lifecycle = null, daysActive = null,
-    scoreChange = null, newSources = [], lostSources = []
+    scoreChange = null, newSources = [], lostSources = [], microtrend = null, positiveExamples = []
   } = opportunity;
 
   const productList = PRODUCTS.map((p) => `- ${p.name}${p.sizes ? ` (${p.sizes})` : ''}`).join('\n');
@@ -87,6 +112,8 @@ function buildPrompt(opportunity) {
     ? momentumSources.map((s) => `- ${MOMENTUM_SOURCE_LABELS[s] || s}`).join('\n')
     : '(not independently flagged as rising/growing by either source today)';
   const memoryBlock = buildMemoryBlock({ recentRecs, sameDayRec, lifecycle, daysActive, scoreChange, newSources, lostSources });
+  const microtrendBlock = buildMicrotrendBlock(microtrend);
+  const positiveExamplesBlock = buildPositiveExamplesBlock(positiveExamples);
 
   return `You are a sharp, commercially-minded social media strategist for SunRice, an Australian rice company. You are given REAL evidence already collected for one theme today, SunRice's REAL current product range, and REAL recommendation history for this theme. Respond with ONLY a single valid JSON object (no markdown fences, no prose before or after it) matching exactly this shape:
 
@@ -116,7 +143,7 @@ Hard rules -- breaking any of these makes your answer useless and it will be dis
 - Be specific and commercial, not generic marketing filler. No "own the moment" cliches, no exclamation points, no vague "leverage this opportunity" language.
 
 Theme: ${themeLabel}
-Action already decided (do not change or second-guess it): ${actionType}
+${microtrendBlock ? `\n${microtrendBlock}\n` : ''}Action already decided (do not change or second-guess it): ${actionType}
 Independent sources corroborating this: ${distinctSourceCount}
 Independently flagged as rising/growing right now by:
 ${momentumList}
@@ -135,7 +162,7 @@ ${socialList}
 
 Recommendation history for this theme:
 ${memoryBlock}
-
+${positiveExamplesBlock ? `\n${positiveExamplesBlock}\n` : ''}
 SunRice's real current product range:
 ${productList}
 

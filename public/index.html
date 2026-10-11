@@ -63,9 +63,16 @@
           <section class="bd-hero">
             <div class="bd-hero-top">
               <div><div class="bd-kicker">Today's read</div><h2>The three things worth acting on today</h2></div>
-              <div class="bd-hero-note">Prioritised using freshness, momentum, source agreement and brand relevance.</div>
+              <div class="bd-hero-note">Prioritised using freshness, momentum, source agreement and brand relevance. <button class="bd-link-btn" type="button" id="bd-feedback-manager-button">Hidden &amp; covered items</button></div>
             </div>
             <div class="bd-priorities" id="bd-priorities"></div>
+          </section>
+
+          <section class="bd-panel bd-full" id="bd-emerging-section">
+            <div class="bd-panel-head">
+              <div><h3>What's emerging</h3><p>Specific, evidence-backed microtrends tracked today that haven't won a slot above yet -- not a priority, just worth knowing about</p></div>
+            </div>
+            <div class="bd-emerging-list" id="bd-emerging-list"><div class="bd-empty">Loading…</div></div>
           </section>
 
           <section class="bd-panel bd-full" id="bd-theme-trends-section">
@@ -116,6 +123,23 @@
       <p id="bd-proof-summary"></p>
       <div class="bd-scores" id="bd-proof-scores"></div>
       <div id="bd-proof-evidence"></div>
+    </aside>
+  </div>
+
+  <div class="bd-drawer-scrim" id="bd-feedback-scrim" hidden>
+    <aside class="bd-drawer" aria-label="Give feedback" aria-modal="true" role="dialog">
+      <div class="bd-drawer-top"><span class="bd-source-tag">Feedback</span><button class="bd-icon" id="bd-feedback-close" type="button" aria-label="Close feedback form">&times;</button></div>
+      <h2 id="bd-feedback-title">&nbsp;</h2>
+      <div id="bd-feedback-form"></div>
+    </aside>
+  </div>
+
+  <div class="bd-drawer-scrim" id="bd-manager-scrim" hidden>
+    <aside class="bd-drawer" aria-label="Hidden and covered items" aria-modal="true" role="dialog">
+      <div class="bd-drawer-top"><span class="bd-source-tag">Hidden &amp; covered items</span><button class="bd-icon" id="bd-manager-close" type="button" aria-label="Close manager">&times;</button></div>
+      <h2>Active feedback</h2>
+      <p style="color:var(--bd-muted);font-size:11px;">Everything marked not relevant, already covered, or don't-show-again -- Undo restores it to the pool.</p>
+      <div id="bd-manager-list"></div>
     </aside>
   </div>
 
