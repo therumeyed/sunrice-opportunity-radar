@@ -1,8 +1,21 @@
-const { test, describe } = require('node:test');
+const { test, describe, beforeEach, afterEach } = require('node:test');
 const assert = require('node:assert/strict');
 const {
-  buildBatchPrompt, validateAssessment, parseAndValidateResponse, buildClusterKeyIndex, analyzeCandidates, extractJson
+  buildBatchPrompt, validateAssessment, parseAndValidateResponse, buildClusterKeyIndex,
+  chunkThemeBatches, analyzeCandidates, extractJson
 } = require('../src/candidateAnalyst');
+
+// A minimal real-shaped candidate, used only to pad out candidate counts
+// for chunking tests -- members/clusterKey content doesn't matter here.
+function fillerCandidate(theme, n) {
+  return { clusterKey: `${theme}::filler-${n}`, displayText: `filler ${n}`, members: [{ sourceItemId: n, sourceType: 'apify_reddit', matchType: 'social_post' }] };
+}
+function themeWithNCandidates(theme, n) {
+  return {
+    theme, themeLabel: theme, seedQueries: [], evergreenBaselines: [], positiveExamples: [],
+    candidates: Array.from({ length: n }, (_, i) => fillerCandidate(theme, i))
+  };
+}
 
 function sampleThemeBatches() {
   return [
@@ -245,5 +258,101 @@ describe('analyzeCandidates', () => {
     // silently claim "ok" just because there was nothing to analyze while
     // the key itself is missing.
     assert.equal(result.status, 'unavailable');
+  });
+});
+
+describe('chunkThemeBatches', () => {
+  test('groups multiple small themes into one chunk under the budget', () => {
+    const batches = [themeWithNCandidates('a', 3), themeWithNCandidates('b', 4)];
+    const chunks = chunkThemeBatches(batches);
+    assert.equal(chunks.length, 1);
+    assert.equal(chunks[0].length, 2);
+  });
+
+  test('starts a new chunk once adding a theme would exceed the budget', () => {
+    const batches = [themeWithNCandidates('a', 15), themeWithNCandidates('b', 15)];
+    const chunks = chunkThemeBatches(batches);
+    assert.equal(chunks.length, 2, '15 + 15 = 30 must not share one chunk at a 20-candidate budget');
+  });
+
+  test('a single theme exceeding the budget alone is split into same-theme sub-batches, never dropping candidates', () => {
+    const batches = [themeWithNCandidates('big', 45)];
+    const chunks = chunkThemeBatches(batches);
+    const totalCandidates = chunks.flatMap((c) => c.flatMap((t) => t.candidates)).length;
+    assert.equal(totalCandidates, 45, 'every candidate must survive the split, none dropped');
+    assert.ok(chunks.length >= 3, '45 candidates at a 20-candidate budget needs at least 3 sub-batches');
+    for (const chunk of chunks) {
+      assert.equal(chunk.length, 1);
+      assert.equal(chunk[0].theme, 'big', 'every sub-batch still carries the real theme identity/context');
+    }
+  });
+
+  test('a theme with zero candidates is never given its own empty chunk', () => {
+    const batches = [themeWithNCandidates('empty', 0), themeWithNCandidates('real', 2)];
+    const chunks = chunkThemeBatches(batches);
+    assert.equal(chunks.length, 1);
+    assert.equal(chunks[0].length, 1);
+    assert.equal(chunks[0][0].theme, 'real');
+  });
+});
+
+describe('analyzeCandidates: multi-chunk resilience (mocked network)', () => {
+  const realFetch = global.fetch;
+  beforeEach(() => {
+    process.env.ANTHROPIC_API_KEY = 'test-key';
+  });
+  afterEach(() => {
+    global.fetch = realFetch;
+    delete process.env.ANTHROPIC_API_KEY;
+  });
+
+  // Builds a fetch stub that inspects the real prompt sent for each call
+  // and returns a well-formed assessment for every candidate it mentions
+  // UNLESS that call's prompt matches `failOn` -- simulating one chunk's
+  // Anthropic call failing (both attempts) while another chunk succeeds.
+  function mockFetch(failOn) {
+    return async (url, opts) => {
+      const prompt = JSON.parse(opts.body).messages[0].content;
+      if (failOn(prompt)) {
+        return { ok: false, status: 500, text: async () => 'simulated failure' };
+      }
+      const clusterKeys = [...prompt.matchAll(/clusterKey: "([^"]+)"/g)].map((m) => m[1]);
+      const assessments = clusterKeys.map((ck) => ({
+        clusterKeys: [ck],
+        candidateName: `Candidate ${ck}`,
+        parentTheme: ck.split('::')[0],
+        classification: 'micro',
+        brandRelevance: 0.5,
+        whyItMattersNow: 'Real evidence supports this.',
+        proposedAction: { recommendedAction: 'Do something concrete' },
+        evidenceIds: [Number(ck.split('filler-')[1])]
+      }));
+      return { ok: true, json: async () => ({ content: [{ text: JSON.stringify(assessments) }], stop_reason: 'end_turn' }), text: async () => '' };
+    };
+  }
+
+  test('one chunk failing after retry never discards another chunk\'s real, valid assessments', async () => {
+    // 45 candidates in one theme -> split into 3 sub-batches of (20, 20, 5)
+    // by chunkThemeBatches; make the smallest (last) sub-batch fail.
+    global.fetch = mockFetch((prompt) => prompt.includes('filler-44'));
+    const result = await analyzeCandidates([themeWithNCandidates('big', 45)]);
+    assert.equal(result.status, 'ok', 'a partial chunk failure must never flip the whole report to unavailable');
+    assert.equal(result.assessments.length, 40, 'the 2 successful 20-candidate chunks\' assessments must all survive');
+    assert.ok(result.reason && result.reason.includes('1 of 3'), 'the partial failure must still be noted, not silently swallowed');
+  });
+
+  test('every chunk failing after retry returns unavailable with zero recommendations, never a partial fallback', async () => {
+    global.fetch = mockFetch(() => true);
+    const result = await analyzeCandidates([themeWithNCandidates('big', 45)]);
+    assert.equal(result.status, 'unavailable');
+    assert.ok(result.reason);
+  });
+
+  test('a single chunk still succeeds end-to-end (no network mocking needed beyond this)', async () => {
+    global.fetch = mockFetch(() => false);
+    const result = await analyzeCandidates([themeWithNCandidates('small', 5)]);
+    assert.equal(result.status, 'ok');
+    assert.equal(result.assessments.length, 5);
+    assert.equal(result.reason, null);
   });
 });

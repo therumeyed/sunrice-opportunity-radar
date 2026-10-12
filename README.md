@@ -229,9 +229,23 @@ recommendation history, feedback exclusions, deduplication, and --
 critically -- the final Watch/Investigate/Create tier. See section 5c for
 the full pipeline; this section is about the call itself.
 
-One batched call per ingest run covers every candidate across every theme
-together (not one call per candidate), so Claude can compare signals
-against each other and judge which ones are genuinely distinctive. Given
+A handful of batched calls per ingest run (`chunkThemeBatches`) cover
+every candidate across every theme -- never one call per candidate, but
+also never so few calls that a busy day's candidate volume (social-native
+discovery means one real post is one un-clustered candidate) overruns a
+single response. Small themes are grouped together up to a 20-candidate
+budget per call; a single theme that alone exceeds it is split into
+same-theme sub-batches (each still carrying that theme's own seed
+queries/evergreen baselines/positive examples) rather than ever dropping
+real evidence -- the only cost is that Claude can't merge a candidate in
+one sub-batch with one in another sub-batch of the SAME theme, which
+deterministic first-pass clustering (5c) still catches for exact/near-
+duplicate search/Pinterest wording regardless. One chunk failing after
+its own retry (including a response truncated at `max_tokens`, which
+fails identically on a bare retry, not a transient fluke) never discards
+another chunk's real, valid assessments -- only a report where *every*
+chunk failed returns `unavailable`; a partial failure still returns real
+assessments for what succeeded, plus a note on what was skipped. Given
 SunRice's real product range (`src/products.js`, 66 products, confirmed
 directly against the live "Showing 66 Products" count on sunrice.com.au --
 the site is JS-rendered and couldn't be scraped automatically, so the

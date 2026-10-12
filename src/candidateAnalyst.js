@@ -18,10 +18,11 @@
 // the actual recommendation (what to go create or which conversation to
 // join); it is never asked for and never gets to set the tier.
 //
-// Batched: one call covers every candidate across every theme from a
-// single ingest run, so Claude can compare signals against each other
-// and judge which ones are genuinely distinctive -- not one call per
-// candidate.
+// Batched: a handful of calls cover every candidate across every theme
+// from a single ingest run (chunkThemeBatches), so Claude can still
+// compare signals within a theme and judge which ones are genuinely
+// distinctive -- never one call per candidate, and never so few calls
+// that a busy day's total candidate volume overruns a single response.
 const ANTHROPIC_API_BASE = 'https://api.anthropic.com/v1/messages';
 const MODEL = process.env.ANTHROPIC_MODEL || 'claude-haiku-4-5-20251001';
 const { PRODUCTS } = require('./products');
@@ -200,6 +201,54 @@ function buildClusterKeyIndex(themeBatches) {
   return index;
 }
 
+// A single call covering every theme's candidates doesn't scale once
+// social-native discovery is in the mix -- one real post is one
+// un-clustered candidate, so a busy day's total candidate count across
+// every theme can comfortably outgrow max_tokens, and a truncated
+// response fails identically on the retry (not a transient fluke a bare
+// retry fixes). So instead of one call for the whole report, candidates
+// are chunked into several smaller calls, each kept under a conservative
+// candidate budget: small themes are grouped together up to that budget;
+// a single theme that alone exceeds it is split into same-theme
+// sub-batches (each still carrying that theme's full seed
+// queries/evergreen baselines/positive examples, so classification and
+// relevance judgment stay correct) rather than ever dropping evidence.
+// The only real cost is that Claude can no longer merge a candidate in
+// one sub-batch with one in another sub-batch of the SAME theme -- first-
+// pass deterministic clustering (microtrends.js) still catches exact/
+// near-duplicate search/Pinterest wording regardless; only Claude's own
+// cross-wording semantic merge is narrowed to within a sub-batch.
+const MAX_CANDIDATES_PER_CALL = 20;
+
+function chunkThemeBatches(themeBatches) {
+  const chunks = [];
+  let current = [];
+  let currentCount = 0;
+  for (const theme of themeBatches) {
+    if (theme.candidates.length === 0) continue;
+    if (theme.candidates.length > MAX_CANDIDATES_PER_CALL) {
+      if (current.length > 0) {
+        chunks.push(current);
+        current = [];
+        currentCount = 0;
+      }
+      for (let i = 0; i < theme.candidates.length; i += MAX_CANDIDATES_PER_CALL) {
+        chunks.push([{ ...theme, candidates: theme.candidates.slice(i, i + MAX_CANDIDATES_PER_CALL) }]);
+      }
+      continue;
+    }
+    if (current.length > 0 && currentCount + theme.candidates.length > MAX_CANDIDATES_PER_CALL) {
+      chunks.push(current);
+      current = [];
+      currentCount = 0;
+    }
+    current.push(theme);
+    currentCount += theme.candidates.length;
+  }
+  if (current.length > 0) chunks.push(current);
+  return chunks;
+}
+
 function parseAndValidateResponse(rawText, themeBatches) {
   const clusterKeyToMembers = buildClusterKeyIndex(themeBatches);
   let parsed;
@@ -257,13 +306,41 @@ async function callOnce(prompt) {
   return text;
 }
 
+// One chunk's call, with its own one-retry loop -- same resilience
+// contract as the old single-call version, just scoped to one chunk.
+async function analyzeChunk(chunk) {
+  const prompt = buildBatchPrompt(chunk);
+  let lastError;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const text = await callOnce(prompt);
+      const { assessments, rejectedCount, parseError } = parseAndValidateResponse(text, chunk);
+      if (parseError) {
+        lastError = parseError;
+        continue; // malformed JSON is worth one retry, same as a transport failure
+      }
+      return { ok: true, assessments, rejectedCount };
+    } catch (err) {
+      lastError = err.message;
+      console.warn(`[candidateAnalyst] chunk (${chunk.map((t) => t.theme).join(', ')}) attempt ${attempt + 1} failed: ${err.message}`);
+    }
+  }
+  return { ok: false, error: lastError };
+}
+
 /**
  * The single entry point reportBuilder.js calls. Analysis is mandatory for
- * a recommendation to exist at all -- no ANTHROPIC_API_KEY, or a call that
- * still fails after one retry, returns status 'unavailable' and
- * reportBuilder.js shows "AI analysis unavailable" with zero
- * recommendations rather than any deterministic fallback copy.
- * @returns {Promise<{status: 'ok', assessments: Array} | {status: 'unavailable', reason: string}>}
+ * a recommendation to exist at all -- no ANTHROPIC_API_KEY returns status
+ * 'unavailable' immediately. Otherwise candidates are chunked
+ * (chunkThemeBatches) and each chunk is analyzed independently: one bad
+ * chunk (failed after its own retry) never discards every other chunk's
+ * real, valid assessments -- same "a bad element doesn't void the whole
+ * batch" principle as validateAssessment, just one level up. Only a report
+ * where EVERY chunk failed returns 'unavailable' with zero recommendations
+ * -- a partial failure still returns 'ok' with whatever succeeded, plus a
+ * `reason` noting what was skipped (surfaced to the report row, same
+ * field reportBuilder.js already reads either way).
+ * @returns {Promise<{status: 'ok', assessments: Array, reason?: string} | {status: 'unavailable', reason: string}>}
  */
 async function analyzeCandidates(themeBatches) {
   if (!isConfigured()) {
@@ -273,29 +350,38 @@ async function analyzeCandidates(themeBatches) {
     return { status: 'ok', assessments: [] }; // nothing to analyze -- not a failure
   }
 
-  const prompt = buildBatchPrompt(themeBatches);
-  let lastError;
-  for (let attempt = 0; attempt < 2; attempt++) {
-    try {
-      const text = await callOnce(prompt);
-      const { assessments, rejectedCount, parseError } = parseAndValidateResponse(text, themeBatches);
-      if (parseError) {
-        lastError = parseError;
-        continue; // malformed JSON is worth one retry, same as a transport failure
-      }
-      if (rejectedCount > 0) {
-        console.warn(`[candidateAnalyst] ${rejectedCount} assessment(s) rejected validation this run`);
-      }
-      return { status: 'ok', assessments };
-    } catch (err) {
-      lastError = err.message;
-      console.warn(`[candidateAnalyst] attempt ${attempt + 1} failed: ${err.message}`);
+  const chunks = chunkThemeBatches(themeBatches);
+  const assessments = [];
+  const failures = [];
+  let totalRejected = 0;
+
+  for (const chunk of chunks) {
+    const result = await analyzeChunk(chunk);
+    if (result.ok) {
+      assessments.push(...result.assessments);
+      totalRejected += result.rejectedCount;
+    } else {
+      failures.push(`[${chunk.map((t) => t.theme).join(', ')}] ${result.error}`);
     }
   }
-  return { status: 'unavailable', reason: `Anthropic candidate analysis failed after retry: ${lastError}` };
+
+  if (totalRejected > 0) {
+    console.warn(`[candidateAnalyst] ${totalRejected} assessment(s) rejected validation this run`);
+  }
+
+  if (failures.length === chunks.length) {
+    return { status: 'unavailable', reason: `Anthropic candidate analysis failed after retry: ${failures.join(' | ')}` };
+  }
+  return {
+    status: 'ok',
+    assessments,
+    reason: failures.length > 0
+      ? `${failures.length} of ${chunks.length} theme batch(es) failed and were skipped: ${failures.join(' | ')}`
+      : null
+  };
 }
 
 module.exports = {
   isConfigured, buildBatchPrompt, extractJson, validateAssessment, parseAndValidateResponse,
-  buildClusterKeyIndex, analyzeCandidates
+  buildClusterKeyIndex, chunkThemeBatches, analyzeCandidates
 };
