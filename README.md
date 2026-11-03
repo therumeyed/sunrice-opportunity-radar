@@ -687,13 +687,18 @@ longer than an HTTP request should stay open. Reload the page after a bit to
 see the new report.
 
 ```bash
-curl -X POST -H "Authorization: Bearer <ADMIN_TOKEN>" https://<your-service>.onrender.com/admin/refresh
+curl -X POST -H "X-Admin-Token: <ADMIN_TOKEN>" https://<your-service>.onrender.com/admin/refresh
 ```
 
 On Render, `ADMIN_TOKEN` is auto-generated -- find it under the web
-service's Environment tab.
+service's Environment tab. It travels as a dedicated `X-Admin-Token`
+header, not `Authorization: Bearer` -- the login wall (section 6a)
+already owns `Authorization` for the whole site's Basic Auth, and an
+explicit Bearer header from the frontend would silently replace that
+instead of adding to it (HTTP allows only one `Authorization` header per
+request).
 
-`EDITOR_TOKEN` works the same way for the feedback-writing endpoints (see
+`EDITOR_TOKEN` works the same way (`X-Editor-Token` header) for the feedback-writing endpoints (see
 section 5c) -- the dashboard's feedback buttons and the Hidden & covered
 items manager's Undo prompt for it the same way, and it's also
 auto-generated on Render under the same Environment tab.

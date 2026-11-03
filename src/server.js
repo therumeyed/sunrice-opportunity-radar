@@ -6,8 +6,10 @@ const { spawn } = require('child_process');
 const {
   pool, initSchemaWithRetry, getReportByDate, getLatestReport, listReportDates, getReportBundle,
   tryAcquireIngestLock, releaseIngestLock, getRecommendationById, insertFeedback, restoreFeedback, listActiveFeedback,
-  getActiveExclusions, getIdeas, updateIdea, getIdeaHistory, getIdeaStatusCounts, getMostRecentRecommendationByFingerprint
+  getActiveExclusions, getIdeas, updateIdea, getIdeaHistory, getIdeaStatusCounts, getMostRecentRecommendationByFingerprint,
+  recordBaselineSnapshot, getLatestBaselineSnapshot, getAllBaselineSnapshots
 } = require('./db');
+const { computeBaseline } = require('./baseline');
 const { ALL_TOPICS } = require('./topics');
 const { peakingEligible } = require('./themeLifecycle');
 const { isSocialSourceType } = require('./microtrendExtraction');
@@ -66,22 +68,31 @@ const THEME_LABEL_BY_KEY = Object.fromEntries(ALL_TOPICS.map((t) => [t.theme, t.
 const AUDIENCES = ['parents', 'families', 'home cooks', 'health-conscious', 'multicultural audiences', 'general'];
 const STATES = ['National', 'VIC', 'NSW', 'QLD', 'SA', 'WA', 'TAS', 'ACT', 'NT'];
 
+// X-Admin-Token, not Authorization: Bearer -- the site-wide login wall
+// (requireSitePassword) already owns the Authorization header for the
+// whole app's Basic Auth. A browser that's already passed that gate
+// auto-attaches its Basic credentials to every request on this origin;
+// an explicit `Authorization: Bearer <token>` from the frontend would
+// silently REPLACE that Basic header instead of adding to it (HTTP allows
+// only one Authorization header per request), locking the admin/editor
+// actions out behind the site gate they'd just passed. A dedicated header
+// has no such collision.
 function requireAdmin(req, res, next) {
-  const token = req.get('Authorization')?.replace(/^Bearer\s+/i, '');
+  const token = req.get('X-Admin-Token');
   if (!process.env.ADMIN_TOKEN || token !== process.env.ADMIN_TOKEN) {
     return res.status(403).json({ error: 'forbidden' });
   }
   next();
 }
 
-// Same session-scoped-token UX as ADMIN_TOKEN (browser prompt(), Bearer
-// header, sessionStorage on the frontend) but a separate token and a
-// separate env var -- feedback is a distinct, lower-risk write than
-// triggering a paid ingest run, and read access to feedback (the
+// Same session-scoped-token UX as ADMIN_TOKEN (browser prompt(),
+// X-Editor-Token header, sessionStorage on the frontend) but a separate
+// token and a separate env var -- feedback is a distinct, lower-risk write
+// than triggering a paid ingest run, and read access to feedback (the
 // hidden/covered-items manager) stays public same as every other report
 // read in this app; only the mutations below are gated.
 function requireEditor(req, res, next) {
-  const token = req.get('Authorization')?.replace(/^Bearer\s+/i, '');
+  const token = req.get('X-Editor-Token');
   if (!process.env.EDITOR_TOKEN || token !== process.env.EDITOR_TOKEN) {
     return res.status(403).json({ error: 'forbidden' });
   }
@@ -473,6 +484,36 @@ app.post('/admin/refresh', requireAdmin, async (req, res) => {
   });
   child.unref();
   res.json({ ok: true, started: true });
+});
+
+// Stage 1 of the roadmap (IMPLEMENTATION_CHECKLIST.md) -- computes and
+// durably stores a point-in-time baseline from real, existing data, so a
+// genuine before/after comparison is possible once later stages change
+// recommendation behaviour. Each call is a NEW row (see
+// recordBaselineSnapshot), never an overwrite -- there is no scratch DB
+// with real history, so this only means something once run against the
+// real deployment.
+app.post('/admin/baseline', requireAdmin, async (req, res) => {
+  try {
+    const metrics = await computeBaseline();
+    const row = await recordBaselineSnapshot(metrics, req.body?.notes || null);
+    res.json({ ok: true, id: row.id, computedAt: row.computed_at, metrics });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// Public read, same as every other report read in this app -- lets
+// anyone see the most recent baseline (and its full history) without
+// needing database access.
+app.get('/api/baseline', async (req, res) => {
+  if (req.query.all === 'true') {
+    const rows = await getAllBaselineSnapshots();
+    return res.json({ snapshots: rows.map((r) => ({ id: r.id, computedAt: r.computed_at, notes: r.notes, metrics: r.metrics })) });
+  }
+  const latest = await getLatestBaselineSnapshot();
+  if (!latest) return res.status(404).json({ error: 'no baseline snapshot has been captured yet' });
+  res.json({ id: latest.id, computedAt: latest.computed_at, notes: latest.notes, metrics: latest.metrics });
 });
 
 const port = process.env.PORT || 3000;

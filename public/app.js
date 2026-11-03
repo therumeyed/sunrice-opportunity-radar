@@ -12,7 +12,7 @@
   };
 
   // Session-scoped editor token, same UX as the existing ADMIN_TOKEN prompt
-  // (browser prompt(), Bearer header, sessionStorage) -- never written into
+  // (browser prompt(), X-Editor-Token header, sessionStorage) -- never written into
   // the report JSON or any source file. A separate token from ADMIN_TOKEN:
   // feedback is a distinct, lower-risk write than triggering a paid ingest run.
   function getEditorToken() {
@@ -489,7 +489,7 @@
     };
     const res = await fetch(`/api/recommendations/${recId}/feedback`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      headers: { 'Content-Type': 'application/json', 'X-Editor-Token': token },
       body: JSON.stringify(payload)
     });
     if (res.status === 403) {
@@ -541,7 +541,7 @@
   async function undoFeedback(feedbackId) {
     const token = getEditorToken();
     if (!token) return;
-    const res = await fetch(`/api/feedback/${feedbackId}/undo`, { method: 'POST', headers: { Authorization: `Bearer ${token}` } });
+    const res = await fetch(`/api/feedback/${feedbackId}/undo`, { method: 'POST', headers: { 'X-Editor-Token': token } });
     if (res.status === 403) { clearEditorToken(); alert('Editor token rejected -- try again.'); return; }
     if (!res.ok) { alert('Could not undo this feedback.'); return; }
     await renderFeedbackManager();
@@ -693,7 +693,7 @@
     if (!token) return;
     const res = await fetch(`/api/ideas/${encodeURIComponent(fingerprint)}`, {
       method: 'PATCH',
-      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      headers: { 'Content-Type': 'application/json', 'X-Editor-Token': token },
       body: JSON.stringify(changes)
     });
     if (res.status === 403) { clearEditorToken(); alert('Editor token rejected -- try again.'); return; }
@@ -707,7 +707,7 @@
     if (!token) return;
     const res = await fetch(`/api/ideas/${encodeURIComponent(fingerprint)}/feedback`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      headers: { 'Content-Type': 'application/json', 'X-Editor-Token': token },
       body: JSON.stringify({ feedbackType })
     });
     if (res.status === 403) { clearEditorToken(); alert('Editor token rejected -- try again.'); return; }
@@ -745,7 +745,7 @@
     qs('#bd-refresh-button').addEventListener('click', async () => {
       const token = window.prompt('Admin token to trigger a refresh:');
       if (!token) return;
-      const res = await fetch('/admin/refresh', { method: 'POST', headers: { Authorization: `Bearer ${token}` } });
+      const res = await fetch('/admin/refresh', { method: 'POST', headers: { 'X-Admin-Token': token } });
       if (res.ok) {
         alert('Refresh started. This can take several minutes -- reload later to see the new report.');
       } else if (res.status === 409) {

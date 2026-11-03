@@ -428,6 +428,19 @@ async function initSchema() {
       active BOOLEAN NOT NULL DEFAULT true,
       UNIQUE(theme, query)
     );
+
+    -- Point-in-time baseline capture (src/baseline.js) -- a JSONB blob
+    -- rather than typed columns because the metric set is expected to
+    -- grow as later stages add new things worth measuring (a review
+    -- queue, mismatch reason codes). Never overwritten: each run is its
+    -- own row, so "before" and "after" a behavior change are both real,
+    -- comparable snapshots, not one row silently replaced.
+    CREATE TABLE IF NOT EXISTS baseline_snapshots (
+      id SERIAL PRIMARY KEY,
+      computed_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      metrics JSONB NOT NULL,
+      notes TEXT
+    );
   `);
 }
 
@@ -1405,8 +1418,29 @@ async function getReportBundle(report) {
   };
 }
 
+async function recordBaselineSnapshot(metrics, notes) {
+  const res = await pool.query(
+    `INSERT INTO baseline_snapshots (metrics, notes) VALUES ($1, $2) RETURNING *`,
+    [JSON.stringify(metrics), notes || null]
+  );
+  return res.rows[0];
+}
+
+async function getLatestBaselineSnapshot() {
+  const res = await pool.query(`SELECT * FROM baseline_snapshots ORDER BY computed_at DESC LIMIT 1`);
+  return res.rows[0] || null;
+}
+
+async function getAllBaselineSnapshots() {
+  const res = await pool.query(`SELECT * FROM baseline_snapshots ORDER BY computed_at ASC`);
+  return res.rows;
+}
+
 module.exports = {
   pool,
+  recordBaselineSnapshot,
+  getLatestBaselineSnapshot,
+  getAllBaselineSnapshots,
   DATA_STATUSES,
   initSchema,
   initSchemaWithRetry,

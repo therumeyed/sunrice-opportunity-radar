@@ -11,22 +11,41 @@ known limitation -- filled in as each stage actually ships, not drafted
 in advance.
 
 ## Stage 1: Baseline snapshot
-**Status:** in progress
+**Status:** shipped (code); real production run still pending
 
 Capture what the system can already measure before any of Stages 4-7
 change recommendation behaviour. Metrics that genuinely can't be
 measured yet (no review queue, no mismatch reason codes) are marked
 `unavailable`, never approximated or defaulted to zero.
 
-- [ ] `baseline_snapshots` table (additive)
-- [ ] `src/baseline.js` -- computes feedback-type counts, duplicate-recommendation
+- [x] `baseline_snapshots` table (additive, append-only -- each run is its
+      own row, never overwritten)
+- [x] `src/baseline.js` -- computes feedback-type counts, duplicate-recommendation
       rate, time-to-recommendation, evidence completeness/freshness, tier-at-
-      first-appearance distribution
-- [ ] `POST /admin/baseline` endpoint (requireAdmin) to trigger + store + return it
-- [ ] Verified against fixtures in a scratch DB
-- [ ] Run once for real against production after this stage deploys (this
-      needs the user to trigger it on Render -- a local scratch DB has no
-      real history to snapshot)
+      first-appearance distribution, plus plain context counts (report/
+      recommendation/microtrend totals, AI-unavailable day count)
+- [x] `POST /admin/baseline` endpoint (requireAdmin) to trigger + store + return it;
+      `GET /api/baseline` (public, same as every other report read) to read the
+      latest or full history
+- [x] Verified against known fixtures in a scratch DB (`test/baseline.test.js`,
+      3/3 passing) -- confirmed both the empty-DB "everything unavailable,
+      nothing zero" case and real computed numbers against hand-checked
+      fixture data (duplicate rate, time-to-recommendation, tier-at-first-
+      appearance, evidence completeness/freshness all matched by hand)
+- [ ] Run once for real against production (needs the user to call
+      `POST /admin/baseline` on the live Render deploy once this ships --
+      a scratch DB has no real history to snapshot, so this step can't be
+      done from here)
+
+**Found and fixed along the way (not new work, a standing regression):**
+the site-wide login wall (shipped earlier) and `ADMIN_TOKEN`/`EDITOR_TOKEN`
+were silently incompatible -- both tried to use the `Authorization`
+header, and a browser can only send one. Since the login wall shipped,
+clicking **Refresh** or any feedback button was actually broken in
+production (blocked by the login wall's own gate, which saw a Bearer
+token where it expected Basic auth). Fixed by moving `ADMIN_TOKEN`/
+`EDITOR_TOKEN` to dedicated `X-Admin-Token`/`X-Editor-Token` headers --
+verified live, both gates now compose correctly. See README section 6a/7.
 
 ## Stage 2: Evidence-store additions, catalogue enrichment, data-use audit
 **Status:** pending
