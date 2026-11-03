@@ -654,6 +654,29 @@ separation becomes a priority).
 Cron fires at `20:00 UTC` (~6am Melbourne) -- Render cron is UTC-only, no DST
 awareness; shift by an hour at each daylight-saving change.
 
+### 6a. Login wall
+
+The entire dashboard -- every page, every API route, reports and
+Idea Tracker alike -- sits behind one shared password, checked via
+standard HTTP Basic Auth (`requireSitePassword` in `server.js`): no
+custom login page, just the browser's own native password prompt. Set it
+in Render under the **`sunrice-radar-secrets`** env var group (the
+Blueprint prompts for it at deploy time since it's `sync: false`, same as
+the DataForSEO/Apify credentials) -- key **`SITE_PASSWORD`**. Anyone
+sharing the dashboard needs that one password; there's no per-user login.
+
+This fails **closed**: if `SITE_PASSWORD` is ever unset, the whole site
+returns 503 to everyone rather than quietly becoming public. The one
+exception is `/health`, left open on purpose so Render's own
+infrastructure polling never needs a password -- it reveals nothing
+beyond "the process is up." Locally, set `SITE_PASSWORD` in `.env` the
+same way, or the dev server is just as locked out as production.
+
+This is a different, broader gate than `ADMIN_TOKEN`/`EDITOR_TOKEN`
+(section 7) -- those two only protect specific mutation endpoints
+(triggering a refresh, writing feedback) while every report *read* stays
+public; `SITE_PASSWORD` blocks everything, read or write, up front.
+
 ## 7. Triggering a refresh manually
 
 The dashboard's **Refresh** button prompts for the admin token at click time

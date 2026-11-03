@@ -1,6 +1,12 @@
 envVarGroups:
   - name: sunrice-radar-secrets
     envVars:
+      # The whole dashboard's login-wall password (HTTP Basic Auth, see
+      # server.js's requireSitePassword) -- sync: false so Render prompts
+      # for a real value at deploy time rather than defaulting to blank;
+      # the app fails closed (no access at all) if this is ever unset.
+      - key: SITE_PASSWORD
+        sync: false
       - key: DATAFORSEO_LOGIN
         sync: false
       - key: DATAFORSEO_PASSWORD

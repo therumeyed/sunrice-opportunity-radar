@@ -1,6 +1,7 @@
 require('dotenv').config();
 const express = require('express');
 const path = require('path');
+const crypto = require('crypto');
 const { spawn } = require('child_process');
 const {
   pool, initSchemaWithRetry, getReportByDate, getLatestReport, listReportDates, getReportBundle,
@@ -13,6 +14,45 @@ const { isSocialSourceType } = require('./microtrendExtraction');
 const { FEEDBACK_TYPES, REASONS_BY_TYPE, validateFeedbackInput } = require('./feedback');
 
 const app = express();
+
+// Login wall: the entire dashboard (every static asset and every API
+// route) is gated behind ONE shared password, checked via standard HTTP
+// Basic Auth -- the browser's own native login prompt, no custom login
+// page or session/cookie handling needed. This is a different, broader
+// gate than ADMIN_TOKEN/EDITOR_TOKEN below, which only protect specific
+// mutation endpoints while every report READ stays public; this gate
+// blocks EVERYTHING, read or write, until the right password is given.
+// Fails CLOSED: if SITE_PASSWORD isn't set, nobody gets in (never falls
+// back to "no password configured means open access") -- the one
+// exception is /health, which Render's own infrastructure may poll
+// without credentials and which reveals nothing beyond "the process is
+// up". Username is ignored; only the password is checked, with a
+// constant-time comparison so response timing can't leak how much of a
+// guessed password was correct.
+function timingSafeEqual(a, b) {
+  const bufA = Buffer.from(a);
+  const bufB = Buffer.from(b);
+  if (bufA.length !== bufB.length) return false;
+  return crypto.timingSafeEqual(bufA, bufB);
+}
+
+function requireSitePassword(req, res, next) {
+  if (req.path === '/health') return next();
+  if (!process.env.SITE_PASSWORD) {
+    return res.status(503).send('This dashboard has no SITE_PASSWORD configured yet -- set one in Render to enable access.');
+  }
+  const header = req.get('Authorization') || '';
+  const [scheme, encoded] = header.split(' ');
+  if (scheme === 'Basic' && encoded) {
+    const decoded = Buffer.from(encoded, 'base64').toString('utf8');
+    const password = decoded.slice(decoded.indexOf(':') + 1);
+    if (timingSafeEqual(password, process.env.SITE_PASSWORD)) return next();
+  }
+  res.set('WWW-Authenticate', 'Basic realm="SunRice Opportunity Radar", charset="UTF-8"');
+  res.status(401).send('Password required.');
+}
+
+app.use(requireSitePassword);
 app.use(express.static(path.join(__dirname, '..', 'public')));
 
 const FEATURE_FLAGS = {
