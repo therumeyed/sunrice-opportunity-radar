@@ -722,6 +722,48 @@ rejected-for-`product_mismatch` but it's `strong`), it's logged to the new
 `fit_contradictions` table, readable via `GET /admin/fit-contradictions`
 (admin-gated, no UI yet -- same pattern as `/admin/rejected-candidates`).
 
+## 5g. Candidate-level lifecycle and urgency (Stage 6)
+
+A second, deliberately separate lifecycle to the one in 5a. Section 5a's
+`themeLifecycleFor()` describes the whole topic area (e.g. "rice cooking &
+prep" is `building`); this describes one specific idea's own trend (e.g.
+"air fryer rice crisps" is `growing`). Shown on the priority card, the
+Emerging card, and the evidence drawer, each labelled explicitly as "this
+idea's own trend, not the theme's" so the two are never confused, and
+rendered with a visibly different (non-pill) badge shape from the
+theme-level badge.
+
+**`src/candidateLifecycle.js`** -- `insufficient_history` (fewer than 3
+real days of history) / `emerging` (3-6 days) / `growing` / `established`
+/ `declining` (7+ days, direction-dependent). Reuses the existing 3/7-day
+tiers from `socialObservationEligibility()` (`src/microtrendScoring.js`)
+rather than inventing new thresholds, and the same ±20% windowed-average
+convention `scoring.js`/`themeLifecycle.js` already use for direction.
+History is counted in real elapsed calendar days via each day's own
+`report_id` (both `microtrend_observations` and the brand-new read of
+`microtrend_social_signals` are upserted one row per report, so a same-day
+refresh can never inflate a candidate's age). Direction comes from two
+independently-checked series -- the numeric search signal, and real
+social post-count history (`microtrend_social_signals`, stored since
+Stage 2/3 and read for the first time here) -- either can call it
+growing/declining; today's own reading is folded into both series before
+the check runs, so a genuine same-day spike shows up immediately rather
+than the next day.
+
+A `growing` or `declining` candidate also gets an `urgencyNote` --
+e.g. *"Momentum is still building -- with a typical ~2-day
+planning/production lead time (a configurable assumption, not a predicted
+expiry), sooner is better."* `EXECUTION_LEAD_TIME_DAYS` is a named
+constant, not a gate: it never excludes a candidate or claims a precise
+remaining window, only adds that one line of context.
+
+**Known limitation:** a social-only candidate can't persist its identity
+across days under the current extraction scheme (`socialCandidatesFor()`
+keys each raw candidate to one specific post's id, which differs every
+day) -- only a candidate that also carries search/Pinterest evidence (a
+stable, text-based identity) can accumulate the multi-day history this
+lifecycle needs. Pre-existing, not something this stage changed.
+
 ## 6. Deploy to Render
 
 `render.yaml` provisions a web service, a daily cron job (ingestion), and

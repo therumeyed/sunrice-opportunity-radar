@@ -28,7 +28,7 @@ matter for how this system actually decides what to recommend.
 | `new_item_count` / `duplicate_item_count` **(new, Stage 3)** | Derived, not collected | `provider_runs` | Stage 3's `zero_usable_records` rule and the Source health tab's per-source run history | Since Stage 3 | Null (not 0) for a run that never attempted any items (e.g. the DataForSEO cost-ceiling skip with no cached fallback available) -- "didn't try" is never recorded the same as "tried and found nothing" |
 | `source_health_alerts` **(new, Stage 3)** | Derived, not collected | `source_health_alerts` | In-app admin alerts, email trigger, the public evidence-outage notice (names no source, just a boolean) | Since Stage 3 | At most one OPEN row per (source_type, alert_type) by construction (partial unique index) -- a repeat firing bumps the existing row, never creates a duplicate |
 | `microtrend_observations` (daily score/classification per source) | Yes | `microtrend_observations`, append-only per report | `scoreMicrotrend`'s velocity input, material-change checks | Since microtrend discovery shipped | Working as intended |
-| `microtrend_social_signals` (new posts/creators/platforms/dateable/recent) | Yes | `microtrend_social_signals`, append-only per report | **Nowhere yet** -- explicitly deferred pending real history | Since the momentum round | Stage 6 is where this finally gets read, once enough real history exists |
+| `microtrend_social_signals` (new posts/creators/platforms/dateable/recent) | Yes | `microtrend_social_signals`, append-only per report | **Stage 6:** `new_post_count` history now feeds `candidateLifecycleFor`'s social-direction check (`src/candidateLifecycle.js`) -- the other columns (creators/platforms/dateable/recent) are still unread | Since the momentum round | First real read happened this stage, once enough history existed to make it meaningful |
 | `recommendation_feedback` | Yes | `recommendation_feedback` | Exclusion rules (`deriveExclusions`), "useful" style examples shown to Claude | Since feedback system shipped | 4 types today, not the Relevant/Not-relevant split -- Stage 7. No feedback-to-scoring numeric loop yet |
 | `ideas.workflow_status` | Yes | `ideas` | Idea Tracker | Since Idea Tracker shipped | Already correctly separate from `feedback_type` -- no change needed |
 | `action_fingerprint` | Yes | `recommendations`, `ideas`, `recommendation_feedback` | Continuity, suppression, Idea Tracker identity | Since launch | Working as intended |
@@ -38,11 +38,22 @@ matter for how this system actually decides what to recommend.
 | `recommendations.resurfacing_note` **(new, Stage 4)** | Derived, not collected | `recommendations.resurfacing_note` | Displayed on the recommendation itself (`resurfacingNote` in the API, shown on the card and in the evidence drawer) | Since Stage 4 | Null in the normal case (never previously rejected) -- set only when a prior rejection's bar was genuinely cleared |
 | `microtrends.sunrice_fit_*` / `recommendations.sunrice_fit_*` **(new, Stage 5)** | Derived, not collected | `microtrends`, `recommendations` | Displayed on every priority/Emerging card and the evidence drawer (`sunriceFit` in the API); `detectFitEligibilityContradiction`'s input | Since Stage 5 | Stored on `microtrends` for EVERY observed candidate regardless of outcome (same "store now" reasoning as `last_score`); `recommendations`' copy is a write-time snapshot, never recomputed later |
 | `fit_contradictions` **(new, Stage 5)** | Derived, not collected | `fit_contradictions` | `GET /admin/fit-contradictions` (audit, admin-only) | Since Stage 5 | Scoped to the one component that overlaps both Stage 4 and Stage 5's primary question -- product connection -- the only place a disagreement between the two stages is actually meaningful to compare |
+| `microtrends.candidate_lifecycle` / `recommendations.candidate_lifecycle` / `recommendations.urgency_note` **(new, Stage 6)** | Derived, not collected | `microtrends`, `recommendations` | Displayed on every priority/Emerging card and the evidence drawer (`candidateLifecycle`/`urgencyNote` in the API), explicitly labelled as the idea's own trend, not the theme's | Since Stage 6 | Stored on `microtrends` for every observed candidate (same "store now" reasoning as `last_score`/`sunrice_fit_*`); `recommendations`' copy is a write-time snapshot, never recomputed later |
 
 ## Known gaps carried forward (not yet closed)
 
 - **No acceleration/2nd-derivative signal anywhere in scoring** --
-  `microtrend_social_signals` stores the raw material (Stage 6 reads it).
+  `candidateLifecycleFor` only ever reports a direction
+  (growing/established/declining), never a rate of change.
+- **Social-only candidates can't accumulate cross-day history** --
+  `socialCandidatesFor()`'s per-post identity (`social-${item.id}`) means
+  only a candidate that also carries search/Pinterest evidence (a stable,
+  text-based identity) can build the multi-day history Stage 6's
+  lifecycle math needs. Pre-existing extraction-layer limitation, not
+  something Stage 6 changed.
+- `microtrend_social_signals`' creator/platform/dateable/recent counts
+  are still unread by anything -- only `new_post_count` feeds Stage 6's
+  social direction check so far.
 - **No review-queue-derived signal** -- `usefulCandidatesIncorrectlyRejectedRate`
   in the baseline stays `unavailable` until Stage 8 ships (`rejected_candidates`'
   `uncertain` rows are the raw material Stage 8's queue will read).

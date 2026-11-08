@@ -206,6 +206,17 @@ a { color: var(--bd-red); }
 .bd-priority .bd-fit-badge.moderate { border-color: #f0b94d; }
 .bd-priority .bd-fit-badge.low { border-color: #ff9c92; }
 .bd-resurfacing-note { color: var(--bd-amber); font-size: 11px; font-style: italic; margin: -4px 0 10px; }
+
+/* Stage 6: candidate-level lifecycle -- deliberately NOT pill-shaped like
+   .bd-lifecycle (theme-level) above, so the two never look like the same
+   system at a glance. Base styling suits a light panel; .bd-priority
+   overrides it for the dark hero. */
+.bd-candidate-lifecycle { display: inline-block; border-radius: 4px; padding: 3px 7px; font-size: 9px; font-weight: 600; border-left: 3px solid; white-space: nowrap; }
+.bd-candidate-lifecycle.insufficient_history, .bd-candidate-lifecycle.emerging { color: var(--bd-muted); background: var(--bd-panel-2); border-color: var(--bd-muted); }
+.bd-candidate-lifecycle.growing { color: var(--bd-green); background: var(--bd-green-soft); border-color: var(--bd-green); }
+.bd-candidate-lifecycle.established { color: var(--bd-amber); background: var(--bd-amber-soft); border-color: var(--bd-amber); }
+.bd-candidate-lifecycle.declining { color: var(--bd-red); background: var(--bd-red-soft); border-color: var(--bd-red); }
+.bd-priority .bd-candidate-lifecycle { background: rgba(255,255,255,.12); color: #ffffff; }
 .bd-ai-unavailable { color: #fff0ed; padding: 4px 0; }
 .bd-ai-unavailable strong { display: block; font-size: 15px; margin-bottom: 6px; font-family: Georgia, serif; }
 .bd-ai-unavailable p { font-size: 12px; line-height: 1.5; margin: 0 0 6px; }

@@ -306,18 +306,95 @@ scratch Postgres instance.
   ranking a Moderate candidate already has to clear to win a slot.
 
 ## Stage 6: Momentum and lifecycle improvements
-**Status:** pending
+**Status:** done
 
-- [ ] History eligibility accounts for elapsed calendar time + successful
-      collection windows, not raw run count (same-day refreshes don't
-      count as separate days)
-- [ ] Candidate-level Emerging/Growing/Established/Declining, kept
-      distinct from theme-level lifecycle, both explained in the UI
-- [ ] "Insufficient history" shown rather than a forced label; never an
-      invented growth rate
-- [ ] 2-day execution lead time as a labelled, configurable assumption --
-      informs urgency only, never auto-rejects, never claims a precise
-      remaining window
+- [x] History eligibility accounts for elapsed calendar time + distinct
+      successful collection days, not raw run count (`observationDays`,
+      `src/candidateLifecycle.js`) -- a same-day refresh can never inflate
+      a microtrend's history, since both `microtrend_observations` and
+      `microtrend_social_signals` are upserted one row per `report_id`
+      (1:1 with calendar date) via a real UNIQUE constraint
+- [x] Reuses the existing 3/7-day eligibility tiers rather than inventing
+      new thresholds -- `socialObservationEligibility()`
+      (`src/microtrendScoring.js`, already shipped in an earlier stage) now
+      also gates candidate-level lifecycle: under 3 days is always
+      `insufficient_history`, 3-6 days is always `emerging`, never a
+      forced direction either way
+- [x] Candidate-level Emerging/Growing/Established/Declining
+      (`candidateLifecycleFor`, `src/candidateLifecycle.js`), kept
+      genuinely distinct from theme-level lifecycle
+      (`themeLifecycle.js`'s new/validating/building/cooling/sustained/
+      peaking): different states, different badge shape in the UI
+      (non-pill `.bd-candidate-lifecycle` vs pill `.bd-lifecycle`), and
+      both panels' copy explicitly says which is which -- verified live,
+      see below
+- [x] Direction (growing/declining/established) comes from comparing a
+      3-day windowed average against everything before it (the same
+      ±20%-threshold convention `scoring.js`/`themeLifecycle.js` already
+      use), across two real, separately-tracked series: the numeric
+      search signal (`dataforseo_trends` rising value) and, for the first
+      time, real `microtrend_social_signals` history (new post count per
+      day) -- stored since Stage 2/3 and explicitly deferred until now.
+      Either series alone can call it `growing`/`declining`; they're never
+      averaged together
+- [x] Today's own reading is folded into the trend series before the
+      direction check runs, not just prior history -- a genuine same-day
+      spike shows up in today's lifecycle label immediately, not
+      tomorrow
+- [x] "Insufficient history" shown rather than a forced label -- the
+      eligibility gate above is checked before any direction math runs,
+      so a 1- or 2-day-old candidate can never get `growing`/`established`/
+      `declining` by chance of the numbers lining up
+- [x] 2-day execution lead time (`EXECUTION_LEAD_TIME_DAYS`,
+      `src/candidateLifecycle.js`) as a named, configurable constant --
+      only ever produces an informational `urgencyNote` string on
+      `growing`/`declining` candidates (e.g. "~2-day planning/production
+      lead time"), never a gate, never a precise deadline
+
+**Verification:** `test/candidateLifecycle.test.js` (17/17, pure) --
+day-counting never double-counts a same-day rerun, eligibility tiers
+never forced early, direction math on both series independently,
+urgency note only on growing/declining. `test/reportBuilder.test.js`'s
+new Stage 6 suite (3/3, DB-backed): one real 8-day history walking
+through all three states in order (insufficient_history on day 1,
+emerging on day 3, growing on day 8 off a genuine spike, with the
+recommendation itself carrying the urgency note); a flat 7-day history
+settling on `established` as the honest default; a mixed search+social
+candidate whose `growing` label is driven specifically by real
+`microtrend_social_signals` rows (asserted directly against the table --
+8 rows, one per real day, never duplicated). Full suite: 345/345 passing
+in a scratch Postgres instance, run twice back-to-back against a fresh
+database with no flakiness. Live-verified with a seeded smoke database
+and a Playwright screenshot: the priority card shows the "Growing" badge
+next to the SunRice fit badge plus the urgency note; the evidence drawer
+shows a "Candidate lifecycle: Growing" row under its own heading
+("this idea's own trend, not the theme's"), visibly separate from the
+theme-level "BUILDING" badge shown on the National theme momentum panel
+for the same underlying theme.
+
+**Known limitations:**
+- Social-only candidates can't naturally persist their identity across
+  days under the current clustering scheme: `socialCandidatesFor()`
+  (`src/microtrendExtraction.js`) keys each raw social candidate to one
+  specific post's database id (`social-${item.id}`), which is different
+  every day even for the "same" recurring topic. A social-only cluster
+  therefore can't accumulate multi-day history on its own -- only a
+  candidate that also has search/Pinterest evidence (whose normalized key
+  is stable, text-based, and shared across days) gets a persistent
+  identity for the lifecycle math to track. This is a pre-existing
+  extraction-layer limitation, not something Stage 6 was asked to fix or
+  changed; it's the reason the Stage 6 "social" test above uses a mixed
+  search+social candidate rather than a social-only one.
+- Direction detection needs at least 4 real data points in a series
+  (3-day window + 1 to compare against) before it can call a direction at
+  all; below that, `candidateLifecycleFor` already short-circuits to
+  `insufficient_history`/`emerging` via the 3/7-day gate, so this never
+  surfaces as a separate edge case in practice.
+- Only the `growing` state (with its urgency note) was live-screenshotted
+  end-to-end; `emerging`/`established`/`declining`/`insufficient_history`
+  share the exact same render path (`candidateLifecycleBadge()`,
+  `public/app.js`) and are each covered by the pure/DB-backed tests above,
+  but weren't individually screenshotted.
 
 ## Stage 7: Feedback interface and reason-specific integration
 **Status:** pending

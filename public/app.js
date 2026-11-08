@@ -219,6 +219,21 @@
     return `<span class="bd-fit-badge ${FIT_BAND_CLASS[sunriceFit.band] || ''}" title="${escapeHtml(sunriceFit.disclaimer || '')}${parts ? ` (${escapeHtml(parts)})` : ''}">SunRice fit: ${escapeHtml(sunriceFit.band)} &middot; ${sunriceFit.score}/100</span>`;
   }
 
+  // Stage 6 (IMPLEMENTATION_CHECKLIST.md): candidate-level lifecycle --
+  // this ONE idea's own trend (Emerging/Growing/Established/Declining),
+  // a SEPARATE concept from the theme-wide lifecycle shown on the
+  // Thematic trends card (new/validating/building/cooling/sustained/
+  // peaking) -- never conflated, so this gets its own badge class/label
+  // set and its own explanatory copy (see index.html's panel subtitles).
+  const CANDIDATE_LIFECYCLE_LABELS = {
+    insufficient_history: 'Insufficient history', emerging: 'Emerging',
+    growing: 'Growing', established: 'Established', declining: 'Declining'
+  };
+  function candidateLifecycleBadge(lifecycle) {
+    if (!lifecycle || !CANDIDATE_LIFECYCLE_LABELS[lifecycle]) return '';
+    return `<span class="bd-candidate-lifecycle ${escapeHtml(lifecycle)}">${escapeHtml(CANDIDATE_LIFECYCLE_LABELS[lifecycle])}</span>`;
+  }
+
   // Claude's candidate analysis is mandatory for a recommendation to exist
   // (see src/reportBuilder.js) -- when it's unavailable, zero
   // recommendations looks IDENTICAL to a day where AI ran fine and
@@ -252,10 +267,11 @@
         <div class="bd-pill" style="display:inline-block;margin-bottom:6px;">${escapeHtml(categoryLabel)}</div>
         ${continuityBadge(r.continuityStatus)}
         ${momentumBadge(r.momentumSources)}
-        <div style="margin:4px 0;">${fitBadge(r.sunriceFit)}</div>
+        <div style="margin:4px 0;">${fitBadge(r.sunriceFit)} ${candidateLifecycleBadge(r.candidateLifecycle)}</div>
         <p>${escapeHtml(r.rationale)}</p>
         ${r.recommendedAction ? `<p class="bd-change-note" style="font-style:normal;"><strong>Do this:</strong> ${escapeHtml(r.recommendedAction)}</p>` : ''}
         ${r.resurfacingNote ? `<p class="bd-change-note">${escapeHtml(r.resurfacingNote)}</p>` : ''}
+        ${r.urgencyNote ? `<p class="bd-change-note">${escapeHtml(r.urgencyNote)}</p>` : ''}
         ${changeNote ? `<p class="bd-change-note">${escapeHtml(changeNote)}</p>` : ''}
         ${r.continuityMeta?.appearances14d ? `<p class="bd-change-note">Recommended ${r.continuityMeta.appearances14d} time${r.continuityMeta.appearances14d === 1 ? '' : 's'} in the last 14 days${r.continuityMeta.previousRecommendationDate ? `, last on ${escapeHtml(r.continuityMeta.previousRecommendationDate)}` : ''}.</p>` : ''}
         <div class="bd-priority-meta">
@@ -294,7 +310,8 @@
         <div class="bd-emerging-meta">
           ${escapeHtml(m.label)} · score <strong>${m.score != null ? Math.round(m.score) : '—'}</strong> · ${m.todayEvidenceCount} evidence item${m.todayEvidenceCount === 1 ? '' : 's'}
         </div>
-        ${m.sunriceFit ? `<div style="margin-top:6px;">${fitBadge(m.sunriceFit)}</div>` : ''}
+        ${(m.sunriceFit || m.candidateLifecycle) ? `<div style="margin-top:6px;">${fitBadge(m.sunriceFit)} ${candidateLifecycleBadge(m.candidateLifecycle)}</div>` : ''}
+        ${m.urgencyNote ? `<div class="bd-emerging-meta" style="margin-top:4px;font-style:italic;">${escapeHtml(m.urgencyNote)}</div>` : ''}
       </div>
     `).join('');
   }
@@ -444,8 +461,9 @@
     if (!rec) return;
     qs('#bd-proof-title').textContent = rec.title;
     qs('#bd-proof-summary').textContent = rec.rationale;
-    qs('#bd-proof-resurfacing').textContent = rec.resurfacingNote || '';
-    qs('#bd-proof-resurfacing').hidden = !rec.resurfacingNote;
+    const resurfacingAndUrgency = [rec.resurfacingNote, rec.urgencyNote].filter(Boolean).join(' ');
+    qs('#bd-proof-resurfacing').textContent = resurfacingAndUrgency;
+    qs('#bd-proof-resurfacing').hidden = !resurfacingAndUrgency;
 
     const scoreRows = Object.entries(rec.scoreComponents).map(([k, v]) =>
       `<span>${escapeHtml(k)}</span><span>${Math.round(v * 100)}%</span>`
@@ -460,7 +478,14 @@
         ).join('')
         + `<span>SunRice fit</span><span>${escapeHtml(rec.sunriceFit.band)} &middot; ${rec.sunriceFit.score}/100</span>`
       : '';
-    qs('#bd-proof-scores').innerHTML = scoreRows + fitRows;
+    // Stage 6: candidate-level lifecycle -- this ONE idea's own trend,
+    // distinct from the theme-wide lifecycle (never shown here, see the
+    // Thematic trends card instead).
+    const lifecycleRow = CANDIDATE_LIFECYCLE_LABELS[rec.candidateLifecycle]
+      ? `<span style="grid-column:1/-1;border-top:1px solid var(--bd-line);margin-top:6px;padding-top:6px;color:var(--bd-muted);font-size:10px;">Lifecycle (this idea's own trend, not the theme's)</span>`
+        + `<span>Candidate lifecycle</span><span>${escapeHtml(CANDIDATE_LIFECYCLE_LABELS[rec.candidateLifecycle])}</span>`
+      : '';
+    qs('#bd-proof-scores').innerHTML = scoreRows + fitRows + lifecycleRow;
 
     const evEl = qs('#bd-proof-evidence');
     if (rec.evidence.length === 0) {

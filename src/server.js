@@ -14,6 +14,7 @@ const { computeBaseline } = require('./baseline');
 const { runHealthCheck } = require('./healthMonitor');
 const { getEmailConfig } = require('./emailAlerts');
 const { DISCLAIMER: SUNRICE_FIT_DISCLAIMER } = require('./sunriceFit');
+const { urgencyNote } = require('./candidateLifecycle');
 const { ALL_TOPICS } = require('./topics');
 const { peakingEligible } = require('./themeLifecycle');
 const { isSocialSourceType } = require('./microtrendExtraction');
@@ -172,6 +173,11 @@ function serializeMicrotrend(m) {
     sunriceFit: m.sunrice_fit_score != null
       ? { score: m.sunrice_fit_score, band: m.sunrice_fit_band, components: m.sunrice_fit_components, disclaimer: SUNRICE_FIT_DISCLAIMER }
       : null,
+    // Stage 6: candidate-level lifecycle, distinct from theme-level
+    // lifecycle -- recomputed from the live function rather than a stored
+    // column here (unlike recommendations, nothing write-time to snapshot).
+    candidateLifecycle: m.candidate_lifecycle,
+    urgencyNote: urgencyNote(m.candidate_lifecycle),
     todayObservations,
     todayEvidenceCount: Number(m.today_evidence_count) || 0,
     isSocialOnly,
@@ -233,6 +239,13 @@ async function serializeBundle(bundle) {
       sunriceFit: r.sunrice_fit_score != null
         ? { score: r.sunrice_fit_score, band: r.sunrice_fit_band, components: r.sunrice_fit_components, disclaimer: SUNRICE_FIT_DISCLAIMER }
         : null,
+      // Stage 6 (IMPLEMENTATION_CHECKLIST.md): candidate-level lifecycle --
+      // a SEPARATE concept from the theme-level lifecycle shown on the
+      // Thematic trends card. urgencyNote is informational only, never a
+      // gate, and null in the normal (established/emerging/insufficient-
+      // history) case.
+      candidateLifecycle: r.candidate_lifecycle,
+      urgencyNote: r.urgency_note,
       recommendationKind: r.recommendation_kind,
       microtrendId: r.microtrend_id,
       recommendedAction: r.recommended_action,

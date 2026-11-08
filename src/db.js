@@ -207,6 +207,15 @@ async function initSchema() {
     ALTER TABLE recommendations ADD COLUMN IF NOT EXISTS sunrice_fit_score INTEGER;
     ALTER TABLE recommendations ADD COLUMN IF NOT EXISTS sunrice_fit_band TEXT CHECK (sunrice_fit_band IN ('High','Moderate','Low'));
     ALTER TABLE recommendations ADD COLUMN IF NOT EXISTS sunrice_fit_components JSONB;
+    -- Stage 6 (IMPLEMENTATION_CHECKLIST.md): candidate-level lifecycle
+    -- (Emerging/Growing/Established/Declining), a write-time snapshot --
+    -- distinct from theme-level lifecycle on theme_daily_snapshots, which
+    -- answers a different question. urgency_note is informational only,
+    -- never a gate (see src/candidateLifecycle.js's urgencyNote) -- null
+    -- in the normal case (established/emerging/insufficient_history).
+    ALTER TABLE recommendations ADD COLUMN IF NOT EXISTS candidate_lifecycle TEXT
+      CHECK (candidate_lifecycle IN ('insufficient_history','emerging','growing','established','declining'));
+    ALTER TABLE recommendations ADD COLUMN IF NOT EXISTS urgency_note TEXT;
 
     -- One row per theme per report, for every theme that had real evidence
     -- that day -- not only the top 3 that became recommendations. This is
@@ -289,6 +298,12 @@ async function initSchema() {
     ALTER TABLE microtrends ADD COLUMN IF NOT EXISTS sunrice_fit_score INTEGER;
     ALTER TABLE microtrends ADD COLUMN IF NOT EXISTS sunrice_fit_band TEXT CHECK (sunrice_fit_band IN ('High','Moderate','Low'));
     ALTER TABLE microtrends ADD COLUMN IF NOT EXISTS sunrice_fit_components JSONB;
+    -- Stage 6: candidate-level lifecycle, recomputed and overwritten each
+    -- time this microtrend is observed -- same "mutable current state"
+    -- pattern as last_score/sunrice_fit_score above. Stored for EVERY
+    -- observed candidate so Emerging can show it too, not only a winner.
+    ALTER TABLE microtrends ADD COLUMN IF NOT EXISTS candidate_lifecycle TEXT
+      CHECK (candidate_lifecycle IN ('insufficient_history','emerging','growing','established','declining'));
 
     -- Per-report metric readings for a microtrend. UNIQUE on
     -- (report_id, microtrend_id, source_type, metric_type) means a same-day
@@ -792,8 +807,8 @@ async function insertRecommendation(reportId, rec) {
                                    suggested_channel, freshness, confidence, score, score_components, momentum_sources,
                                    opportunity_name, continuity_status, action_fingerprint, continuity_meta, strategy_output,
                                    microtrend_id, recommendation_kind, recommended_action, evidence_basis, resurfacing_note,
-                                   sunrice_fit_score, sunrice_fit_band, sunrice_fit_components)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27) RETURNING *`,
+                                   sunrice_fit_score, sunrice_fit_band, sunrice_fit_components, candidate_lifecycle, urgency_note)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29) RETURNING *`,
     [
       reportId, rec.rank, rec.actionType, rec.theme || null, rec.title, rec.rationale, rec.audience || null,
       rec.state || 'National', rec.suggestedChannel || null, rec.freshness || null,
@@ -811,7 +826,9 @@ async function insertRecommendation(reportId, rec) {
       rec.resurfacingNote || null,
       rec.sunriceFit?.score ?? null,
       rec.sunriceFit?.band ?? null,
-      rec.sunriceFit ? JSON.stringify(rec.sunriceFit.components) : null
+      rec.sunriceFit ? JSON.stringify(rec.sunriceFit.components) : null,
+      rec.candidateLifecycle || null,
+      rec.urgencyNote || null
     ]
   );
   return res.rows[0];
@@ -865,14 +882,16 @@ async function getMicrotrendsForTheme(theme) {
   return res.rows;
 }
 
-async function updateMicrotrendScore(microtrendId, reportId, score, components, sunriceFit = null) {
+async function updateMicrotrendScore(microtrendId, reportId, score, components, sunriceFit = null, candidateLifecycle = null) {
   const res = await pool.query(
     `UPDATE microtrends SET last_score = $2, last_score_components = $3, last_scored_report_id = $4,
-            sunrice_fit_score = $5, sunrice_fit_band = $6, sunrice_fit_components = $7, updated_at = now()
+            sunrice_fit_score = $5, sunrice_fit_band = $6, sunrice_fit_components = $7,
+            candidate_lifecycle = $8, updated_at = now()
      WHERE id = $1 RETURNING *`,
     [
       microtrendId, score, JSON.stringify(components), reportId,
-      sunriceFit?.score ?? null, sunriceFit?.band ?? null, sunriceFit ? JSON.stringify(sunriceFit.components) : null
+      sunriceFit?.score ?? null, sunriceFit?.band ?? null, sunriceFit ? JSON.stringify(sunriceFit.components) : null,
+      candidateLifecycle || null
     ]
   );
   return res.rows[0];

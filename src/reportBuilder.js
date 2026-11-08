@@ -2,7 +2,7 @@ const {
   pool, insertSignal, insertRecommendation, linkEvidence,
   upsertThemeSnapshot, getPriorThemeSnapshots, getRecentRecommendationsForMicrotrend, getSameDayRecommendations,
   upsertMicrotrend, getMicrotrendObservationHistory, recordMicrotrendObservation, linkMicrotrendEvidence,
-  getMicrotrendSocialEvidenceHistory, recordMicrotrendSocialSignal, recordPossibleRepost,
+  getMicrotrendSocialEvidenceHistory, recordMicrotrendSocialSignal, getMicrotrendSocialSignalHistory, recordPossibleRepost,
   updateMicrotrendScore, setMicrotrendStatus, getActiveExclusions, getPositiveFeedbackExamples,
   countRecentMicrotrendRecommendations, getMicrotrendEvidence, setReportAiStatus, ensureIdeaExists,
   getEvidenceSourceItemIdsForRecommendation, recordRejectedCandidate, getLatestRejectionForMicrotrend,
@@ -13,6 +13,9 @@ const {
   checkInsufficientEvidence, isDuplicateWithoutNewEvidence, buildResurfacingContext, canResurface
 } = require('./eligibility');
 const { detectFitEligibilityContradiction } = require('./sunriceFit');
+const {
+  observationDays, searchTrendDirection, socialTrendDirection, candidateLifecycleFor, urgencyNote
+} = require('./candidateLifecycle');
 const { ALL_TOPICS, evergreenBaselinesForTheme } = require('./topics');
 const { scoreOpportunity, confidenceFor, actionTypeFor } = require('./scoring');
 const { themeLifecycleFor } = require('./themeLifecycle');
@@ -288,6 +291,14 @@ async function processThemeAssessments(opp, assessments, rawCandidateByClusterKe
     const socialEvidenceHistory = socialMembersToday.length > 0
       ? await getMicrotrendSocialEvidenceHistory(microtrend.id, reportDate)
       : [];
+    // Stage 6 (IMPLEMENTATION_CHECKLIST.md): fetched BEFORE today's own
+    // signal row is recorded below, same "prior" convention as priorHistory
+    // -- this is the first time microtrend_social_signals (stored since
+    // Stage 2/3, explicitly deferred) actually gets READ.
+    const fullSocialSignalHistory = await getMicrotrendSocialSignalHistory(microtrend.id);
+    const priorSocialSignalHistory = fullSocialSignalHistory.filter(
+      (h) => new Date(h.report_date).toISOString().slice(0, 10) < reportDate
+    );
     const todayObservations = aggregateObservations(allMembers);
     const distinctSourceCount = new Set(allMembers.map((m) => m.sourceType)).size;
     const uniqueSourceItemCount = new Set(allMembers.map((m) => m.sourceItemId)).size;
@@ -335,12 +346,17 @@ async function processThemeAssessments(opp, assessments, rawCandidateByClusterKe
     // NOT read by scoring yet (see microtrendScoring.js). Only recorded
     // when there's real social evidence today; a theme with zero social
     // posts gets no row rather than a hollow all-zero one.
+    // Hoisted so Stage 6's lifecycle calc below can include TODAY's own
+    // reading in its trend series, not just prior history -- otherwise a
+    // real spike wouldn't show up in the lifecycle label until tomorrow.
+    let todayNewPostCount = null;
     if (socialMembersToday.length > 0) {
       const historicalPostIds = new Set(socialEvidenceHistory.map((r) => r.source_item_id));
       const historicalAuthors = new Set(socialEvidenceHistory.map((r) => r.author).filter(Boolean));
       const todayPostIds = new Set(socialMembersToday.map((m) => m.sourceItemId));
       const todayAuthors = new Set(socialMembersToday.map((m) => m.author).filter(Boolean));
       const newPostCount = [...todayPostIds].filter((id) => !historicalPostIds.has(id)).length;
+      todayNewPostCount = newPostCount;
       const newCreatorCount = [...todayAuthors].filter((a) => !historicalAuthors.has(a)).length;
       const platformCount = new Set(socialMembersToday.map((m) => m.sourceType)).size;
       // dateable/recent are counted by distinct real post, not by member
@@ -361,7 +377,32 @@ async function processThemeAssessments(opp, assessments, rawCandidateByClusterKe
     for (const link of evidenceLinksFor(allMembers)) {
       await linkMicrotrendEvidence(microtrend.id, reportId, link.sourceItemId, link.matchType);
     }
-    await updateMicrotrendScore(microtrend.id, reportId, score, components, assessment.sunriceFit);
+    // Stage 6: candidate-level lifecycle -- a SEPARATE concept from the
+    // theme-level lifecycle above (themeLifecycleFor), computed from this
+    // one microtrend's own real observation history (search/Pinterest
+    // numeric momentum + the social-signal history above). Uses the
+    // existing 3/7-day eligibility tiers (microtrendScoring.js's
+    // socialObservationEligibility) -- never forces growing/established/
+    // declining from inadequate history.
+    const days = observationDays(priorHistory, priorSocialSignalHistory);
+    // Trend direction includes TODAY's own reading as the series' latest
+    // point -- using priorHistory alone would mean a real spike/drop today
+    // never shows up in the lifecycle label until tomorrow.
+    const todayNumeric = todayObservations.find(
+      (o) => o.sourceType === 'dataforseo_trends' && o.metricType === 'rising_value' && typeof o.metricValue === 'number'
+    );
+    const searchSeries = todayNumeric
+      ? [...priorHistory, { report_date: reportDate, source_type: 'dataforseo_trends', metric_type: 'rising_value', metric_value: todayNumeric.metricValue }]
+      : priorHistory;
+    const socialSeries = todayNewPostCount != null
+      ? [...priorSocialSignalHistory, { report_date: reportDate, new_post_count: todayNewPostCount }]
+      : priorSocialSignalHistory;
+    const candidateLifecycle = candidateLifecycleFor({
+      days,
+      searchDirection: searchTrendDirection(searchSeries),
+      socialDirection: socialTrendDirection(socialSeries)
+    });
+    await updateMicrotrendScore(microtrend.id, reportId, score, components, assessment.sunriceFit, candidateLifecycle);
 
     let qualifies = true;
     if (assessment.classification === 'macro') {
@@ -472,7 +513,8 @@ async function processThemeAssessments(opp, assessments, rawCandidateByClusterKe
       hasMomentumCorroboration: momentumCorroborated, recentCreatorCount,
       qualifies, hidden: exclusions.hiddenMicrotrendIds.has(microtrend.id),
       actionFingerprint, suppressed: exclusions.suppressedFingerprints.has(actionFingerprint),
-      eligible, eligibilityReasonCode, eligibilityExplanation, resurfacingExplanation, fitQualifies
+      eligible, eligibilityReasonCode, eligibilityExplanation, resurfacingExplanation, fitQualifies,
+      candidateLifecycle, urgencyNote: urgencyNote(candidateLifecycle)
     });
   }
   return results.sort((a, b) => b.score - a.score);
@@ -788,7 +830,8 @@ async function buildCandidateRecommendation({ reportId, rank, opp, winner, repor
   const {
     microtrend, assessment, score, components, distinctSourceCount, actionFingerprint,
     isSocialOnly, distinctCreatorCount, uniqueSourceItemCount, evidenceBasis,
-    hasMomentumCorroboration: momentumCorroborated, recentCreatorCount, resurfacingExplanation
+    hasMomentumCorroboration: momentumCorroborated, recentCreatorCount, resurfacingExplanation,
+    candidateLifecycle, urgencyNote: candidateUrgencyNote
   } = winner;
   const name = assessment.candidateName;
 
@@ -853,7 +896,9 @@ async function buildCandidateRecommendation({ reportId, rank, opp, winner, repor
     recommendationKind: 'candidate',
     evidenceBasis,
     resurfacingNote: resurfacingExplanation,
-    sunriceFit: assessment.sunriceFit
+    sunriceFit: assessment.sunriceFit,
+    candidateLifecycle,
+    urgencyNote: candidateUrgencyNote
   });
 
   // Idea Tracker row -- keyed by this stable action_fingerprint. A

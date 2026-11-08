@@ -1169,4 +1169,138 @@ describe('report generation from fixture evidence (DB-backed)', { skip }, () => 
       assert.equal(contradictions.rowCount, 0);
     });
   });
+
+  describe('Stage 6: candidate-level lifecycle', () => {
+    function daysAgoDate(n) {
+      return new Date(Date.now() - n * 86400000);
+    }
+
+    // One real microtrend, observed across 8 real consecutive calendar
+    // days (never duplicated within a day -- each gets its own real
+    // report/source_items row, same as a real daily cron would produce):
+    // flat for the first 7 days, then a real, verified spike on day 8.
+    // Walks through all 3 of Stage 6's lifecycle states in one real
+    // history, proving none of them is ever forced early.
+    test('insufficient_history -> emerging -> growing as real history accumulates, never skipping ahead', async () => {
+      const values = [20, 20, 20, 20, 20, 20, 20, 90];
+      let lastReport;
+      for (let i = 0; i < values.length; i++) {
+        const dayOffset = values.length - 1 - i; // oldest first
+        const dateObj = daysAgoDate(dayOffset);
+        const dateStr = melbourneDateString(dateObj);
+        const report = await db.getOrCreateReport(dateStr);
+        lastReport = report;
+        const run = await db.recordProviderRun(report.id, { providerName: 'DataForSEO', sourceType: 'dataforseo_trends', status: 'live' });
+        const item = await db.upsertSourceItem({
+          providerRunId: run.id, sourceType: 'dataforseo_trends', sourceName: 'DataForSEO',
+          contentHash: `fixture-lifecycle-${i}`, title: 'rice', queryOrTopic: 'rice', theme: 'rice_basics',
+          normalizedMetrics: { relatedQueries: { rising: [{ query: 'air fryer rice crisps', value: values[i] }], top: [] } },
+          dataStatus: 'live'
+        });
+        if (dayOffset > 0) {
+          await db.pool.query('UPDATE source_items SET collected_at = $1 WHERE id = $2', [dateObj, item.id]);
+        }
+        candidateAnalyst.analyzeCandidates = autoAssessAll({ candidateName: 'Air fryer rice crisps' });
+        await buildReport(report.id, dateStr);
+
+        const microtrends = await db.getMicrotrendsForReport(report.id);
+        const m = microtrends.find((mt) => mt.theme === 'rice_basics');
+        assert.ok(m, `expected a rice_basics microtrend on day ${i + 1}`);
+
+        if (i === 0) assert.equal(m.candidate_lifecycle, 'insufficient_history', 'day 1 (only today) must never get a forced label');
+        if (i === 2) assert.equal(m.candidate_lifecycle, 'emerging', 'day 3 -- real history, but not enough yet for a direction');
+        if (i === values.length - 1) {
+          assert.equal(m.candidate_lifecycle, 'growing', 'day 8: 7+ real days plus a genuine verified spike today -- enough for a direction, and the direction is up');
+        }
+      }
+
+      const bundle = await db.getReportBundle(lastReport);
+      const rec = bundle.recommendations.find((r) => r.theme === 'rice_basics');
+      assert.ok(rec, 'expected the final day\'s recommendation');
+      assert.equal(rec.candidate_lifecycle, 'growing');
+      assert.ok(rec.urgency_note, 'a growing candidate must carry an informational urgency note');
+      assert.ok(rec.urgency_note.includes('2'), 'the note must mention the configurable lead-time assumption');
+    });
+
+    test('a flat, unremarkable 7+ day history is established -- the honest default, never forced to growing or declining', async () => {
+      let lastReport;
+      for (let i = 0; i < 7; i++) {
+        const dayOffset = 6 - i;
+        const dateObj = daysAgoDate(dayOffset);
+        const dateStr = melbourneDateString(dateObj);
+        const report = await db.getOrCreateReport(dateStr);
+        lastReport = report;
+        const run = await db.recordProviderRun(report.id, { providerName: 'DataForSEO', sourceType: 'dataforseo_trends', status: 'live' });
+        const item = await db.upsertSourceItem({
+          providerRunId: run.id, sourceType: 'dataforseo_trends', sourceName: 'DataForSEO',
+          contentHash: `fixture-flat-${i}`, title: 'curry', queryOrTopic: 'curry', theme: 'curry_night',
+          normalizedMetrics: { relatedQueries: { rising: [{ query: 'butter chicken meal prep', value: 40 }], top: [] } },
+          dataStatus: 'live'
+        });
+        if (dayOffset > 0) {
+          await db.pool.query('UPDATE source_items SET collected_at = $1 WHERE id = $2', [dateObj, item.id]);
+        }
+        candidateAnalyst.analyzeCandidates = autoAssessAll({ candidateName: 'Butter chicken meal prep' });
+        await buildReport(report.id, dateStr);
+      }
+      const microtrends = await db.getMicrotrendsForReport(lastReport.id);
+      const m = microtrends.find((mt) => mt.theme === 'curry_night');
+      assert.equal(m.candidate_lifecycle, 'established');
+    });
+
+    // The exact signal Stage 2/3 stored and explicitly deferred reading --
+    // this is that read finally happening. A search candidate anchors a
+    // STABLE cross-day microtrend identity (social-only candidates don't
+    // have one -- each real post gets its own normalized_key, so a
+    // social-only cluster can't naturally persist across days under the
+    // current identity scheme; merging search+social is the realistic
+    // mixed-evidence shape this exercises), while the social evidence
+    // alongside it is what builds the real microtrend_social_signals
+    // history this test is actually about.
+    test('a mixed search+social candidate\'s lifecycle reflects real microtrend_social_signals history, not just search', async () => {
+      const postCounts = [1, 1, 1, 1, 1, 1, 1, 6]; // flat, then a real spike in new posts
+      let lastReport;
+      for (let i = 0; i < postCounts.length; i++) {
+        const dayOffset = postCounts.length - 1 - i;
+        const dateObj = daysAgoDate(dayOffset);
+        const dateStr = melbourneDateString(dateObj);
+        const report = await db.getOrCreateReport(dateStr);
+        lastReport = report;
+        const run = await db.recordProviderRun(report.id, { providerName: 'DataForSEO', sourceType: 'dataforseo_trends', status: 'live' });
+        const searchItem = await db.upsertSourceItem({
+          providerRunId: run.id, sourceType: 'dataforseo_trends', sourceName: 'DataForSEO',
+          contentHash: `fixture-mixed-search-${i}`, title: 'low gi', queryOrTopic: 'low gi', theme: 'healthy_eating',
+          normalizedMetrics: { relatedQueries: { rising: [{ query: 'low gi meal prep bowls', value: 40 }], top: [] } },
+          dataStatus: 'live'
+        });
+        if (dayOffset > 0) {
+          await db.pool.query('UPDATE source_items SET collected_at = $1 WHERE id = $2', [dateObj, searchItem.id]);
+        }
+        for (let p = 0; p < postCounts[i]; p++) {
+          const socialItem = await insertSocialPost(report.id, {
+            theme: 'healthy_eating', sourceType: 'apify_reddit', contentHash: `fixture-social-lifecycle-${i}-${p}`,
+            excerpt: 'Low GI meal prep bowls got me through this week, a real distinct post', author: `creator_${i}_${p}`,
+            publishedAt: dateObj
+          });
+          if (dayOffset > 0) {
+            await db.pool.query('UPDATE source_items SET collected_at = $1 WHERE id = $2', [dateObj, socialItem.id]);
+          }
+        }
+        // The search candidate's clusterKey is always first in extraction
+        // order, so mergeAllForTheme's canonical (ties broken by stable
+        // sort) is always it -- the same stable identity every day.
+        candidateAnalyst.analyzeCandidates = mergeAllForTheme('healthy_eating', { candidateName: 'Low GI meal prep bowls' });
+        await buildReport(report.id, dateStr);
+      }
+      const microtrends = await db.getMicrotrendsForReport(lastReport.id);
+      const m = microtrends.find((mt) => mt.theme === 'healthy_eating');
+      assert.ok(m, 'expected a healthy_eating microtrend');
+      assert.equal(m.candidate_lifecycle, 'growing', 'a real, verified spike in new posts must be reflected, driven by microtrend_social_signals history');
+
+      const signalHistory = await db.pool.query(
+        'SELECT * FROM microtrend_social_signals WHERE microtrend_id = $1 ORDER BY report_id ASC', [m.id]
+      );
+      assert.equal(signalHistory.rowCount, 8, 'one real row per real day -- never duplicated, never collapsed');
+    });
+  });
 });
