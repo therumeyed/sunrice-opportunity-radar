@@ -200,6 +200,25 @@
     return '';
   }
 
+  // Stage 5 (IMPLEMENTATION_CHECKLIST.md): "SunRice fit" is a SEPARATE
+  // axis from this card's own score/tier -- brand suitability, not
+  // momentum/evidence strength. Always shown with its own disclaimer text
+  // (never just the number) per the brief's explicit requirement that this
+  // never be read as a calibrated probability. The title attribute carries
+  // the 4-component breakdown so a reader can see WHY without extra UI.
+  const FIT_BAND_CLASS = { High: 'high', Moderate: 'moderate', Low: 'low' };
+  const FIT_COMPONENT_LABELS = {
+    productConnectionFit: 'product connection', formatSuitability: 'format suitability',
+    audienceOccasionRelevance: 'audience/occasion', trendFidelity: 'trend fidelity'
+  };
+  function fitBadge(sunriceFit) {
+    if (!sunriceFit) return '';
+    const parts = Object.entries(sunriceFit.components || {})
+      .map(([k, v]) => `${FIT_COMPONENT_LABELS[k] || k}: ${v}`)
+      .join(', ');
+    return `<span class="bd-fit-badge ${FIT_BAND_CLASS[sunriceFit.band] || ''}" title="${escapeHtml(sunriceFit.disclaimer || '')}${parts ? ` (${escapeHtml(parts)})` : ''}">SunRice fit: ${escapeHtml(sunriceFit.band)} &middot; ${sunriceFit.score}/100</span>`;
+  }
+
   // Claude's candidate analysis is mandatory for a recommendation to exist
   // (see src/reportBuilder.js) -- when it's unavailable, zero
   // recommendations looks IDENTICAL to a day where AI ran fine and
@@ -233,8 +252,10 @@
         <div class="bd-pill" style="display:inline-block;margin-bottom:6px;">${escapeHtml(categoryLabel)}</div>
         ${continuityBadge(r.continuityStatus)}
         ${momentumBadge(r.momentumSources)}
+        <div style="margin:4px 0;">${fitBadge(r.sunriceFit)}</div>
         <p>${escapeHtml(r.rationale)}</p>
         ${r.recommendedAction ? `<p class="bd-change-note" style="font-style:normal;"><strong>Do this:</strong> ${escapeHtml(r.recommendedAction)}</p>` : ''}
+        ${r.resurfacingNote ? `<p class="bd-change-note">${escapeHtml(r.resurfacingNote)}</p>` : ''}
         ${changeNote ? `<p class="bd-change-note">${escapeHtml(changeNote)}</p>` : ''}
         ${r.continuityMeta?.appearances14d ? `<p class="bd-change-note">Recommended ${r.continuityMeta.appearances14d} time${r.continuityMeta.appearances14d === 1 ? '' : 's'} in the last 14 days${r.continuityMeta.previousRecommendationDate ? `, last on ${escapeHtml(r.continuityMeta.previousRecommendationDate)}` : ''}.</p>` : ''}
         <div class="bd-priority-meta">
@@ -273,6 +294,7 @@
         <div class="bd-emerging-meta">
           ${escapeHtml(m.label)} · score <strong>${m.score != null ? Math.round(m.score) : '—'}</strong> · ${m.todayEvidenceCount} evidence item${m.todayEvidenceCount === 1 ? '' : 's'}
         </div>
+        ${m.sunriceFit ? `<div style="margin-top:6px;">${fitBadge(m.sunriceFit)}</div>` : ''}
       </div>
     `).join('');
   }
@@ -422,9 +444,23 @@
     if (!rec) return;
     qs('#bd-proof-title').textContent = rec.title;
     qs('#bd-proof-summary').textContent = rec.rationale;
-    qs('#bd-proof-scores').innerHTML = Object.entries(rec.scoreComponents).map(([k, v]) =>
+    qs('#bd-proof-resurfacing').textContent = rec.resurfacingNote || '';
+    qs('#bd-proof-resurfacing').hidden = !rec.resurfacingNote;
+
+    const scoreRows = Object.entries(rec.scoreComponents).map(([k, v]) =>
       `<span>${escapeHtml(k)}</span><span>${Math.round(v * 100)}%</span>`
     ).join('') + `<span>Total score</span><span>${rec.score}/100</span>`;
+    // Stage 5: a clearly separate block -- SunRice fit is brand
+    // suitability, not the momentum/evidence-strength score above it, and
+    // must never be read as one blended number.
+    const fitRows = rec.sunriceFit
+      ? `<span style="grid-column:1/-1;border-top:1px solid var(--bd-line);margin-top:6px;padding-top:6px;color:var(--bd-muted);font-size:10px;">SunRice fit (brand suitability -- ${escapeHtml(rec.sunriceFit.disclaimer || '')})</span>`
+        + Object.entries(rec.sunriceFit.components).map(([k, v]) =>
+          `<span>${escapeHtml(FIT_COMPONENT_LABELS[k] || k)}</span><span>${escapeHtml(v)}</span>`
+        ).join('')
+        + `<span>SunRice fit</span><span>${escapeHtml(rec.sunriceFit.band)} &middot; ${rec.sunriceFit.score}/100</span>`
+      : '';
+    qs('#bd-proof-scores').innerHTML = scoreRows + fitRows;
 
     const evEl = qs('#bd-proof-evidence');
     if (rec.evidence.length === 0) {

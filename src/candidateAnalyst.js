@@ -28,6 +28,7 @@ const MODEL = process.env.ANTHROPIC_MODEL || 'claude-haiku-4-5-20251001';
 const { PRODUCTS } = require('./products');
 const suitabilityConfig = require('./suitabilityConfig');
 const { validateEligibilityBlock } = require('./eligibility');
+const { computeSunriceFit } = require('./sunriceFit');
 
 const PRODUCT_NAMES = new Set(PRODUCTS.map((p) => p.name));
 const VALID_CLASSIFICATIONS = new Set(['macro', 'micro', 'seasonal']);
@@ -93,7 +94,12 @@ Respond with ONLY a single valid JSON array (no markdown fences, no prose before
   "parentTheme": "<theme key>",
   "classification": "macro" | "micro" | "seasonal",
   "isDistinctFromEvergreen": true or false,
-  "brandRelevance": 0.0 to 1.0,
+  "sunriceFit": {
+    "productConnectionFit": "strong" | "moderate" | "weak" | "none",
+    "formatSuitability": "strong" | "moderate" | "weak" | "none",
+    "audienceOccasionRelevance": "strong" | "moderate" | "weak" | "none",
+    "trendFidelity": "strong" | "moderate" | "weak" | "none"
+  },
   "productConnection": ["exact product name(s) from the list below -- empty array if nothing genuinely fits"],
   "whyItMattersNow": "1-2 sentences: the specific reason this is worth attention today, grounded in the evidence given",
   "proposedAction": {
@@ -126,6 +132,13 @@ Reason codes YOU may use (reject or mark uncertain with exactly one of these):
 - verdict "uncertain": use this, with no reasonCode, whenever you are genuinely not confident enough to call eligible or rejected -- never force a confident-sounding verdict you don't actually have evidence for.
 - verdict "eligible": the normal case when none of the above applies. reasonCode and explanation must both be null.
 Do NOT use "already_covered" or "insufficient_evidence" -- those are decided deterministically by code, not by you.
+
+SunRice fit scoring (sunriceFit) -- a SEPARATE job from eligibility above. Eligibility asks "is there a credible connection at all?"; this asks "how strong is it?". Pick exactly one anchor per component -- never invent a number, pick the closest named anchor:
+- productConnectionFit (most heavily weighted): strong = a real, current SunRice product is the natural core of the idea. moderate = a real SunRice product fits naturally but isn't the central focus, or needs only a small, reasonable substitution (e.g. "any white rice" -> a specific SunRice variety). weak = a SunRice product could technically be used but the idea doesn't highlight or need rice specifically. none = no genuine link to any real SunRice product.
+- formatSuitability: strong = the format/preparation shown is one SunRice's real products genuinely support today (e.g. microwave rice for a quick-bowl trend). moderate = plausible with a minor adaptation. weak = requires a real stretch to make the format work with an actual SunRice product. none = fundamentally incompatible with how SunRice's real products are prepared or sold.
+- audienceOccasionRelevance: strong = squarely matches SunRice's core audiences/occasions (see the suitability standard above). moderate = an adjacent audience/occasion, plausible crossover. weak = a stretch to connect to SunRice's actual audience. none = clearly a different audience or occasion entirely.
+- trendFidelity: strong = the proposed action stays faithful to exactly what the evidence shows people doing/wanting. moderate = a minor, reasonable extrapolation beyond the literal evidence. weak = a significant stretch from what the evidence actually supports. none = barely resembles what the evidence shows.
+This score is an assessed suitability, never a statistically calibrated probability -- do not imply otherwise in whyItMattersNow or anywhere else.
 
 How to use clusterKeys -- THIS IS WHERE YOU DO REAL ANALYTICAL WORK, not just restate the input:
 - One candidate normally maps to one clusterKey.
@@ -196,10 +209,12 @@ function validateAssessment(raw, clusterKeyToMembers) {
     return null;
   }
 
-  const brandRelevance = typeof raw.brandRelevance === 'number' && !Number.isNaN(raw.brandRelevance)
-    ? Math.max(0, Math.min(1, raw.brandRelevance))
-    : null;
-  if (brandRelevance == null) return null;
+  // Stage 5 (IMPLEMENTATION_CHECKLIST.md): replaces the old scalar
+  // brandRelevance with 4 anchored components -- computeSunriceFit returns
+  // null if any anchor is missing/invalid, same "this whole assessment is
+  // unusable" severity brandRelevance's own missing-value check had.
+  const sunriceFit = computeSunriceFit(raw.sunriceFit);
+  if (sunriceFit == null) return null;
 
   return {
     clusterKeys,
@@ -207,7 +222,7 @@ function validateAssessment(raw, clusterKeyToMembers) {
     parentTheme: String(parentTheme),
     classification,
     isDistinctFromEvergreen: Boolean(raw.isDistinctFromEvergreen),
-    brandRelevance,
+    sunriceFit,
     productConnection: products,
     whyItMattersNow: String(whyItMattersNow).slice(0, 500),
     proposedAction: {

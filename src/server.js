@@ -8,11 +8,12 @@ const {
   tryAcquireIngestLock, releaseIngestLock, getRecommendationById, insertFeedback, restoreFeedback, listActiveFeedback,
   getActiveExclusions, getIdeas, updateIdea, getIdeaHistory, getIdeaStatusCounts, getMostRecentRecommendationByFingerprint,
   recordBaselineSnapshot, getLatestBaselineSnapshot, getAllBaselineSnapshots, getOpenSourceHealthAlerts,
-  getRejectedCandidates
+  getRejectedCandidates, getFitContradictions
 } = require('./db');
 const { computeBaseline } = require('./baseline');
 const { runHealthCheck } = require('./healthMonitor');
 const { getEmailConfig } = require('./emailAlerts');
+const { DISCLAIMER: SUNRICE_FIT_DISCLAIMER } = require('./sunriceFit');
 const { ALL_TOPICS } = require('./topics');
 const { peakingEligible } = require('./themeLifecycle');
 const { isSocialSourceType } = require('./microtrendExtraction');
@@ -165,6 +166,12 @@ function serializeMicrotrend(m) {
     lastSeenAt: m.last_seen_at,
     score: m.last_score != null ? Number(m.last_score) : null,
     scoreComponents: m.last_score_components,
+    // Stage 5: stored for every observed candidate regardless of outcome
+    // (same "store now" reasoning as score above) -- a Low band is why a
+    // candidate sits in Emerging rather than winning a slot.
+    sunriceFit: m.sunrice_fit_score != null
+      ? { score: m.sunrice_fit_score, band: m.sunrice_fit_band, components: m.sunrice_fit_components, disclaimer: SUNRICE_FIT_DISCLAIMER }
+      : null,
     todayObservations,
     todayEvidenceCount: Number(m.today_evidence_count) || 0,
     isSocialOnly,
@@ -221,6 +228,11 @@ async function serializeBundle(bundle) {
       // recommendation is resurfacing a previously rejected candidate --
       // "store and display a short explanation of why."
       resurfacingNote: r.resurfacing_note,
+      // Stage 5: write-time snapshot, null for a theme_disclaimer
+      // recommendation (no Claude assessment exists for that kind).
+      sunriceFit: r.sunrice_fit_score != null
+        ? { score: r.sunrice_fit_score, band: r.sunrice_fit_band, components: r.sunrice_fit_components, disclaimer: SUNRICE_FIT_DISCLAIMER }
+        : null,
       recommendationKind: r.recommendation_kind,
       microtrendId: r.microtrend_id,
       recommendedAction: r.recommended_action,
@@ -563,6 +575,29 @@ app.get('/admin/rejected-candidates', requireAdmin, async (req, res) => {
       explanation: r.explanation,
       evidenceIds: r.evidence_ids,
       resurfacingExplanation: r.resurfacing_explanation,
+      createdAt: r.created_at
+    }))
+  });
+});
+
+// Stage 5 (IMPLEMENTATION_CHECKLIST.md): "flag contradictions between the
+// two stages for review" -- admin-only, same no-UI-yet pattern as
+// rejected-candidates above.
+app.get('/admin/fit-contradictions', requireAdmin, async (req, res) => {
+  const { theme, limit } = req.query;
+  const rows = await getFitContradictions({ theme, limit: limit ? Number(limit) : undefined });
+  res.json({
+    contradictions: rows.map((r) => ({
+      id: r.id,
+      reportId: r.report_id,
+      microtrendId: r.microtrend_id,
+      theme: r.theme,
+      candidateName: r.candidate_name,
+      eligibilityVerdict: r.eligibility_verdict,
+      eligibilityReasonCode: r.eligibility_reason_code,
+      sunriceFitScore: r.sunrice_fit_score,
+      sunriceFitBand: r.sunrice_fit_band,
+      explanation: r.explanation,
       createdAt: r.created_at
     }))
   });

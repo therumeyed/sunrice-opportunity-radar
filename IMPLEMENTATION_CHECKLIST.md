@@ -253,16 +253,57 @@ one shared scratch database).
   existed. Stage 8 is where this gets a real page.
 
 ## Stage 5: Brand-fit scoring (SunRice fit)
-**Status:** pending
+**Status:** done
 
-- [ ] 4-component weighted score (product connection 40%, format fit 25%,
-      audience/occasion 20%, trend fidelity 15%), anchored criteria
-- [ ] Composite rounded to nearest 5, High (80+) / Moderate (60-79) / Low (<60)
-- [ ] Low stays stored, out of the main feed; Moderate can qualify with
-      strong rationale/evidence
-- [ ] Eligibility-vs-fit contradictions flagged for review
-- [ ] "Assessed suitability, not a calibrated probability" stated plainly
-      wherever the score is shown
+- [x] 4-component weighted score (`src/sunriceFit.js`): product connection
+      40%, format suitability 25%, audience/occasion relevance 20%, trend
+      fidelity 15%. Anchored criteria -- Claude picks one of 4 named
+      anchors (`strong`/`moderate`/`weak`/`none`) per component, with
+      written criteria for each in the prompt, never a raw float. Replaces
+      the old scalar `brandRelevance` entirely (also now feeds
+      `scoreMicrotrend`'s `relevance` input, as `sunriceFit.score / 100`)
+- [x] Composite rounded to nearest 5, High (80+) / Moderate (60-79) / Low
+      (<60) -- `computeSunriceFit`/`bandForScore`
+- [x] Low stays fully scored/stored (visible in Emerging, same "store now"
+      treatment as every other candidate) but can never win a
+      recommendation slot (`fitQualifies` gate in `pickWinningCandidate`,
+      `src/reportBuilder.js`); Moderate/High compete normally, no extra gate
+- [x] Eligibility-vs-fit contradictions flagged for review
+      (`detectFitEligibilityContradiction`, scoped to the one component
+      that overlaps both stages -- product connection) -- persisted to the
+      new `fit_contradictions` table, readable via
+      `GET /admin/fit-contradictions` (admin-gated, no UI yet)
+- [x] "Assessed suitability, not a statistically calibrated probability"
+      (`DISCLAIMER`) shown on every recommendation card, Emerging card, and
+      in the evidence drawer's component breakdown -- real UI, not just an
+      API field (verified live with a seeded fixture + Playwright
+      screenshot of all three: the card badge, the Emerging card badge,
+      and the drawer breakdown)
+
+**Verification:** `test/sunriceFit.test.js` (15/15, pure) -- composite
+math, band thresholds, both contradiction directions, and that product
+connection (40% weight) isn't trivially dominant on its own.
+`test/candidateAnalyst.test.js`'s Stage 5 additions -- the prompt shows
+the 4 anchored criteria; `validateAssessment` rejects a missing/invalid
+`sunriceFit` block (same severity the old `brandRelevance` check had) and
+computes the real weighted composite. `test/reportBuilder.test.js`'s new
+Stage 5 suite (4/4, DB-backed): a Low-fit candidate is eligible but never
+wins a slot and stays queryable for review; a Moderate/High candidate
+wins normally with the composite stored on the recommendation; the
+eligible+"none"-product-connection contradiction is flagged; a consistent
+eligible+"strong" case raises nothing. Full suite: 325/325 passing in a
+scratch Postgres instance.
+
+**Known limitations:**
+- Contradiction detection is scoped to the product-connection component
+  only -- the other 3 fit components have no eligibility-stage
+  counterpart to compare against, so a contradiction there (e.g. eligible
+  but `formatSuitability: none`) isn't flagged. Could be extended if real
+  review data shows it's needed.
+- "Moderate can qualify with strong rationale/evidence" is implemented as
+  "Moderate competes normally, no extra gate" -- there's no separate
+  rationale-strength check beyond the existing score/evidence-completeness
+  ranking a Moderate candidate already has to clear to win a slot.
 
 ## Stage 6: Momentum and lifecycle improvements
 **Status:** pending

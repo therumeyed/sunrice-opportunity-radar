@@ -201,6 +201,12 @@ async function initSchema() {
     -- a short explanation of why a previously rejected opportunity is
     -- being reconsidered." Null is the normal case (never rejected before).
     ALTER TABLE recommendations ADD COLUMN IF NOT EXISTS resurfacing_note TEXT;
+    -- Stage 5: the SunRice fit composite as of the moment this specific
+    -- recommendation was created -- a write-time snapshot (like
+    -- strategy_output), never recomputed later.
+    ALTER TABLE recommendations ADD COLUMN IF NOT EXISTS sunrice_fit_score INTEGER;
+    ALTER TABLE recommendations ADD COLUMN IF NOT EXISTS sunrice_fit_band TEXT CHECK (sunrice_fit_band IN ('High','Moderate','Low'));
+    ALTER TABLE recommendations ADD COLUMN IF NOT EXISTS sunrice_fit_components JSONB;
 
     -- One row per theme per report, for every theme that had real evidence
     -- that day -- not only the top 3 that became recommendations. This is
@@ -275,6 +281,14 @@ async function initSchema() {
     -- original wording and the date Claude proposed the merge, so the
     -- grouping stays inspectable rather than silently reshaping history.
     ALTER TABLE microtrends ADD COLUMN IF NOT EXISTS semantic_merges JSONB NOT NULL DEFAULT '[]';
+    -- Stage 5 (IMPLEMENTATION_CHECKLIST.md): the "SunRice fit" brand-
+    -- suitability composite -- a SEPARATE axis from last_score above
+    -- (momentum/evidence strength). Stored for EVERY observed candidate,
+    -- win or not, same "store now" reasoning as last_score -- a Low-fit
+    -- candidate stays visible for review, it just can't win a slot.
+    ALTER TABLE microtrends ADD COLUMN IF NOT EXISTS sunrice_fit_score INTEGER;
+    ALTER TABLE microtrends ADD COLUMN IF NOT EXISTS sunrice_fit_band TEXT CHECK (sunrice_fit_band IN ('High','Moderate','Low'));
+    ALTER TABLE microtrends ADD COLUMN IF NOT EXISTS sunrice_fit_components JSONB;
 
     -- Per-report metric readings for a microtrend. UNIQUE on
     -- (report_id, microtrend_id, source_type, metric_type) means a same-day
@@ -531,6 +545,28 @@ async function initSchema() {
     CREATE INDEX IF NOT EXISTS idx_rejected_candidates_microtrend ON rejected_candidates(microtrend_id);
     CREATE INDEX IF NOT EXISTS idx_rejected_candidates_report ON rejected_candidates(report_id);
 
+    -- Stage 5 (IMPLEMENTATION_CHECKLIST.md): "flag contradictions between
+    -- the two stages for review" -- a case where Stage 4's eligibility
+    -- verdict and Stage 5's own product-connection fit component
+    -- disagree (eligible but "none" fit, or rejected-for-product_mismatch
+    -- but "strong" fit). Audit-only, same endpoint-only pattern as
+    -- rejected_candidates -- Stage 8's review queue is where a human
+    -- actually resolves these.
+    CREATE TABLE IF NOT EXISTS fit_contradictions (
+      id SERIAL PRIMARY KEY,
+      report_id INTEGER NOT NULL REFERENCES reports(id) ON DELETE CASCADE,
+      microtrend_id INTEGER REFERENCES microtrends(id) ON DELETE SET NULL,
+      theme TEXT NOT NULL,
+      candidate_name TEXT NOT NULL,
+      eligibility_verdict TEXT NOT NULL,
+      eligibility_reason_code TEXT,
+      sunrice_fit_score INTEGER NOT NULL,
+      sunrice_fit_band TEXT NOT NULL,
+      explanation TEXT NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    CREATE INDEX IF NOT EXISTS idx_fit_contradictions_report ON fit_contradictions(report_id);
+
     CREATE TABLE IF NOT EXISTS topic_definitions (
       id SERIAL PRIMARY KEY,
       theme TEXT NOT NULL,
@@ -755,8 +791,9 @@ async function insertRecommendation(reportId, rec) {
     `INSERT INTO recommendations (report_id, rank, action_type, theme, title, rationale, audience, state,
                                    suggested_channel, freshness, confidence, score, score_components, momentum_sources,
                                    opportunity_name, continuity_status, action_fingerprint, continuity_meta, strategy_output,
-                                   microtrend_id, recommendation_kind, recommended_action, evidence_basis, resurfacing_note)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24) RETURNING *`,
+                                   microtrend_id, recommendation_kind, recommended_action, evidence_basis, resurfacing_note,
+                                   sunrice_fit_score, sunrice_fit_band, sunrice_fit_components)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27) RETURNING *`,
     [
       reportId, rec.rank, rec.actionType, rec.theme || null, rec.title, rec.rationale, rec.audience || null,
       rec.state || 'National', rec.suggestedChannel || null, rec.freshness || null,
@@ -771,7 +808,10 @@ async function insertRecommendation(reportId, rec) {
       rec.recommendationKind || null,
       rec.recommendedAction || null,
       rec.evidenceBasis || null,
-      rec.resurfacingNote || null
+      rec.resurfacingNote || null,
+      rec.sunriceFit?.score ?? null,
+      rec.sunriceFit?.band ?? null,
+      rec.sunriceFit ? JSON.stringify(rec.sunriceFit.components) : null
     ]
   );
   return res.rows[0];
@@ -825,11 +865,15 @@ async function getMicrotrendsForTheme(theme) {
   return res.rows;
 }
 
-async function updateMicrotrendScore(microtrendId, reportId, score, components) {
+async function updateMicrotrendScore(microtrendId, reportId, score, components, sunriceFit = null) {
   const res = await pool.query(
-    `UPDATE microtrends SET last_score = $2, last_score_components = $3, last_scored_report_id = $4, updated_at = now()
+    `UPDATE microtrends SET last_score = $2, last_score_components = $3, last_scored_report_id = $4,
+            sunrice_fit_score = $5, sunrice_fit_band = $6, sunrice_fit_components = $7, updated_at = now()
      WHERE id = $1 RETURNING *`,
-    [microtrendId, score, JSON.stringify(components), reportId]
+    [
+      microtrendId, score, JSON.stringify(components), reportId,
+      sunriceFit?.score ?? null, sunriceFit?.band ?? null, sunriceFit ? JSON.stringify(sunriceFit.components) : null
+    ]
   );
   return res.rows[0];
 }
@@ -1153,6 +1197,34 @@ async function getRejectedCandidates({ theme, verdict, limit = 50 } = {}) {
   const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
   const res = await pool.query(
     `SELECT * FROM rejected_candidates ${where} ORDER BY created_at DESC LIMIT $${params.length}`,
+    params
+  );
+  return res.rows;
+}
+
+async function recordFitContradiction(reportId, {
+  microtrendId, theme, candidateName, eligibilityVerdict, eligibilityReasonCode, sunriceFit, explanation
+}) {
+  const res = await pool.query(
+    `INSERT INTO fit_contradictions
+       (report_id, microtrend_id, theme, candidate_name, eligibility_verdict, eligibility_reason_code, sunrice_fit_score, sunrice_fit_band, explanation)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *`,
+    [
+      reportId, microtrendId || null, theme, candidateName, eligibilityVerdict, eligibilityReasonCode || null,
+      sunriceFit.score, sunriceFit.band, explanation
+    ]
+  );
+  return res.rows[0];
+}
+
+async function getFitContradictions({ theme, limit = 50 } = {}) {
+  const conditions = [];
+  const params = [];
+  if (theme) { params.push(theme); conditions.push(`theme = $${params.length}`); }
+  params.push(limit);
+  const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
+  const res = await pool.query(
+    `SELECT * FROM fit_contradictions ${where} ORDER BY created_at DESC LIMIT $${params.length}`,
     params
   );
   return res.rows;
@@ -1785,6 +1857,8 @@ module.exports = {
   recordRejectedCandidate,
   getLatestRejectionForMicrotrend,
   getRejectedCandidates,
+  recordFitContradiction,
+  getFitContradictions,
   countRecentMicrotrendRecommendations,
   getSameDayRecommendations,
   tryAcquireIngestLock,

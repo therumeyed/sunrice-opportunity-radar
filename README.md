@@ -689,6 +689,39 @@ ids and a full snapshot of the assessment at the time -- readable via
 `GET /admin/rejected-candidates` (admin-gated, no UI yet; Stage 8's human
 review queue is where `uncertain` rows get a real page).
 
+## 5f. SunRice fit scoring (Stage 5)
+
+A separate axis from the recommendation's own score/tier (which measures
+momentum/evidence strength) -- this measures brand suitability. Shown on
+every recommendation card and Emerging card as **SunRice fit: High ·
+85/100**, and broken down into its 4 components in the evidence drawer,
+always next to the disclaimer: *"Assessed suitability, not a statistically
+calibrated probability"* (`src/sunriceFit.js`'s `DISCLAIMER`).
+
+Claude picks one of 4 named anchors (`strong`/`moderate`/`weak`/`none`,
+never a raw number) per component, with written criteria for each in the
+prompt -- deliberately anchored rather than continuous, so the score never
+implies more precision than a qualitative judgment can support:
+
+| Component | Weight |
+|---|---|
+| Product connection | 40% |
+| Format/preparation suitability | 25% |
+| Audience/occasion relevance | 20% |
+| Trend fidelity | 15% |
+
+The weighted composite is rounded to the nearest 5 and banded: **High**
+80-100, **Moderate** 60-79, **Low** below 60. A Low-fit candidate stays
+fully scored/stored (visible in Emerging) but can never win a
+recommendation slot; Moderate and High compete normally.
+
+Eligibility (Stage 4) asks "is there a credible connection at all?"; this
+asks "how strong is it?" -- when they disagree on that specific question
+(eligible but the fit's own product-connection component is `none`, or
+rejected-for-`product_mismatch` but it's `strong`), it's logged to the new
+`fit_contradictions` table, readable via `GET /admin/fit-contradictions`
+(admin-gated, no UI yet -- same pattern as `/admin/rejected-candidates`).
+
 ## 6. Deploy to Render
 
 `render.yaml` provisions a web service, a daily cron job (ingestion), and

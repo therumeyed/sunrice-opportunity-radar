@@ -5,12 +5,14 @@ const {
   getMicrotrendSocialEvidenceHistory, recordMicrotrendSocialSignal, recordPossibleRepost,
   updateMicrotrendScore, setMicrotrendStatus, getActiveExclusions, getPositiveFeedbackExamples,
   countRecentMicrotrendRecommendations, getMicrotrendEvidence, setReportAiStatus, ensureIdeaExists,
-  getEvidenceSourceItemIdsForRecommendation, recordRejectedCandidate, getLatestRejectionForMicrotrend
+  getEvidenceSourceItemIdsForRecommendation, recordRejectedCandidate, getLatestRejectionForMicrotrend,
+  recordFitContradiction
 } = require('./db');
 const { detectPossibleReposts } = require('./repostDetection');
 const {
   checkInsufficientEvidence, isDuplicateWithoutNewEvidence, buildResurfacingContext, canResurface
 } = require('./eligibility');
+const { detectFitEligibilityContradiction } = require('./sunriceFit');
 const { ALL_TOPICS, evergreenBaselinesForTheme } = require('./topics');
 const { scoreOpportunity, confidenceFor, actionTypeFor } = require('./scoring');
 const { themeLifecycleFor } = require('./themeLifecycle');
@@ -60,10 +62,10 @@ const THEME_AUDIENCE = {
 
 // Fixed editorial priority used ONLY for theme-level ranking (which 3
 // themes' slots compete for a recommendation today) -- NOT for a
-// candidate's own relevance score, which is Claude's brandRelevance
-// judgment (see scoreThemeCandidates below). Not derived from any live
-// metric. multicultural is deliberately left out -- its weight is already
-// forced to 0.5 by the requiresReview lock regardless of this map.
+// candidate's own relevance score, which is Claude's sunriceFit (Stage 5)
+// judgment. Not derived from any live metric. multicultural is
+// deliberately left out -- its weight is already forced to 0.5 by the
+// requiresReview lock regardless of this map.
 const THEME_RELEVANCE = {
   rice_basics: 1,
   weeknight_dinners: 1,
@@ -221,9 +223,10 @@ function materialChangeInputs(priorHistory, todayObservations) {
 // cluster(s) it referenced into one microtrend identity, persists
 // observations/evidence (for EVERY theme's candidates, not only the top 3
 // -- this is what makes the Emerging section possible), scores it using
-// Claude's own brandRelevance as the relevance input, and determines
-// whether it's eligible to win a slot (macro baseline suppression, the
-// not_relevant/dont_show_again/already_covered/implemented exclusions).
+// Claude's own sunriceFit composite (Stage 5) as the relevance input, and
+// determines whether it's eligible to win a slot (macro baseline
+// suppression, the not_relevant/dont_show_again/already_covered/
+// implemented exclusions, Stage 4's eligibility gate, Stage 5's fit band).
 // Claude is authoritative for classification/relevance/product fit/the
 // proposed action; this function is authoritative for everything
 // measurable built on top of that -- evidence, momentum math, history,
@@ -313,7 +316,7 @@ async function processThemeAssessments(opp, assessments, rawCandidateByClusterKe
       distinctSourceCount,
       // Claude's own judgment of brand relevance -- authoritative, replaces
       // the old static THEME_RELEVANCE lookup for this specific input.
-      relevance: forceEarlySignal ? 0.5 : assessment.brandRelevance,
+      relevance: forceEarlySignal ? 0.5 : assessment.sunriceFit.score / 100,
       daysSinceFirstSeen: daysOld,
       priorRecommendationCount,
       uniqueSourceItemCount
@@ -358,7 +361,7 @@ async function processThemeAssessments(opp, assessments, rawCandidateByClusterKe
     for (const link of evidenceLinksFor(allMembers)) {
       await linkMicrotrendEvidence(microtrend.id, reportId, link.sourceItemId, link.matchType);
     }
-    await updateMicrotrendScore(microtrend.id, reportId, score, components);
+    await updateMicrotrendScore(microtrend.id, reportId, score, components, assessment.sunriceFit);
 
     let qualifies = true;
     if (assessment.classification === 'macro') {
@@ -444,13 +447,32 @@ async function processThemeAssessments(opp, assessments, rawCandidateByClusterKe
       });
     }
 
+    // --- Stage 5 (IMPLEMENTATION_CHECKLIST.md): SunRice fit gate --------
+    // Eligibility (above) asks "is there a credible connection at all?";
+    // this asks "how strong is it?" -- a Low-fit candidate stays fully
+    // stored/scored (Emerging section unaffected) but can never win a
+    // slot, same "store now, don't act on it" treatment as an ineligible
+    // one. Moderate/High compete normally -- no extra gate beyond the
+    // existing score/evidence-strength ranking.
+    const fitQualifies = assessment.sunriceFit.band !== 'Low';
+
+    const contradiction = detectFitEligibilityContradiction({
+      eligibilityVerdict, eligibilityReasonCode, fit: assessment.sunriceFit
+    });
+    if (contradiction) {
+      await recordFitContradiction(reportId, {
+        microtrendId: microtrend.id, theme: opp.theme, candidateName: assessment.candidateName,
+        eligibilityVerdict, eligibilityReasonCode, sunriceFit: assessment.sunriceFit, explanation: contradiction
+      });
+    }
+
     results.push({
       microtrend, assessment, allMembers, score, components, distinctSourceCount, uniqueSourceItemCount,
       isSocialOnly, distinctCreatorCount, evidenceBasis,
       hasMomentumCorroboration: momentumCorroborated, recentCreatorCount,
       qualifies, hidden: exclusions.hiddenMicrotrendIds.has(microtrend.id),
       actionFingerprint, suppressed: exclusions.suppressedFingerprints.has(actionFingerprint),
-      eligible, eligibilityReasonCode, eligibilityExplanation, resurfacingExplanation
+      eligible, eligibilityReasonCode, eligibilityExplanation, resurfacingExplanation, fitQualifies
     });
   }
   return results.sort((a, b) => b.score - a.score);
@@ -458,13 +480,14 @@ async function processThemeAssessments(opp, assessments, rawCandidateByClusterKe
 
 // Highest-scoring candidate for this theme that is qualified (macro
 // baseline rule), not hidden (not_relevant), not suppressed
-// (dont_show_again / already_covered / implemented), and eligible (Stage 4
-// -- passed the semantic/evidence/duplicate gate) -- results are already
-// sorted by score, so the first match wins. Returns null when nothing in
-// the theme's candidate list is winnable, which is exactly when this slot
-// gets no recommendation at all today -- never a deterministic fallback.
+// (dont_show_again / already_covered / implemented), eligible (Stage 4 --
+// passed the semantic/evidence/duplicate gate), and fitQualifies (Stage 5
+// -- not a Low SunRice-fit band) -- results are already sorted by score,
+// so the first match wins. Returns null when nothing in the theme's
+// candidate list is winnable, which is exactly when this slot gets no
+// recommendation at all today -- never a deterministic fallback.
 function pickWinningCandidate(opp) {
-  return (opp.candidateResults || []).find((c) => c.qualifies && !c.hidden && !c.suppressed && c.eligible) || null;
+  return (opp.candidateResults || []).find((c) => c.qualifies && !c.hidden && !c.suppressed && c.eligible && c.fitQualifies) || null;
 }
 
 // Builds this report's signals + theme snapshots from whatever real
@@ -829,7 +852,8 @@ async function buildCandidateRecommendation({ reportId, rank, opp, winner, repor
     microtrendId: microtrend.id,
     recommendationKind: 'candidate',
     evidenceBasis,
-    resurfacingNote: resurfacingExplanation
+    resurfacingNote: resurfacingExplanation,
+    sunriceFit: assessment.sunriceFit
   });
 
   // Idea Tracker row -- keyed by this stable action_fingerprint. A

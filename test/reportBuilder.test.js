@@ -12,6 +12,7 @@
 // it exercise the real "no ANTHROPIC_API_KEY" unavailable path for free.
 const { test, describe, before, after, beforeEach } = require('node:test');
 const assert = require('node:assert/strict');
+const { computeSunriceFit } = require('../src/sunriceFit');
 
 const TEST_DATABASE_URL = process.env.TEST_DATABASE_URL;
 const skip = !TEST_DATABASE_URL ? 'set TEST_DATABASE_URL to a scratch database to run this suite' : false;
@@ -33,12 +34,31 @@ describe('report generation from fixture evidence (DB-backed)', { skip }, () => 
   // assessment per clusterKey, citing that candidate's own real evidence
   // IDs -- a reasonable default for tests that aren't specifically about
   // merging or exclusion. Overrides let a test set classification/
-  // brandRelevance/channel etc.
+  // sunriceFit/channel etc.
   // Stage 4: every stub defaults to a confidently eligible verdict -- real
   // eligibility-gate behaviour (rejected/uncertain/resurfacing) is covered
   // by its own describe block below, via overrides.eligibility.
   function defaultEligibility(overrides) {
     return overrides.eligibility || { verdict: 'eligible', reasonCode: null, explanation: null };
+  }
+
+  // Stage 5: pre-Stage-5 tests pass a 0-1 brandRelevance override (kept
+  // working here rather than rewritten at every call site) -- anchors are
+  // discrete, so this is not an exact inverse, just close enough that the
+  // ~15%-weighted relevance input it feeds never flips a tier threshold in
+  // these fixtures (verified by the full suite passing). A test actually
+  // about fit scoring itself passes overrides.sunriceFit directly instead.
+  function fitFromRelevance(target = 0.7) {
+    const anchor = target >= 0.85 ? 'strong' : target >= 0.55 ? 'moderate' : target >= 0.25 ? 'weak' : 'none';
+    return { productConnectionFit: anchor, formatSuitability: anchor, audienceOccasionRelevance: anchor, trendFidelity: anchor };
+  }
+  // The real pipeline only ever sees the COMPUTED shape ({score, band,
+  // components}, from candidateAnalyst.js's validateAssessment) -- never
+  // the raw anchor block directly. overrides.sunriceFit may be given as
+  // either (raw anchors are passed through computeSunriceFit here too).
+  function defaultFit(overrides, fallback = 0.7) {
+    const anchors = overrides.sunriceFit || fitFromRelevance(overrides.brandRelevance ?? fallback);
+    return anchors.components ? anchors : computeSunriceFit(anchors);
   }
 
   function autoAssessAll(overrides = {}) {
@@ -50,7 +70,7 @@ describe('report generation from fixture evidence (DB-backed)', { skip }, () => 
         parentTheme: t.theme,
         classification: overrides.classification || 'micro',
         isDistinctFromEvergreen: true,
-        brandRelevance: overrides.brandRelevance ?? 0.7,
+        sunriceFit: defaultFit(overrides),
         productConnection: overrides.productConnection || [],
         whyItMattersNow: overrides.whyItMattersNow || 'Real evidence points to this right now.',
         proposedAction: {
@@ -82,7 +102,7 @@ describe('report generation from fixture evidence (DB-backed)', { skip }, () => 
           parentTheme: theme,
           classification: overrides.classification || 'micro',
           isDistinctFromEvergreen: true,
-          brandRelevance: overrides.brandRelevance ?? 0.8,
+          sunriceFit: defaultFit(overrides, 0.8),
           productConnection: overrides.productConnection || [],
           whyItMattersNow: overrides.whyItMattersNow || 'Real social evidence points to this right now.',
           proposedAction: {
@@ -125,14 +145,14 @@ describe('report generation from fixture evidence (DB-backed)', { skip }, () => 
   beforeEach(async () => {
     candidateAnalyst.analyzeCandidates = realAnalyzeCandidates; // undo any stub a previous test set
     delete process.env.ANTHROPIC_API_KEY;
-    await db.pool.query(`TRUNCATE TABLE rejected_candidates, idea_status_history, ideas, recommendation_feedback, recommendation_evidence, recommendations,
+    await db.pool.query(`TRUNCATE TABLE rejected_candidates, fit_contradictions, idea_status_history, ideas, recommendation_feedback, recommendation_evidence, recommendations,
       microtrend_evidence, microtrend_observations, microtrends,
       signals, theme_daily_snapshots, source_items, provider_runs, reports RESTART IDENTITY CASCADE`);
   });
 
   after(async () => {
     candidateAnalyst.analyzeCandidates = realAnalyzeCandidates;
-    await db.pool.query(`TRUNCATE TABLE rejected_candidates, idea_status_history, ideas, recommendation_feedback, recommendation_evidence, recommendations,
+    await db.pool.query(`TRUNCATE TABLE rejected_candidates, fit_contradictions, idea_status_history, ideas, recommendation_feedback, recommendation_evidence, recommendations,
       microtrend_evidence, microtrend_observations, microtrends,
       signals, theme_daily_snapshots, source_items, provider_runs, reports RESTART IDENTITY CASCADE`);
     await db.pool.end();
@@ -238,7 +258,7 @@ describe('report generation from fixture evidence (DB-backed)', { skip }, () => 
           parentTheme: 'healthy_eating',
           classification: 'micro',
           isDistinctFromEvergreen: true,
-          brandRelevance: 0.8,
+          sunriceFit: computeSunriceFit({ productConnectionFit: 'moderate', formatSuitability: 'moderate', audienceOccasionRelevance: 'moderate', trendFidelity: 'moderate' }),
           productConnection: [],
           whyItMattersNow: 'Two different wordings for the same real idea.',
           proposedAction: { recommendedAction: 'Publish a low GI meal prep bowl guide', channel: null, format: null, creativeAngle: null },
@@ -1058,6 +1078,95 @@ describe('report generation from fixture evidence (DB-backed)', { skip }, () => 
       assert.ok(rec3);
       assert.ok(rec3.resurfacing_note, 'a resurfaced recommendation must carry a stored, displayable explanation of why');
       assert.ok(rec3.resurfacing_note.includes('product_mismatch'));
+    });
+  });
+
+  describe('Stage 5: SunRice fit scoring', () => {
+    const LOW_FIT = { productConnectionFit: 'none', formatSuitability: 'none', audienceOccasionRelevance: 'none', trendFidelity: 'none' };
+    const HIGH_FIT = { productConnectionFit: 'strong', formatSuitability: 'strong', audienceOccasionRelevance: 'strong', trendFidelity: 'strong' };
+
+    test('a Low SunRice-fit candidate is eligible but never wins a slot -- it stays stored for review', async () => {
+      const report = await db.getOrCreateReport(TODAY);
+      const run = await db.recordProviderRun(report.id, { providerName: 'DataForSEO', sourceType: 'dataforseo_trends', status: 'live' });
+      await db.upsertSourceItem({
+        providerRunId: run.id, sourceType: 'dataforseo_trends', sourceName: 'DataForSEO',
+        contentHash: 'fixture-fit-low-1', title: 'rice', queryOrTopic: 'rice', theme: 'rice_basics',
+        normalizedMetrics: { relatedQueries: { rising: [{ query: 'rice based craft glue recipe', value: 60 }], top: [] } },
+        dataStatus: 'live'
+      });
+      candidateAnalyst.analyzeCandidates = autoAssessAll({ candidateName: 'Rice based craft glue recipe', sunriceFit: LOW_FIT });
+      const result = await buildReport(report.id, TODAY);
+      assert.equal(result.recommendationsCreated, 0, 'Low fit must never win a slot even though eligibility itself passed');
+
+      const microtrends = await db.getMicrotrendsForReport(report.id);
+      const m = microtrends.find((mt) => mt.theme === 'rice_basics');
+      assert.ok(m, 'the candidate must still be stored/scored for review, same as any other Emerging candidate');
+      assert.equal(m.sunrice_fit_band, 'Low');
+      assert.equal(m.sunrice_fit_score, 0);
+
+      // Never stored in rejected_candidates -- Low fit is a different axis
+      // from the Stage 4 eligibility gate, and this candidate WAS eligible.
+      const rejected = await db.pool.query('SELECT * FROM rejected_candidates WHERE theme = $1', ['rice_basics']);
+      assert.equal(rejected.rowCount, 0);
+    });
+
+    test('a Moderate/High fit candidate competes normally and the composite is stored on the winning recommendation', async () => {
+      const report = await db.getOrCreateReport(TODAY);
+      const run = await db.recordProviderRun(report.id, { providerName: 'DataForSEO', sourceType: 'dataforseo_trends', status: 'live' });
+      await db.upsertSourceItem({
+        providerRunId: run.id, sourceType: 'dataforseo_trends', sourceName: 'DataForSEO',
+        contentHash: 'fixture-fit-high-1', title: 'sushi rice', queryOrTopic: 'sushi rice', theme: 'sushi_asian',
+        normalizedMetrics: { relatedQueries: { rising: [{ query: 'air fryer sushi rice bowl', value: 80 }], top: [] } },
+        dataStatus: 'live'
+      });
+      candidateAnalyst.analyzeCandidates = autoAssessAll({ candidateName: 'Air fryer sushi rice bowls', sunriceFit: HIGH_FIT });
+      const result = await buildReport(report.id, TODAY);
+      assert.equal(result.recommendationsCreated, 1);
+
+      const bundle = await db.getReportBundle(report);
+      const rec = bundle.recommendations.find((r) => r.theme === 'sushi_asian');
+      assert.ok(rec);
+      assert.equal(rec.sunrice_fit_band, 'High');
+      assert.equal(rec.sunrice_fit_score, 100);
+      assert.deepEqual(rec.sunrice_fit_components, HIGH_FIT);
+    });
+
+    test('eligible + "none" product-connection fit raises a contradiction for review', async () => {
+      const report = await db.getOrCreateReport(TODAY);
+      const run = await db.recordProviderRun(report.id, { providerName: 'DataForSEO', sourceType: 'dataforseo_trends', status: 'live' });
+      await db.upsertSourceItem({
+        providerRunId: run.id, sourceType: 'dataforseo_trends', sourceName: 'DataForSEO',
+        contentHash: 'fixture-contradiction-1', title: 'rice', queryOrTopic: 'rice', theme: 'rice_basics',
+        normalizedMetrics: { relatedQueries: { rising: [{ query: 'rice water hair rinse diy', value: 55 }], top: [] } },
+        dataStatus: 'live'
+      });
+      candidateAnalyst.analyzeCandidates = autoAssessAll({
+        candidateName: 'Rice water hair rinse DIY',
+        eligibility: { verdict: 'eligible' },
+        sunriceFit: { ...LOW_FIT, productConnectionFit: 'none' }
+      });
+      await buildReport(report.id, TODAY);
+
+      const contradictions = await db.pool.query('SELECT * FROM fit_contradictions WHERE theme = $1', ['rice_basics']);
+      assert.equal(contradictions.rowCount, 1);
+      assert.equal(contradictions.rows[0].eligibility_verdict, 'eligible');
+      assert.equal(contradictions.rows[0].sunrice_fit_band, 'Low');
+    });
+
+    test('a consistent eligible + strong product-connection fit raises no contradiction', async () => {
+      const report = await db.getOrCreateReport(TODAY);
+      const run = await db.recordProviderRun(report.id, { providerName: 'DataForSEO', sourceType: 'dataforseo_trends', status: 'live' });
+      await db.upsertSourceItem({
+        providerRunId: run.id, sourceType: 'dataforseo_trends', sourceName: 'DataForSEO',
+        contentHash: 'fixture-no-contradiction-1', title: 'sushi rice', queryOrTopic: 'sushi rice', theme: 'sushi_asian',
+        normalizedMetrics: { relatedQueries: { rising: [{ query: 'sushi rice bowl meal prep', value: 70 }], top: [] } },
+        dataStatus: 'live'
+      });
+      candidateAnalyst.analyzeCandidates = autoAssessAll({ candidateName: 'Sushi rice bowl meal prep', sunriceFit: HIGH_FIT });
+      await buildReport(report.id, TODAY);
+
+      const contradictions = await db.pool.query('SELECT * FROM fit_contradictions WHERE theme = $1', ['sushi_asian']);
+      assert.equal(contradictions.rowCount, 0);
     });
   });
 });

@@ -5,6 +5,11 @@ const {
   chunkThemeBatches, analyzeCandidates, extractJson
 } = require('../src/candidateAnalyst');
 
+// A valid, all-strong sunriceFit block -- used as filler wherever a
+// fixture just needs SOME valid fit object and isn't testing fit scoring
+// itself.
+const SAMPLE_FIT = { productConnectionFit: 'strong', formatSuitability: 'strong', audienceOccasionRelevance: 'strong', trendFidelity: 'strong' };
+
 // A minimal real-shaped candidate, used only to pad out candidate counts
 // for chunking tests -- members/clusterKey content doesn't matter here.
 function fillerCandidate(theme, n) {
@@ -124,7 +129,7 @@ describe('validateAssessment', () => {
     parentTheme: 'rice_basics',
     classification: 'micro',
     isDistinctFromEvergreen: true,
-    brandRelevance: 0.7,
+    sunriceFit: { productConnectionFit: 'strong', formatSuitability: 'strong', audienceOccasionRelevance: 'moderate', trendFidelity: 'strong' },
     productConnection: ['SunRice Jasmine Fragrant Rice'],
     whyItMattersNow: 'Rising search and a matching Pinterest trend term both point to this right now.',
     proposedAction: {
@@ -186,14 +191,21 @@ describe('validateAssessment', () => {
     assert.equal(result, null);
   });
 
-  test('rejects a response missing brandRelevance', () => {
-    const result = validateAssessment({ ...valid, brandRelevance: undefined }, index);
+  test('rejects a response missing sunriceFit entirely', () => {
+    const result = validateAssessment({ ...valid, sunriceFit: undefined }, index);
     assert.equal(result, null);
   });
 
-  test('clamps an out-of-range brandRelevance into 0-1', () => {
-    const result = validateAssessment({ ...valid, brandRelevance: 1.5 }, index);
-    assert.equal(result.brandRelevance, 1);
+  test('rejects a response with an invalid anchor value for any one fit component', () => {
+    const result = validateAssessment({ ...valid, sunriceFit: { ...valid.sunriceFit, productConnectionFit: 'extremely strong' } }, index);
+    assert.equal(result, null);
+  });
+
+  test('computes the real weighted composite from the 4 anchors, rounded to the nearest 5', () => {
+    const result = validateAssessment(valid, index);
+    // strong(100)*.4 + strong(100)*.25 + moderate(65)*.2 + strong(100)*.15 = 40+25+13+15 = 93 -> rounds to 95
+    assert.equal(result.sunriceFit.score, 95);
+    assert.equal(result.sunriceFit.band, 'High');
   });
 
   test('rejects a response missing a concrete recommendedAction', () => {
@@ -239,7 +251,7 @@ describe('parseAndValidateResponse', () => {
       candidateName: 'Air fryer rice paper rolls',
       parentTheme: 'rice_basics',
       classification: 'micro',
-      brandRelevance: 0.6,
+      sunriceFit: { productConnectionFit: 'strong', formatSuitability: 'strong', audienceOccasionRelevance: 'strong', trendFidelity: 'strong' },
       productConnection: [],
       whyItMattersNow: 'Rising search interest right now.',
       proposedAction: { recommendedAction: 'Make a short video' },
@@ -264,8 +276,8 @@ describe('parseAndValidateResponse', () => {
 
   test('counts rejected elements separately from valid ones', () => {
     const response = JSON.stringify([
-      { clusterKeys: ['rice_basics::air fryer rice paper roll'], candidateName: 'Real one', parentTheme: 'rice_basics', classification: 'micro', brandRelevance: 0.5, whyItMattersNow: 'x', proposedAction: { recommendedAction: 'y' }, evidenceIds: [101] },
-      { clusterKeys: ['made up key'], candidateName: 'Fake one', parentTheme: 'rice_basics', classification: 'micro', brandRelevance: 0.5, whyItMattersNow: 'x', proposedAction: { recommendedAction: 'y' }, evidenceIds: [1] }
+      { clusterKeys: ['rice_basics::air fryer rice paper roll'], candidateName: 'Real one', parentTheme: 'rice_basics', classification: 'micro', sunriceFit: SAMPLE_FIT, whyItMattersNow: 'x', proposedAction: { recommendedAction: 'y' }, evidenceIds: [101] },
+      { clusterKeys: ['made up key'], candidateName: 'Fake one', parentTheme: 'rice_basics', classification: 'micro', sunriceFit: SAMPLE_FIT, whyItMattersNow: 'x', proposedAction: { recommendedAction: 'y' }, evidenceIds: [1] }
     ]);
     const { assessments, rejectedCount } = parseAndValidateResponse(response, batches);
     assert.equal(assessments.length, 1);
@@ -281,9 +293,9 @@ describe('parseAndValidateResponse', () => {
   test('a 10-candidate response with exactly 1 invalid candidate keeps the other 9, never discards the whole batch', () => {
     const valid = (i) => ({
       clusterKeys: ['rice_basics::air fryer rice paper roll'], candidateName: `Real candidate ${i}`, parentTheme: 'rice_basics',
-      classification: 'micro', brandRelevance: 0.5, whyItMattersNow: 'x', proposedAction: { recommendedAction: 'y' }, evidenceIds: [101]
+      classification: 'micro', sunriceFit: SAMPLE_FIT, whyItMattersNow: 'x', proposedAction: { recommendedAction: 'y' }, evidenceIds: [101]
     });
-    const invalid = { clusterKeys: ['rice_basics::air fryer rice paper roll'], candidateName: 'Bad one', parentTheme: 'rice_basics', classification: 'not-a-real-classification', brandRelevance: 0.5, whyItMattersNow: 'x', proposedAction: { recommendedAction: 'y' }, evidenceIds: [101] };
+    const invalid = { clusterKeys: ['rice_basics::air fryer rice paper roll'], candidateName: 'Bad one', parentTheme: 'rice_basics', classification: 'not-a-real-classification', sunriceFit: SAMPLE_FIT, whyItMattersNow: 'x', proposedAction: { recommendedAction: 'y' }, evidenceIds: [101] };
     const response = JSON.stringify([...Array.from({ length: 9 }, (_, i) => valid(i)), invalid]);
     const { assessments, rejectedCount, parseError } = parseAndValidateResponse(response, batches);
     assert.equal(parseError, undefined, 'a per-candidate validation failure is never a parse error');
@@ -371,7 +383,7 @@ describe('analyzeCandidates: multi-chunk resilience (mocked network)', () => {
         candidateName: `Candidate ${ck}`,
         parentTheme: ck.split('::')[0],
         classification: 'micro',
-        brandRelevance: 0.5,
+        sunriceFit: SAMPLE_FIT,
         whyItMattersNow: 'Real evidence supports this.',
         proposedAction: { recommendedAction: 'Do something concrete' },
         evidenceIds: [Number(ck.split('filler-')[1])]

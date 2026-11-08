@@ -20,13 +20,13 @@ describe('baseline (DB-backed)', { skip }, () => {
   });
 
   beforeEach(async () => {
-    await db.pool.query(`TRUNCATE TABLE baseline_snapshots, rejected_candidates, recommendation_feedback, recommendation_evidence, recommendations,
+    await db.pool.query(`TRUNCATE TABLE baseline_snapshots, rejected_candidates, fit_contradictions, recommendation_feedback, recommendation_evidence, recommendations,
       microtrend_evidence, microtrend_observations, microtrend_social_signals, microtrends,
       signals, theme_daily_snapshots, source_items, provider_runs, reports RESTART IDENTITY CASCADE`);
   });
 
   after(async () => {
-    await db.pool.query(`TRUNCATE TABLE baseline_snapshots, rejected_candidates, recommendation_feedback, recommendation_evidence, recommendations,
+    await db.pool.query(`TRUNCATE TABLE baseline_snapshots, rejected_candidates, fit_contradictions, recommendation_feedback, recommendation_evidence, recommendations,
       microtrend_evidence, microtrend_observations, microtrend_social_signals, microtrends,
       signals, theme_daily_snapshots, source_items, provider_runs, reports RESTART IDENTITY CASCADE`);
     await db.pool.end();
