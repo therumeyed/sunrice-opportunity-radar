@@ -91,7 +91,7 @@ expensive. Expect TikTok/Instagram in particular to have off days; that's
 the flakiest part of this whole pipeline and always will be.
 
 Default actors (overridable, see `.env.example`):
-- Reddit: `trudax/reddit-scraper-lite`, scoped to `APIFY_REDDIT_SUBREDDITS` (comma-separated, no `r/`) -- defaults to cooking-focused communities (MealPrepSunday, EatCheapAndHealthy, AskCulinary, budgetfood, AskAnAustralian).
+- Reddit: `tri_angle/reddit-scraper`, scoped to `APIFY_REDDIT_SUBREDDITS` (comma-separated, no `r/`) -- defaults to cooking-focused communities (MealPrepSunday, EatCheapAndHealthy, AskCulinary, budgetfood, AskAnAustralian). Switched from `trudax/reddit-scraper-lite` (2026-11) after that actor went into maintenance; see `src/providers/apifySocial.js`'s `searchReddit` for the real output-shape differences (no `url` field on a post -- reconstructed via Reddit's own `redd.it/<id>` shortlink -- and a `reasonCode` sentinel record for anything that came back empty, which is always dropped before matching).
 - TikTok: `clockworks/tiktok-scraper`, searched against the active topic library's queries (or `APIFY_TIKTOK_SEARCH_TERMS` to override).
 - Instagram: `instaprism/instagram-hashtag-posts` -- hashtag search is the closest thing to free-text search Instagram allows, so this only catches posts tagged with a topic-derived hashtag, not every relevant post.
 - Pinterest Trends: `automation-lab/pinterest-trends-scraper` (see section 3a below).

@@ -27,49 +27,74 @@ function notConfiguredReason(featureFlagEnvVar) {
   return null;
 }
 
+// A Reddit post's body for a text post; absent/empty for a link or image
+// post, and literally "[deleted]"/"[removed]" when the content is gone --
+// per tri_angle/reddit-scraper's own docs. Never matched against as if it
+// were real text.
+function cleanBody(body) {
+  return body && body !== '[deleted]' && body !== '[removed]' ? body : '';
+}
+
 // SocialProvider.search(topicQueries, sinceDate) for Reddit -- one actor run
 // scanning each configured subreddit's newest posts, then locally matched
 // against every active topic query (cheaper and more predictable than a
 // site-wide search on a pay-per-result actor -- same approach proven on the
 // Melbourne Airport dashboard in this account).
+//
+// Switched from trudax/reddit-scraper-lite to tri_angle/reddit-scraper
+// (2026-11) -- the former went into maintenance and had been flaky for a
+// while. tri_angle/reddit-scraper's real documented shape is meaningfully
+// different: no `url` field on a post record (redd.it/<id> is Reddit's own
+// official shortlink, reconstructed here), `score`/`commentCount` instead
+// of `upVotes`/`numberOfComments`, and a community/query that produced
+// nothing real comes back as its own sentinel record carrying a
+// `reasonCode` (not-found/empty/nsfw-skipped/unavailable) rather than
+// simply being absent -- the docs are explicit that these must be dropped,
+// never matched against as if they were a real post.
 async function searchReddit(topicQueries, sinceDate) {
   const reason = notConfiguredReason('FEATURE_APIFY_REDDIT');
   if (reason) return { status: 'awaiting_connection', items: [], error: reason };
 
-  const actorId = process.env.APIFY_REDDIT_ACTOR_ID || 'trudax/reddit-scraper-lite';
-  const maxItems = 100; // the actor's own overall ceiling for this run -- see cap/rawItemCount below
+  const actorId = process.env.APIFY_REDDIT_ACTOR_ID || 'tri_angle/reddit-scraper';
+  const maxPostsPerCommunity = 25;
+  const maxItems = maxPostsPerCommunity * subreddits().length; // the actor's own overall ceiling for this run -- see cap/rawItemCount below
   try {
     const { items, runId, datasetId } = await runActor(actorId, {
-      startUrls: subreddits().map((sub) => ({ url: `https://www.reddit.com/r/${sub}/new/` })),
-      maxItems,
-      maxPostCount: 40,
-      maxComments: 0,
-      skipComments: true
+      scrapeMode: 'posts',
+      communityNames: subreddits(),
+      communitySort: 'new',
+      maxPostsPerCommunity,
+      includeNsfw: false
     });
+    const real = (items || []).filter((d) => !d.reasonCode);
     // Raw count BEFORE topic-matching filters it down, and the actor's own
     // configured ceiling -- lets callers (ingest.js) tell "fewer matching
     // posts today" apart from "the raw feed was truncated before matching
     // even happened", which must never be read as declining interest.
-    const rawItemCount = (items || []).length;
+    const rawItemCount = real.length;
 
-    const matched = (items || [])
-      .filter((d) => !d.parentId) // comments carry parentId, posts don't
+    const matched = real
+      // scrapeMode: 'posts' shouldn't return comment records at all, but
+      // belt-and-braces: a comment record carries postId/parentCommentId,
+      // a post record never does.
+      .filter((d) => !d.postId)
       .filter((d) => !d.createdAt || new Date(d.createdAt) >= sinceDate)
       .flatMap((d) => {
-        const text = `${d.title || ''} ${d.body || ''}`;
+        const body = cleanBody(d.body);
+        const text = `${d.title || ''} ${body}`;
         const hitQuery = topicQueries.find((q) => isGenuineMatch(text, q));
         if (!hitQuery) return [];
         return [{
           platform: 'reddit',
-          externalId: d.id || d.parsedId || d.url,
-          url: d.url,
+          externalId: d.id,
+          url: d.id ? `https://redd.it/${d.id}` : null,
           title: d.title || null,
-          excerpt: (d.body || '').slice(0, 500),
-          author: d.username || null,
+          excerpt: body.slice(0, 500),
+          author: d.authorName || null,
           publishedAt: d.createdAt || null,
           queryOrTopic: hitQuery,
           theme: themeForQuery(hitQuery),
-          rawMetrics: { upvotes: d.upVotes, numComments: d.numberOfComments },
+          rawMetrics: { upvotes: d.score, numComments: d.commentCount },
           rawPayload: { ...d, apifyRunId: runId, apifyDatasetId: datasetId }
         }];
       });
