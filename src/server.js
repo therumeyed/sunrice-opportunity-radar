@@ -7,7 +7,8 @@ const {
   pool, initSchemaWithRetry, getReportByDate, getLatestReport, listReportDates, getReportBundle,
   tryAcquireIngestLock, releaseIngestLock, getRecommendationById, insertFeedback, restoreFeedback, listActiveFeedback,
   getActiveExclusions, getIdeas, updateIdea, getIdeaHistory, getIdeaStatusCounts, getMostRecentRecommendationByFingerprint,
-  recordBaselineSnapshot, getLatestBaselineSnapshot, getAllBaselineSnapshots, getOpenSourceHealthAlerts
+  recordBaselineSnapshot, getLatestBaselineSnapshot, getAllBaselineSnapshots, getOpenSourceHealthAlerts,
+  getRejectedCandidates
 } = require('./db');
 const { computeBaseline } = require('./baseline');
 const { runHealthCheck } = require('./healthMonitor');
@@ -216,6 +217,10 @@ async function serializeBundle(bundle) {
       opportunityName: r.opportunity_name || r.title,
       continuityStatus: r.continuity_status,
       continuityMeta: r.continuity_meta,
+      // Stage 4 (IMPLEMENTATION_CHECKLIST.md): set only when this
+      // recommendation is resurfacing a previously rejected candidate --
+      // "store and display a short explanation of why."
+      resurfacingNote: r.resurfacing_note,
       recommendationKind: r.recommendation_kind,
       microtrendId: r.microtrend_id,
       recommendedAction: r.recommended_action,
@@ -535,6 +540,32 @@ app.post('/admin/baseline', requireAdmin, async (req, res) => {
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
   }
+});
+
+// Stage 4 (IMPLEMENTATION_CHECKLIST.md): audit trail for the eligibility
+// filter -- admin-only, same reasoning as Source health (operational/
+// internal detail, not something every dashboard viewer needs). No UI yet
+// -- Stage 8's human review queue is where 'uncertain' rows get a real
+// page; this is the endpoint-only pattern Stage 1's baseline also used
+// before the data was worth building one around.
+app.get('/admin/rejected-candidates', requireAdmin, async (req, res) => {
+  const { theme, verdict, limit } = req.query;
+  const rows = await getRejectedCandidates({ theme, verdict, limit: limit ? Number(limit) : undefined });
+  res.json({
+    rejected: rows.map((r) => ({
+      id: r.id,
+      reportId: r.report_id,
+      microtrendId: r.microtrend_id,
+      theme: r.theme,
+      candidateName: r.candidate_name,
+      verdict: r.verdict,
+      reasonCode: r.reason_code,
+      explanation: r.explanation,
+      evidenceIds: r.evidence_ids,
+      resurfacingExplanation: r.resurfacing_explanation,
+      createdAt: r.created_at
+    }))
+  });
 });
 
 // Public read, same as every other report read in this app -- lets

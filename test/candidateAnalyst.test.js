@@ -84,6 +84,32 @@ describe('buildBatchPrompt', () => {
   });
 });
 
+describe('buildBatchPrompt: Stage 4 eligibility', () => {
+  test('includes the suitability config and the 4 Claude-assignable reason codes', () => {
+    const prompt = buildBatchPrompt(sampleThemeBatches());
+    assert.ok(prompt.includes('product_mismatch'));
+    assert.ok(prompt.includes('audience_mismatch'));
+    assert.ok(prompt.includes('too_generic'));
+    assert.ok(prompt.includes('too_late'));
+    assert.ok(prompt.toLowerCase().includes('international trend'));
+  });
+
+  test('explicitly tells Claude not to use already_covered or insufficient_evidence -- those are deterministic-only', () => {
+    const prompt = buildBatchPrompt(sampleThemeBatches());
+    assert.ok(prompt.includes('Do NOT use "already_covered" or "insufficient_evidence"'));
+  });
+
+  test('shows geography on each evidence line, honestly distinguishing confirmed from unknown', () => {
+    const batches = sampleThemeBatches();
+    batches[0].candidates[0].members[0].geography = 'Australia';
+    batches[0].candidates[0].members[0].geographyConfidence = 'confirmed';
+    const prompt = buildBatchPrompt(batches);
+    assert.ok(prompt.includes('[geography: Australia, confirmed]'));
+    // The second candidate's member never had geography set -- must read as unknown, never silently assumed Australian.
+    assert.ok(prompt.includes('[geography: unknown]'));
+  });
+});
+
 describe('extractJson', () => {
   test('strips a markdown fence Claude added despite being told not to', () => {
     assert.equal(extractJson('```json\n[1,2]\n```'), '[1,2]');
@@ -178,6 +204,29 @@ describe('validateAssessment', () => {
   test('rejects null/non-object input without throwing', () => {
     assert.equal(validateAssessment(null, index), null);
     assert.equal(validateAssessment('not an object', index), null);
+  });
+
+  test('a real eligible verdict is preserved', () => {
+    const result = validateAssessment({ ...valid, eligibility: { verdict: 'eligible' } }, index);
+    assert.equal(result.eligibility.verdict, 'eligible');
+  });
+
+  test('a real rejected verdict with a valid reason code and explanation is preserved', () => {
+    const result = validateAssessment({ ...valid, eligibility: { verdict: 'rejected', reasonCode: 'too_generic', explanation: 'No fresh angle here.' } }, index);
+    assert.equal(result.eligibility.verdict, 'rejected');
+    assert.equal(result.eligibility.reasonCode, 'too_generic');
+  });
+
+  test('a missing eligibility block degrades to uncertain -- never defaults to eligible, and never rejects the whole assessment', () => {
+    const { eligibility: _omit, ...withoutEligibility } = valid;
+    const result = validateAssessment(withoutEligibility, index);
+    assert.ok(result, 'the rest of a genuinely valid assessment must still survive');
+    assert.equal(result.eligibility.verdict, 'uncertain');
+  });
+
+  test('an eligibility block citing already_covered (a deterministic-only reason) degrades to uncertain', () => {
+    const result = validateAssessment({ ...valid, eligibility: { verdict: 'rejected', reasonCode: 'already_covered', explanation: 'x' } }, index);
+    assert.equal(result.eligibility.verdict, 'uncertain');
   });
 });
 

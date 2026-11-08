@@ -34,6 +34,13 @@ describe('report generation from fixture evidence (DB-backed)', { skip }, () => 
   // IDs -- a reasonable default for tests that aren't specifically about
   // merging or exclusion. Overrides let a test set classification/
   // brandRelevance/channel etc.
+  // Stage 4: every stub defaults to a confidently eligible verdict -- real
+  // eligibility-gate behaviour (rejected/uncertain/resurfacing) is covered
+  // by its own describe block below, via overrides.eligibility.
+  function defaultEligibility(overrides) {
+    return overrides.eligibility || { verdict: 'eligible', reasonCode: null, explanation: null };
+  }
+
   function autoAssessAll(overrides = {}) {
     return async (themeBatches) => ({
       status: 'ok',
@@ -52,6 +59,7 @@ describe('report generation from fixture evidence (DB-backed)', { skip }, () => 
           format: overrides.format === undefined ? 'Short-form video' : overrides.format,
           creativeAngle: overrides.creativeAngle === undefined ? 'A concrete angle' : overrides.creativeAngle
         },
+        eligibility: defaultEligibility(overrides),
         evidenceIds: c.members.map((m) => m.sourceItemId)
       })))
     });
@@ -83,6 +91,7 @@ describe('report generation from fixture evidence (DB-backed)', { skip }, () => 
             format: overrides.format === undefined ? 'Short-form video' : overrides.format,
             creativeAngle: overrides.creativeAngle === undefined ? 'A concrete angle' : overrides.creativeAngle
           },
+          eligibility: defaultEligibility(overrides),
           evidenceIds: t.candidates.flatMap((c) => c.members.map((m) => m.sourceItemId))
         }]
       };
@@ -116,14 +125,14 @@ describe('report generation from fixture evidence (DB-backed)', { skip }, () => 
   beforeEach(async () => {
     candidateAnalyst.analyzeCandidates = realAnalyzeCandidates; // undo any stub a previous test set
     delete process.env.ANTHROPIC_API_KEY;
-    await db.pool.query(`TRUNCATE TABLE idea_status_history, ideas, recommendation_feedback, recommendation_evidence, recommendations,
+    await db.pool.query(`TRUNCATE TABLE rejected_candidates, idea_status_history, ideas, recommendation_feedback, recommendation_evidence, recommendations,
       microtrend_evidence, microtrend_observations, microtrends,
       signals, theme_daily_snapshots, source_items, provider_runs, reports RESTART IDENTITY CASCADE`);
   });
 
   after(async () => {
     candidateAnalyst.analyzeCandidates = realAnalyzeCandidates;
-    await db.pool.query(`TRUNCATE TABLE idea_status_history, ideas, recommendation_feedback, recommendation_evidence, recommendations,
+    await db.pool.query(`TRUNCATE TABLE rejected_candidates, idea_status_history, ideas, recommendation_feedback, recommendation_evidence, recommendations,
       microtrend_evidence, microtrend_observations, microtrends,
       signals, theme_daily_snapshots, source_items, provider_runs, reports RESTART IDENTITY CASCADE`);
     await db.pool.end();
@@ -233,6 +242,7 @@ describe('report generation from fixture evidence (DB-backed)', { skip }, () => 
           productConnection: [],
           whyItMattersNow: 'Two different wordings for the same real idea.',
           proposedAction: { recommendedAction: 'Publish a low GI meal prep bowl guide', channel: null, format: null, creativeAngle: null },
+          eligibility: { verdict: 'eligible' },
           evidenceIds: allEvidenceIds
         }]
       };
@@ -879,6 +889,175 @@ describe('report generation from fixture evidence (DB-backed)', { skip }, () => 
       for (const e of rec.evidence) {
         assert.deepEqual(e.product_connection, ['SunRice Sushi Rice']);
       }
+    });
+  });
+
+  describe('Stage 4: eligibility filtering and rejection storage', () => {
+    test('a Claude-rejected candidate never becomes a recommendation, and is stored with its reason code', async () => {
+      const report = await db.getOrCreateReport(TODAY);
+      const run = await db.recordProviderRun(report.id, { providerName: 'DataForSEO', sourceType: 'dataforseo_trends', status: 'live' });
+      await db.upsertSourceItem({
+        providerRunId: run.id, sourceType: 'dataforseo_trends', sourceName: 'DataForSEO',
+        contentHash: 'fixture-eligibility-reject-1', title: 'rice', queryOrTopic: 'rice', theme: 'rice_basics',
+        normalizedMetrics: { relatedQueries: { rising: [{ query: 'rice water hair rinse', value: 70 }], top: [] } },
+        dataStatus: 'live'
+      });
+      candidateAnalyst.analyzeCandidates = autoAssessAll({
+        candidateName: 'Rice water hair rinse',
+        eligibility: { verdict: 'rejected', reasonCode: 'product_mismatch', explanation: 'No real SunRice product or cooking occasion connects to a hair-care use.' }
+      });
+      const result = await buildReport(report.id, TODAY);
+      assert.equal(result.recommendationsCreated, 0, 'a Claude-rejected candidate must never win a slot');
+
+      const rejected = await db.pool.query('SELECT * FROM rejected_candidates WHERE theme = $1', ['rice_basics']);
+      assert.equal(rejected.rowCount, 1, 'the rejection must be retained for audit');
+      assert.equal(rejected.rows[0].verdict, 'rejected');
+      assert.equal(rejected.rows[0].reason_code, 'product_mismatch');
+      assert.ok(rejected.rows[0].explanation);
+
+      const bundle = await db.getReportBundle(report);
+      assert.equal(bundle.recommendations.find((r) => r.theme === 'rice_basics'), undefined);
+    });
+
+    test('a Claude "uncertain" candidate never becomes a recommendation, and is stored as uncertain, not rejected', async () => {
+      const report = await db.getOrCreateReport(TODAY);
+      const run = await db.recordProviderRun(report.id, { providerName: 'DataForSEO', sourceType: 'dataforseo_trends', status: 'live' });
+      await db.upsertSourceItem({
+        providerRunId: run.id, sourceType: 'dataforseo_trends', sourceName: 'DataForSEO',
+        contentHash: 'fixture-eligibility-uncertain-1', title: 'curry', queryOrTopic: 'curry', theme: 'curry_night',
+        normalizedMetrics: { relatedQueries: { rising: [{ query: 'curry flavoured protein shake', value: 65 }], top: [] } },
+        dataStatus: 'live'
+      });
+      candidateAnalyst.analyzeCandidates = autoAssessAll({
+        candidateName: 'Curry flavoured protein shake',
+        eligibility: { verdict: 'uncertain', reasonCode: 'audience_mismatch', explanation: 'Not confident this resonates with our core audience.' }
+      });
+      const result = await buildReport(report.id, TODAY);
+      assert.equal(result.recommendationsCreated, 0, 'an uncertain candidate must never win a slot either');
+
+      const rejected = await db.pool.query('SELECT * FROM rejected_candidates WHERE theme = $1', ['curry_night']);
+      assert.equal(rejected.rowCount, 1);
+      assert.equal(rejected.rows[0].verdict, 'uncertain', 'uncertain must be stored as its own distinct state, never silently treated as rejected');
+    });
+
+    test('insufficient evidence (every item non-live) is rejected deterministically even when Claude says eligible', async () => {
+      const report = await db.getOrCreateReport(TODAY);
+      const run = await db.recordProviderRun(report.id, { providerName: 'DataForSEO (cached)', sourceType: 'dataforseo_trends', status: 'cached' });
+      await db.upsertSourceItem({
+        providerRunId: run.id, sourceType: 'dataforseo_trends', sourceName: 'DataForSEO (cached)',
+        contentHash: 'fixture-eligibility-insufficient-1', title: 'curry', queryOrTopic: 'curry', theme: 'curry_night',
+        normalizedMetrics: { relatedQueries: { rising: [{ query: 'curry meal kit subscription box', value: 60 }], top: [] } },
+        dataStatus: 'cached'
+      });
+      candidateAnalyst.analyzeCandidates = autoAssessAll({ candidateName: 'Curry meal kit subscription box' }); // defaults to eligible
+      const result = await buildReport(report.id, TODAY);
+      assert.equal(result.recommendationsCreated, 0, 'all-cached evidence must be rejected regardless of Claude\'s own verdict');
+
+      const rejected = await db.pool.query('SELECT * FROM rejected_candidates WHERE theme = $1', ['curry_night']);
+      assert.equal(rejected.rowCount, 1);
+      assert.equal(rejected.rows[0].reason_code, 'insufficient_evidence');
+    });
+
+    test('citing exactly the same evidence already recommended recently, with nothing new, is rejected as already_covered', async () => {
+      const yesterday = new Date(Date.now() - 86400000);
+      const yesterdayStr = melbourneDateString(yesterday);
+
+      const report1 = await db.getOrCreateReport(yesterdayStr);
+      const run1 = await db.recordProviderRun(report1.id, { providerName: 'DataForSEO', sourceType: 'dataforseo_trends', status: 'live' });
+      const item1 = await db.upsertSourceItem({
+        providerRunId: run1.id, sourceType: 'dataforseo_trends', sourceName: 'DataForSEO',
+        contentHash: 'fixture-dup-1', title: 'rice', queryOrTopic: 'rice', theme: 'rice_basics',
+        normalizedMetrics: { relatedQueries: { rising: [{ query: 'rice cooker hacks', value: 60 }], top: [] } },
+        dataStatus: 'live'
+      });
+      await db.pool.query('UPDATE source_items SET collected_at = $1 WHERE id = $2', [yesterday, item1.id]);
+      candidateAnalyst.analyzeCandidates = autoAssessAll({ candidateName: 'Rice cooker hacks' });
+      await buildReport(report1.id, yesterdayStr);
+      const bundle1 = await db.getReportBundle(report1);
+      const rec1 = bundle1.recommendations.find((r) => r.theme === 'rice_basics');
+      assert.ok(rec1, 'expected day 1 to win a slot normally');
+
+      // Day 2: the SAME real evidence item (no new evidence exists), now
+      // also dated today -- simulates "nothing new has been collected
+      // since this exact action was already recommended."
+      const report2 = await db.getOrCreateReport(TODAY);
+      await db.pool.query('UPDATE source_items SET collected_at = now() WHERE id = $1', [item1.id]);
+      candidateAnalyst.analyzeCandidates = autoAssessAll({ candidateName: 'Rice cooker hacks' });
+      const result2 = await buildReport(report2.id, TODAY);
+      assert.equal(result2.recommendationsCreated, 0, 'no genuinely new evidence since the recent identical recommendation -- must be rejected');
+
+      const rejected = await db.pool.query('SELECT * FROM rejected_candidates WHERE theme = $1 ORDER BY id DESC LIMIT 1', ['rice_basics']);
+      assert.equal(rejected.rows[0].reason_code, 'already_covered');
+    });
+
+    test('reason-aware resurfacing: blocked while nothing addresses the original reason, allowed once a genuinely new product connection appears', async () => {
+      const yesterday = new Date(Date.now() - 86400000);
+      const yesterdayStr = melbourneDateString(yesterday);
+      const tomorrowDate = new Date(Date.now() + 86400000);
+      const tomorrow = melbourneDateString(tomorrowDate);
+
+      // Day 1: rejected for product_mismatch, no product connection claimed.
+      const report1 = await db.getOrCreateReport(yesterdayStr);
+      const run1 = await db.recordProviderRun(report1.id, { providerName: 'DataForSEO', sourceType: 'dataforseo_trends', status: 'live' });
+      const item1 = await db.upsertSourceItem({
+        providerRunId: run1.id, sourceType: 'dataforseo_trends', sourceName: 'DataForSEO',
+        contentHash: 'fixture-resurface-1', title: 'rice', queryOrTopic: 'rice', theme: 'rice_basics',
+        normalizedMetrics: { relatedQueries: { rising: [{ query: 'rice flour skincare mask', value: 50 }], top: [] } },
+        dataStatus: 'live'
+      });
+      await db.pool.query('UPDATE source_items SET collected_at = $1 WHERE id = $2', [yesterday, item1.id]);
+      candidateAnalyst.analyzeCandidates = autoAssessAll({
+        candidateName: 'Rice flour skincare mask', productConnection: [],
+        eligibility: { verdict: 'rejected', reasonCode: 'product_mismatch', explanation: 'No real SunRice product connects to a skincare use.' }
+      });
+      await buildReport(report1.id, yesterdayStr);
+      const rejected1 = await db.pool.query('SELECT * FROM rejected_candidates WHERE theme = $1', ['rice_basics']);
+      assert.equal(rejected1.rowCount, 1);
+
+      // Day 2: Claude now says eligible, but still no product connection --
+      // the resurfacing bar for product_mismatch is not met, so this must
+      // be rejected again for the SAME reason, deterministically.
+      const report2 = await db.getOrCreateReport(TODAY);
+      const run2 = await db.recordProviderRun(report2.id, { providerName: 'DataForSEO', sourceType: 'dataforseo_trends', status: 'live' });
+      await db.upsertSourceItem({
+        providerRunId: run2.id, sourceType: 'dataforseo_trends', sourceName: 'DataForSEO',
+        contentHash: 'fixture-resurface-2', title: 'rice', queryOrTopic: 'rice', theme: 'rice_basics',
+        normalizedMetrics: { relatedQueries: { rising: [{ query: 'rice flour skincare mask', value: 50 }], top: [] } },
+        dataStatus: 'live'
+      });
+      candidateAnalyst.analyzeCandidates = autoAssessAll({ candidateName: 'Rice flour skincare mask', productConnection: [] }); // Claude itself now says eligible (the autoAssessAll default)
+      const result2 = await buildReport(report2.id, TODAY);
+      assert.equal(result2.recommendationsCreated, 0, 'a new source/day alone must never be enough to resurface product_mismatch');
+      const rejected2 = await db.pool.query('SELECT * FROM rejected_candidates WHERE theme = $1 ORDER BY id DESC LIMIT 1', ['rice_basics']);
+      assert.equal(rejected2.rows[0].reason_code, 'product_mismatch', 'must still carry the original reason, not a new one');
+      assert.equal(rejected2.rows[0].resurfacing_explanation, null);
+
+      // Day 3: a genuinely new, real product connection appears -- the
+      // product_mismatch bar IS met, so this must now be allowed through,
+      // with a resurfacing note stored and displayed.
+      const report3 = await db.getOrCreateReport(tomorrow);
+      const run3 = await db.recordProviderRun(report3.id, { providerName: 'DataForSEO', sourceType: 'dataforseo_trends', status: 'live' });
+      const item3 = await db.upsertSourceItem({
+        providerRunId: run3.id, sourceType: 'dataforseo_trends', sourceName: 'DataForSEO',
+        contentHash: 'fixture-resurface-3', title: 'rice', queryOrTopic: 'rice', theme: 'rice_basics',
+        normalizedMetrics: { relatedQueries: { rising: [{ query: 'rice flour skincare mask', value: 50 }], top: [] } },
+        dataStatus: 'live'
+      });
+      // collected_at always defaults to the DB's real now() -- forward-dated
+      // directly so getTodayItems(tomorrow) actually matches it, same as
+      // the existing "implemented" continuity test above.
+      await db.pool.query('UPDATE source_items SET collected_at = $1 WHERE id = $2', [tomorrowDate, item3.id]);
+      candidateAnalyst.analyzeCandidates = autoAssessAll({
+        candidateName: 'Rice flour skincare mask', productConnection: ['SunRice Jasmine Fragrant Rice']
+      });
+      const result3 = await buildReport(report3.id, tomorrow);
+      assert.equal(result3.recommendationsCreated, 1, 'a genuinely new product connection must clear the product_mismatch resurfacing bar');
+
+      const bundle3 = await db.getReportBundle(report3);
+      const rec3 = bundle3.recommendations.find((r) => r.theme === 'rice_basics');
+      assert.ok(rec3);
+      assert.ok(rec3.resurfacing_note, 'a resurfaced recommendation must carry a stored, displayable explanation of why');
+      assert.ok(rec3.resurfacing_note.includes('product_mismatch'));
     });
   });
 });

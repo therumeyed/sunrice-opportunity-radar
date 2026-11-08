@@ -196,6 +196,11 @@ async function initSchema() {
     ALTER TABLE recommendations ADD COLUMN IF NOT EXISTS action_fingerprint TEXT;
     ALTER TABLE recommendations ADD COLUMN IF NOT EXISTS continuity_meta JSONB;
     ALTER TABLE recommendations ADD COLUMN IF NOT EXISTS strategy_output JSONB;
+    -- Stage 4: a short, human-facing note set ONLY when this recommendation
+    -- is resurfacing a previously rejected candidate -- "store and display
+    -- a short explanation of why a previously rejected opportunity is
+    -- being reconsidered." Null is the normal case (never rejected before).
+    ALTER TABLE recommendations ADD COLUMN IF NOT EXISTS resurfacing_note TEXT;
 
     -- One row per theme per report, for every theme that had real evidence
     -- that day -- not only the top 3 that became recommendations. This is
@@ -493,6 +498,39 @@ async function initSchema() {
     -- empty productConnection array), never "unknown".
     ALTER TABLE recommendation_evidence ADD COLUMN IF NOT EXISTS product_connection JSONB;
 
+    -- Stage 4 (IMPLEMENTATION_CHECKLIST.md): every candidate the eligibility
+    -- gate in reportBuilder.js turned away, with a reason code and the
+    -- specific explanation behind it -- "retain rejected candidates ... so
+    -- we can audit the filter" (never silently discarded, never generates
+    -- an execution idea). verdict distinguishes a confident rejection from
+    -- 'uncertain' (Claude's own semantic read wasn't confident enough to
+    -- call either way) -- both are kept out of the recommendation feed, but
+    -- they are not the same thing; 'uncertain' rows are what a future human
+    -- review queue (Stage 8) is for. assessment_snapshot is the full
+    -- validated Claude assessment at the time of this verdict, kept so
+    -- reason-aware resurfacing later can compare "what's different now"
+    -- against "what was true when this was rejected" without needing to
+    -- reconstruct it from scattered history. Explicit admin/feedback-driven
+    -- exclusions (not_relevant/dont_show_again/already_covered feedback)
+    -- are already fully audited in recommendation_feedback and are NOT
+    -- duplicated into this table.
+    CREATE TABLE IF NOT EXISTS rejected_candidates (
+      id SERIAL PRIMARY KEY,
+      report_id INTEGER NOT NULL REFERENCES reports(id) ON DELETE CASCADE,
+      microtrend_id INTEGER REFERENCES microtrends(id) ON DELETE SET NULL,
+      theme TEXT NOT NULL,
+      candidate_name TEXT NOT NULL,
+      verdict TEXT NOT NULL CHECK (verdict IN ('rejected','uncertain')),
+      reason_code TEXT CHECK (reason_code IN ('product_mismatch','audience_mismatch','too_generic','already_covered','too_late','insufficient_evidence')),
+      explanation TEXT NOT NULL,
+      evidence_ids JSONB,
+      assessment_snapshot JSONB,
+      resurfacing_explanation TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    CREATE INDEX IF NOT EXISTS idx_rejected_candidates_microtrend ON rejected_candidates(microtrend_id);
+    CREATE INDEX IF NOT EXISTS idx_rejected_candidates_report ON rejected_candidates(report_id);
+
     CREATE TABLE IF NOT EXISTS topic_definitions (
       id SERIAL PRIMARY KEY,
       theme TEXT NOT NULL,
@@ -717,8 +755,8 @@ async function insertRecommendation(reportId, rec) {
     `INSERT INTO recommendations (report_id, rank, action_type, theme, title, rationale, audience, state,
                                    suggested_channel, freshness, confidence, score, score_components, momentum_sources,
                                    opportunity_name, continuity_status, action_fingerprint, continuity_meta, strategy_output,
-                                   microtrend_id, recommendation_kind, recommended_action, evidence_basis)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23) RETURNING *`,
+                                   microtrend_id, recommendation_kind, recommended_action, evidence_basis, resurfacing_note)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24) RETURNING *`,
     [
       reportId, rec.rank, rec.actionType, rec.theme || null, rec.title, rec.rationale, rec.audience || null,
       rec.state || 'National', rec.suggestedChannel || null, rec.freshness || null,
@@ -732,7 +770,8 @@ async function insertRecommendation(reportId, rec) {
       rec.microtrendId || null,
       rec.recommendationKind || null,
       rec.recommendedAction || null,
-      rec.evidenceBasis || null
+      rec.evidenceBasis || null,
+      rec.resurfacingNote || null
     ]
   );
   return res.rows[0];
@@ -1061,6 +1100,60 @@ async function getRecentRecommendationsForMicrotrend(microtrendId, reportDate, d
        AND ($4::int IS NULL OR rec.report_id != $4)
      ORDER BY r.report_date DESC`,
     [microtrendId, reportDate, days, excludeReportId]
+  );
+  return res.rows;
+}
+
+// Stage 4: the real evidence ids a past recommendation actually cited --
+// what isDuplicateWithoutNewEvidence (src/eligibility.js) compares today's
+// candidate's evidenceIds against.
+async function getEvidenceSourceItemIdsForRecommendation(recommendationId) {
+  const res = await pool.query('SELECT source_item_id FROM recommendation_evidence WHERE recommendation_id = $1', [recommendationId]);
+  return res.rows.map((r) => r.source_item_id);
+}
+
+async function recordRejectedCandidate(reportId, {
+  microtrendId, theme, candidateName, verdict, reasonCode, explanation, evidenceIds, assessmentSnapshot, resurfacingExplanation
+}) {
+  const res = await pool.query(
+    `INSERT INTO rejected_candidates
+       (report_id, microtrend_id, theme, candidate_name, verdict, reason_code, explanation, evidence_ids, assessment_snapshot, resurfacing_explanation)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *`,
+    [
+      reportId, microtrendId || null, theme, candidateName, verdict, reasonCode || null, explanation,
+      evidenceIds ? JSON.stringify(evidenceIds) : null,
+      assessmentSnapshot ? JSON.stringify(assessmentSnapshot) : null,
+      resurfacingExplanation || null
+    ]
+  );
+  return res.rows[0];
+}
+
+// Only the MOST RECENT rejection for this microtrend matters for today's
+// resurfacing bar -- if a theme was rejected, resurfaced, then rejected
+// again, the earlier rejection's reason is no longer the live one.
+async function getLatestRejectionForMicrotrend(microtrendId) {
+  const res = await pool.query(
+    `SELECT * FROM rejected_candidates WHERE microtrend_id = $1 ORDER BY created_at DESC LIMIT 1`,
+    [microtrendId]
+  );
+  return res.rows[0] || null;
+}
+
+// Read-only audit trail for GET /admin/rejected-candidates -- Stage 8's
+// human review queue is where 'uncertain' rows eventually get a real UI;
+// for now this is the endpoint-only, no-UI-yet pattern Stage 1's baseline
+// also used before the data was worth building a page around.
+async function getRejectedCandidates({ theme, verdict, limit = 50 } = {}) {
+  const conditions = [];
+  const params = [];
+  if (theme) { params.push(theme); conditions.push(`theme = $${params.length}`); }
+  if (verdict) { params.push(verdict); conditions.push(`verdict = $${params.length}`); }
+  params.push(limit);
+  const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
+  const res = await pool.query(
+    `SELECT * FROM rejected_candidates ${where} ORDER BY created_at DESC LIMIT $${params.length}`,
+    params
   );
   return res.rows;
 }
@@ -1688,6 +1781,10 @@ module.exports = {
   getPriorThemeSnapshots,
   getRecentRecommendations,
   getRecentRecommendationsForMicrotrend,
+  getEvidenceSourceItemIdsForRecommendation,
+  recordRejectedCandidate,
+  getLatestRejectionForMicrotrend,
+  getRejectedCandidates,
   countRecentMicrotrendRecommendations,
   getSameDayRecommendations,
   tryAcquireIngestLock,

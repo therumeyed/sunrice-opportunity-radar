@@ -20,13 +20,13 @@ describe('baseline (DB-backed)', { skip }, () => {
   });
 
   beforeEach(async () => {
-    await db.pool.query(`TRUNCATE TABLE baseline_snapshots, recommendation_feedback, recommendation_evidence, recommendations,
+    await db.pool.query(`TRUNCATE TABLE baseline_snapshots, rejected_candidates, recommendation_feedback, recommendation_evidence, recommendations,
       microtrend_evidence, microtrend_observations, microtrend_social_signals, microtrends,
       signals, theme_daily_snapshots, source_items, provider_runs, reports RESTART IDENTITY CASCADE`);
   });
 
   after(async () => {
-    await db.pool.query(`TRUNCATE TABLE baseline_snapshots, recommendation_feedback, recommendation_evidence, recommendations,
+    await db.pool.query(`TRUNCATE TABLE baseline_snapshots, rejected_candidates, recommendation_feedback, recommendation_evidence, recommendations,
       microtrend_evidence, microtrend_observations, microtrend_social_signals, microtrends,
       signals, theme_daily_snapshots, source_items, provider_runs, reports RESTART IDENTITY CASCADE`);
     await db.pool.end();
@@ -127,7 +127,28 @@ describe('baseline (DB-backed)', { skip }, () => {
     // Still unavailable -- nothing in this fixture set builds a review
     // queue or mismatch reason codes, so these must stay honestly absent.
     assert.equal(metrics.productMismatchRate.status, 'unavailable');
+    assert.equal(metrics.genericRecommendationRate.status, 'unavailable');
     assert.equal(metrics.usefulCandidatesIncorrectlyRejectedRate.status, 'unavailable');
+  });
+
+  test('Stage 4: productMismatchRate/genericRecommendationRate become measured once real rejected_candidates rows exist', async () => {
+    const report = (await db.pool.query(`INSERT INTO reports (report_date, status) VALUES ('2026-02-01', 'completed') RETURNING *`)).rows[0];
+    await db.recordRejectedCandidate(report.id, {
+      theme: 'rice_basics', candidateName: 'Fixture A', verdict: 'rejected', reasonCode: 'product_mismatch', explanation: 'x'
+    });
+    await db.recordRejectedCandidate(report.id, {
+      theme: 'rice_basics', candidateName: 'Fixture B', verdict: 'rejected', reasonCode: 'too_generic', explanation: 'x'
+    });
+    await db.recordRejectedCandidate(report.id, {
+      theme: 'rice_basics', candidateName: 'Fixture C', verdict: 'uncertain', reasonCode: null, explanation: 'x'
+    });
+
+    const metrics = await computeBaseline();
+    assert.equal(metrics.productMismatchRate.status, 'measured');
+    assert.equal(metrics.productMismatchRate.totalRejected, 2, 'an uncertain verdict is never counted as a rejection');
+    assert.equal(metrics.productMismatchRate.rate, 0.5);
+    assert.equal(metrics.genericRecommendationRate.status, 'measured');
+    assert.equal(metrics.genericRecommendationRate.rate, 0.5);
   });
 
   test('a snapshot is durably stored and never overwritten by a later one', async () => {

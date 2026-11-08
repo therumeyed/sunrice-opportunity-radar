@@ -4,9 +4,13 @@ const {
   upsertMicrotrend, getMicrotrendObservationHistory, recordMicrotrendObservation, linkMicrotrendEvidence,
   getMicrotrendSocialEvidenceHistory, recordMicrotrendSocialSignal, recordPossibleRepost,
   updateMicrotrendScore, setMicrotrendStatus, getActiveExclusions, getPositiveFeedbackExamples,
-  countRecentMicrotrendRecommendations, getMicrotrendEvidence, setReportAiStatus, ensureIdeaExists
+  countRecentMicrotrendRecommendations, getMicrotrendEvidence, setReportAiStatus, ensureIdeaExists,
+  getEvidenceSourceItemIdsForRecommendation, recordRejectedCandidate, getLatestRejectionForMicrotrend
 } = require('./db');
 const { detectPossibleReposts } = require('./repostDetection');
+const {
+  checkInsufficientEvidence, isDuplicateWithoutNewEvidence, buildResurfacingContext, canResurface
+} = require('./eligibility');
 const { ALL_TOPICS, evergreenBaselinesForTheme } = require('./topics');
 const { scoreOpportunity, confidenceFor, actionTypeFor } = require('./scoring');
 const { themeLifecycleFor } = require('./themeLifecycle');
@@ -377,26 +381,90 @@ async function processThemeAssessments(opp, assessments, rawCandidateByClusterKe
       creativeAngle: assessment.proposedAction.creativeAngle
     });
 
+    // --- Stage 4 (IMPLEMENTATION_CHECKLIST.md): eligibility gate --------
+    // Claude judges semantic suitability/trend fidelity (its own
+    // `assessment.eligibility`, already validated in candidateAnalyst.js,
+    // defaulting to 'uncertain' rather than a fabricated 'eligible').
+    // Deterministic code here enforces evidence integrity and duplicates,
+    // and OVERRIDES Claude whenever it disagrees -- both checks are facts,
+    // not judgment calls, so they take precedence either way. Explicit
+    // admin/feedback exclusions (hidden/suppressed above) are a separate,
+    // already-enforced gate, not duplicated here.
+    let eligibilityVerdict = assessment.eligibility.verdict;
+    let eligibilityReasonCode = assessment.eligibility.reasonCode;
+    let eligibilityExplanation = assessment.eligibility.explanation;
+    let resurfacingExplanation = null;
+
+    const insufficientEvidence = checkInsufficientEvidence(allMembers);
+    if (insufficientEvidence) {
+      eligibilityVerdict = 'rejected';
+      eligibilityReasonCode = 'insufficient_evidence';
+      eligibilityExplanation = 'Every piece of evidence behind this candidate is stale or non-live data -- not enough to support a live trend claim.';
+    } else {
+      // 7-day window matches continuity.js's own repeat_action window --
+      // the same exact action within that window, with nothing newly cited
+      // since, is "duplicates an existing recommendation without
+      // meaningful new evidence."
+      const recentForDup = await getRecentRecommendationsForMicrotrend(microtrend.id, reportDate, 7, reportId);
+      const matchingPastRec = recentForDup.find((r) => r.action_fingerprint === actionFingerprint);
+      if (matchingPastRec) {
+        const priorEvidenceIds = await getEvidenceSourceItemIdsForRecommendation(matchingPastRec.id);
+        if (isDuplicateWithoutNewEvidence(assessment.evidenceIds, priorEvidenceIds)) {
+          eligibilityVerdict = 'rejected';
+          eligibilityReasonCode = 'already_covered';
+          eligibilityExplanation = 'This exact action was already recommended recently with no new supporting evidence since.';
+        }
+      }
+    }
+
+    // Reason-aware resurfacing: only reached when nothing above already
+    // rejected this candidate AND Claude itself said eligible -- a prior
+    // rejection's bar must be specifically cleared, never just time
+    // passing or a new source type alone (see src/eligibility.js).
+    if (eligibilityVerdict === 'eligible') {
+      const priorRejection = await getLatestRejectionForMicrotrend(microtrend.id);
+      if (priorRejection) {
+        const ctx = buildResurfacingContext(priorRejection.assessment_snapshot, assessment, assessment.evidenceIds);
+        if (canResurface(priorRejection.reason_code, ctx)) {
+          resurfacingExplanation = `Reconsidered: new evidence/angle now addresses the "${priorRejection.reason_code}" concern that led to the ${new Date(priorRejection.created_at).toISOString().slice(0, 10)} rejection.`;
+        } else {
+          eligibilityVerdict = 'rejected';
+          eligibilityReasonCode = priorRejection.reason_code;
+          eligibilityExplanation = `Still doesn't meet the bar for "${priorRejection.reason_code}" -- no qualifying new evidence or angle since the last rejection.`;
+        }
+      }
+    }
+
+    const eligible = eligibilityVerdict === 'eligible';
+    if (!eligible) {
+      await recordRejectedCandidate(reportId, {
+        microtrendId: microtrend.id, theme: opp.theme, candidateName: assessment.candidateName,
+        verdict: eligibilityVerdict, reasonCode: eligibilityReasonCode, explanation: eligibilityExplanation,
+        evidenceIds: assessment.evidenceIds, assessmentSnapshot: assessment
+      });
+    }
+
     results.push({
       microtrend, assessment, allMembers, score, components, distinctSourceCount, uniqueSourceItemCount,
       isSocialOnly, distinctCreatorCount, evidenceBasis,
       hasMomentumCorroboration: momentumCorroborated, recentCreatorCount,
       qualifies, hidden: exclusions.hiddenMicrotrendIds.has(microtrend.id),
-      actionFingerprint, suppressed: exclusions.suppressedFingerprints.has(actionFingerprint)
+      actionFingerprint, suppressed: exclusions.suppressedFingerprints.has(actionFingerprint),
+      eligible, eligibilityReasonCode, eligibilityExplanation, resurfacingExplanation
     });
   }
   return results.sort((a, b) => b.score - a.score);
 }
 
 // Highest-scoring candidate for this theme that is qualified (macro
-// baseline rule), not hidden (not_relevant), and not suppressed
-// (dont_show_again / already_covered / implemented) -- results are
-// already sorted by score, so the first match wins. Returns null when
-// nothing in the theme's candidate list is winnable, which is exactly
-// when this slot gets no recommendation at all today -- never a
-// deterministic fallback.
+// baseline rule), not hidden (not_relevant), not suppressed
+// (dont_show_again / already_covered / implemented), and eligible (Stage 4
+// -- passed the semantic/evidence/duplicate gate) -- results are already
+// sorted by score, so the first match wins. Returns null when nothing in
+// the theme's candidate list is winnable, which is exactly when this slot
+// gets no recommendation at all today -- never a deterministic fallback.
 function pickWinningCandidate(opp) {
-  return (opp.candidateResults || []).find((c) => c.qualifies && !c.hidden && !c.suppressed) || null;
+  return (opp.candidateResults || []).find((c) => c.qualifies && !c.hidden && !c.suppressed && c.eligible) || null;
 }
 
 // Builds this report's signals + theme snapshots from whatever real
@@ -697,7 +765,7 @@ async function buildCandidateRecommendation({ reportId, rank, opp, winner, repor
   const {
     microtrend, assessment, score, components, distinctSourceCount, actionFingerprint,
     isSocialOnly, distinctCreatorCount, uniqueSourceItemCount, evidenceBasis,
-    hasMomentumCorroboration: momentumCorroborated, recentCreatorCount
+    hasMomentumCorroboration: momentumCorroborated, recentCreatorCount, resurfacingExplanation
   } = winner;
   const name = assessment.candidateName;
 
@@ -760,7 +828,8 @@ async function buildCandidateRecommendation({ reportId, rank, opp, winner, repor
     scoreComponents: components,
     microtrendId: microtrend.id,
     recommendationKind: 'candidate',
-    evidenceBasis
+    evidenceBasis,
+    resurfacingNote: resurfacingExplanation
   });
 
   // Idea Tracker row -- keyed by this stable action_fingerprint. A

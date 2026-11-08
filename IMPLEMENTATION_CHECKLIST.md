@@ -163,18 +163,94 @@ and `ai_analysis` is tracked as a fully separate entry. Full suite:
   miss a provider's own non-standard error wording.
 
 ## Stage 4: Eligibility filtering and rejection storage
-**Status:** pending
+**Status:** done
 
-- [ ] Configurable SunRice suitability config, documented assumptions,
-      non-blocking while in review
-- [ ] Eligibility stage between extraction and scoring -- Claude judges
-      semantic suitability/trend fidelity; deterministic code enforces
-      evidence integrity/catalogue validity/duplicates/explicit exclusions
-- [ ] Uncertain candidates routed to review, never given a fabricated
-      confident verdict
-- [ ] Every rejection persisted with a reason code + explanation
-- [ ] Reason-aware resurfacing (5 reason categories, new-source-type-alone
-      is insufficient, short explanation stored/displayed on resurfacing)
+- [x] Configurable SunRice suitability config (`src/suitabilityConfig.js`)
+      -- plain, documented assumptions (primary market/audiences, accepted
+      occasions, product-connection/generic-advice standards, the
+      international-trends policy), fed verbatim into Claude's eligibility
+      prompt; non-blocking (ships with sensible defaults, edited directly
+      by a human, no approval gate before use)
+- [x] Eligibility stage between extraction and scoring, wired into
+      `processThemeAssessments` (`src/reportBuilder.js`) -- every candidate
+      is still scored/stored (Emerging section unaffected); only
+      `pickWinningCandidate` and the Idea Tracker are gated on `eligible`.
+      Claude judges semantic suitability/trend fidelity (`product_mismatch`,
+      `audience_mismatch`, `too_generic`, `too_late` -- new `eligibility`
+      block in `candidateAnalyst.js`'s schema); deterministic code
+      (`src/eligibility.js`) enforces evidence integrity
+      (`checkInsufficientEvidence` -- every evidence item non-`live`) and
+      duplicates (`isDuplicateWithoutNewEvidence` -- same `action_fingerprint`
+      within 7 days citing nothing new). Explicit admin/feedback exclusions
+      were already enforced pre-Stage-4 (`src/feedback.js`'s
+      `hiddenMicrotrendIds`/`suppressedFingerprints`) -- reused, not
+      duplicated
+- [x] Uncertain candidates routed to review, never given a fabricated
+      confident verdict -- a missing/malformed `eligibility` block from
+      Claude degrades to `uncertain` (`validateEligibilityBlock`'s
+      `UNCERTAIN_FALLBACK`), same treatment as Claude saying so itself
+- [x] Every rejection (and every uncertain verdict) persisted with a
+      reason code + explanation + cited evidence ids + a full assessment
+      snapshot, in the new `rejected_candidates` table -- readable via
+      `GET /admin/rejected-candidates` (admin-gated; no UI yet, same
+      endpoint-only pattern Stage 1's baseline used before a page existed)
+- [x] Reason-aware resurfacing (`src/eligibility.js`'s `canResurface`) --
+      `product_mismatch` needs a genuinely new product connection,
+      `audience_mismatch`/`too_late` need genuinely new evidence,
+      `too_generic` needs an improved classification/distinctness or new
+      evidence, `already_covered` needs a meaningfully different execution.
+      A new source type alone is explicitly never sufficient for any of
+      them. A short explanation is stored (`rejected_candidates.resurfacing_explanation`)
+      and displayed on the resurfaced recommendation itself
+      (`recommendations.resurfacing_note` -> `resurfacingNote` in the API)
+- [x] Geography/geography_confidence (Stage 2) now actually read: shown on
+      every evidence line in Claude's eligibility prompt, with explicit
+      instruction never to reject merely for being international
+- [x] `baseline.js`'s `productMismatchRate`/`genericRecommendationRate`
+      (previously `unavailable` pending this exact stage) now measured
+      from real `rejected_candidates` rows
+
+**Verification:** `test/eligibility.test.js` (21/21, pure) -- every
+deterministic rule and resurfacing case, including the explicit "a new
+source type alone must never be enough to resurface any reason" guarantee.
+`test/candidateAnalyst.test.js`'s new Stage 4 tests (prompt includes the
+suitability config + reason codes + geography; `validateAssessment`
+preserves a real eligibility verdict, degrades a missing one to
+`uncertain`, and rejects Claude citing a deterministic-only reason code).
+`test/reportBuilder.test.js`'s new Stage 4 suite (5/5, DB-backed): a
+Claude-rejected candidate never wins a slot and is stored; an `uncertain`
+one is stored as `uncertain`, never silently treated as rejected;
+all-non-live evidence is rejected regardless of Claude's own verdict;
+citing literally the same evidence as a recent identical recommendation is
+rejected as `already_covered`; and a full 3-day resurfacing scenario
+(rejected -> still rejected on a bare retry -> allowed through once a
+genuinely new product connection appears, with a stored/displayed
+resurfacing note). `test/baseline.test.js`'s new test proves
+`productMismatchRate`/`genericRecommendationRate` go from `unavailable` to
+`measured` once real rejection rows exist. Full suite: 305/305 passing in
+a scratch Postgres instance (now run with `--test-concurrency=1` --
+found and fixed a real flake: enough DB-backed suites now exist that
+`node --test`'s default parallel-file execution was colliding against the
+one shared scratch database).
+
+**Known limitations:**
+- `isDuplicateWithoutNewEvidence`'s "no new evidence" check compares
+  literal evidence-row identity. Given this pipeline's daily-refresh data
+  model (DataForSEO/social content hashes bake in the collection date, so
+  a genuinely unchanged real-world signal still gets a fresh row each
+  day), this means it rarely fires in realistic day-over-day data -- it's
+  a correct, tested safety net for an exact-repeat edge case, not the
+  primary defence against stale repeats. The existing continuity/
+  `repeat_action` labelling plus admin-driven `implemented` suppression
+  remain the primary real-world mechanisms; a content-level (not just
+  evidence-id) duplicate check is a natural refinement once Stage 5's
+  brand-fit scoring and Stage 6's momentum math exist to inform it.
+- `too_late` is accepted as a reason code Claude may choose, but there's
+  no deterministic timing/lifecycle backstop yet -- that's explicitly
+  Stage 6 territory (momentum and lifecycle improvements).
+- No review-queue UI for `uncertain` rows yet -- `GET /admin/rejected-candidates`
+  is endpoint-only, same pattern Stage 1's baseline used before a page
+  existed. Stage 8 is where this gets a real page.
 
 ## Stage 5: Brand-fit scoring (SunRice fit)
 **Status:** pending

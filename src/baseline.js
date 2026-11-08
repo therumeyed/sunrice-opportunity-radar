@@ -133,6 +133,19 @@ async function evidenceCompletenessAndFreshness() {
   };
 }
 
+// Stage 4 (IMPLEMENTATION_CHECKLIST.md): now that real reason codes exist
+// (rejected_candidates.reason_code), productMismatchRate/genericRecommendationRate
+// can finally be measured -- computed once here and shared by both, rather
+// than two near-identical queries.
+async function rejectionReasonCounts() {
+  const res = await pool.query(
+    `SELECT reason_code, COUNT(*)::int AS count FROM rejected_candidates WHERE verdict = 'rejected' GROUP BY reason_code`
+  );
+  const total = res.rows.reduce((sum, r) => sum + r.count, 0);
+  if (total === 0) return null;
+  return { total, byReason: Object.fromEntries(res.rows.map((r) => [r.reason_code, r.count])) };
+}
+
 // Plain counting context -- not asked for explicitly, but needed to read
 // every other number here in proportion (a 20% duplicate rate on 5
 // recommendations means something very different than on 500).
@@ -150,8 +163,9 @@ async function context() {
 }
 
 async function computeBaseline() {
-  const [ctx, feedback, duplicateRate, timeToRec, tierAtFirst, evidence] = await Promise.all([
-    context(), feedbackCounts(), duplicateRecommendationRate(), timeToRecommendation(), tierAtFirstAppearance(), evidenceCompletenessAndFreshness()
+  const [ctx, feedback, duplicateRate, timeToRec, tierAtFirst, evidence, rejectionCounts] = await Promise.all([
+    context(), feedbackCounts(), duplicateRecommendationRate(), timeToRecommendation(), tierAtFirstAppearance(), evidenceCompletenessAndFreshness(),
+    rejectionReasonCounts()
   ]);
   return {
     context: ctx,
@@ -160,11 +174,27 @@ async function computeBaseline() {
     timeToRecommendation: timeToRec,
     tierAtFirstAppearance: tierAtFirst,
     evidenceCompletenessAndFreshness: evidence,
-    // Explicitly named as unavailable rather than silently absent --
-    // these need infrastructure that doesn't exist until Stages 4 and 8
-    // ship, and must never be read as "zero" in the meantime.
-    productMismatchRate: UNAVAILABLE('no product-mismatch reason code exists yet -- lands in Stage 7'),
-    genericRecommendationRate: UNAVAILABLE('no "too generic" reason code exists yet -- lands in Stage 7'),
+    // Stage 4: now measurable from real rejected_candidates rows -- share
+    // of all REJECTED candidates (not all candidates evaluated; there's no
+    // stored count of eligible ones to compare against) whose reason was
+    // this specific one.
+    productMismatchRate: rejectionCounts ? {
+      status: 'measured',
+      definition: 'Share of all rejected candidates (Stage 4 eligibility gate) rejected specifically for product_mismatch',
+      totalRejected: rejectionCounts.total,
+      productMismatchCount: rejectionCounts.byReason.product_mismatch || 0,
+      rate: Math.round(((rejectionCounts.byReason.product_mismatch || 0) / rejectionCounts.total) * 1000) / 1000
+    } : UNAVAILABLE('no candidate has been rejected by the Stage 4 eligibility gate yet'),
+    genericRecommendationRate: rejectionCounts ? {
+      status: 'measured',
+      definition: 'Share of all rejected candidates (Stage 4 eligibility gate) rejected specifically for too_generic',
+      totalRejected: rejectionCounts.total,
+      tooGenericCount: rejectionCounts.byReason.too_generic || 0,
+      rate: Math.round(((rejectionCounts.byReason.too_generic || 0) / rejectionCounts.total) * 1000) / 1000
+    } : UNAVAILABLE('no candidate has been rejected by the Stage 4 eligibility gate yet'),
+    // Explicitly named as unavailable rather than silently absent -- needs
+    // the human review queue that doesn't exist until Stage 8 ships, and
+    // must never be read as "zero" in the meantime.
     usefulCandidatesIncorrectlyRejectedRate: UNAVAILABLE('no human review queue exists yet -- lands in Stage 8')
   };
 }
@@ -177,7 +207,7 @@ if (require.main === module) {
   computeBaseline()
     .then(async (metrics) => {
       console.log(JSON.stringify(metrics, null, 2));
-      const row = await recordBaselineSnapshot(metrics, 'Initial baseline, captured before Stage 4 (eligibility) changes ship');
+      const row = await recordBaselineSnapshot(metrics, 'Captured after Stage 4 (eligibility) shipped, before Stage 5 (brand-fit scoring) changes ship');
       console.log(`\nSaved as baseline_snapshots.id=${row.id} at ${row.computed_at}`);
       await pool.end();
     })

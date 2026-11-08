@@ -642,6 +642,53 @@ Owner, notes, and an optional content URL are plain editable fields on
 each row, saved via `PATCH /api/ideas/:fingerprint` -- same `EDITOR_TOKEN`
 gate as feedback, read access public.
 
+## 5e. Eligibility filtering and rejection storage (Stage 4)
+
+Between candidate extraction and scoring, every candidate is run through an
+eligibility gate before it can ever win a recommendation slot or appear in
+the Idea Tracker -- it still gets scored/stored for the Emerging section
+either way, same "store now" principle as everywhere else in this app.
+
+**`src/suitabilityConfig.js`** is the editable SunRice brand-suitability
+standard -- plain, documented assumptions (primary market/audiences,
+accepted occasions, the product-connection and generic-advice standards,
+the international-trends policy), fed verbatim into Claude's eligibility
+prompt. Edit this file directly to correct or refine the standard; it's
+reviewed by a human, not learned.
+
+Claude judges semantic suitability and trend fidelity, returning an
+`eligibility` verdict (`eligible` / `rejected` / `uncertain`) alongside its
+usual assessment, with one of 4 reason codes when rejecting or uncertain:
+`product_mismatch`, `audience_mismatch`, `too_generic`, `too_late`. A
+missing or malformed eligibility block from Claude degrades to `uncertain`
+-- never a fabricated `eligible` (`src/eligibility.js`'s
+`validateEligibilityBlock`).
+
+Deterministic code (`src/eligibility.js` + `src/reportBuilder.js`) then
+enforces and can OVERRIDE Claude on two things that are facts, not
+judgment calls:
+- **`insufficient_evidence`** -- every piece of evidence behind the
+  candidate is non-`live` data.
+- **`already_covered`** -- the exact same action was already recommended
+  recently (same `action_fingerprint`, within 7 days) citing nothing
+  genuinely new.
+
+Explicit admin/feedback-driven exclusions (`not_relevant` /
+`dont_show_again` / `already_covered` feedback, `implemented` ideas) are a
+separate, already-existing gate (`src/feedback.js`) -- not duplicated here.
+
+**Reason-aware resurfacing**: a previously rejected microtrend can only
+become eligible again once new evidence specifically addresses the reason
+it was rejected for (`src/eligibility.js`'s `canResurface`) -- a new source
+type alone is never enough. When it does resurface, the recommendation
+carries a `resurfacingNote` explaining why (shown in the evidence drawer).
+
+Every rejection (and every uncertain verdict) is persisted in
+`rejected_candidates` with its reason code, explanation, cited evidence
+ids and a full snapshot of the assessment at the time -- readable via
+`GET /admin/rejected-candidates` (admin-gated, no UI yet; Stage 8's human
+review queue is where `uncertain` rows get a real page).
+
 ## 6. Deploy to Render
 
 `render.yaml` provisions a web service, a daily cron job (ingestion), and

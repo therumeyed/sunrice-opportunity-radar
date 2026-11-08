@@ -34,7 +34,8 @@ function rawCandidatesFromSearch(searchItems) {
       raw.push({
         rawText: q.query, normalizedKey: normalizeKey(q.query), sourceType: 'dataforseo_trends',
         matchType: 'rising_query', metricType: 'rising_value', metricValue: typeof q.value === 'number' ? q.value : null,
-        sourceItemId: item.id, sourceNativeClassification: 'rising'
+        sourceItemId: item.id, sourceNativeClassification: 'rising',
+        geography: item.geography || null, geographyConfidence: item.geography_confidence || null, dataStatus: item.data_status
       });
     }
     for (const q of top) {
@@ -42,7 +43,8 @@ function rawCandidatesFromSearch(searchItems) {
       raw.push({
         rawText: q.query, normalizedKey: normalizeKey(q.query), sourceType: 'dataforseo_trends',
         matchType: 'top_query', metricType: 'top_value', metricValue: typeof q.value === 'number' ? q.value : null,
-        sourceItemId: item.id, sourceNativeClassification: 'top'
+        sourceItemId: item.id, sourceNativeClassification: 'top',
+        geography: item.geography || null, geographyConfidence: item.geography_confidence || null, dataStatus: item.data_status
       });
     }
   }
@@ -58,7 +60,8 @@ function rawCandidatesFromPinterest(pinterestItems) {
       rawText: term, normalizedKey: normalizeKey(term), sourceType: 'apify_pinterest',
       matchType: 'pinterest_trend', metricType: 'pinterest_rank',
       metricValue: typeof item.raw_metrics?.rank === 'number' ? item.raw_metrics.rank : null,
-      sourceItemId: item.id, sourceNativeClassification: item.raw_metrics?.trendType || null
+      sourceItemId: item.id, sourceNativeClassification: item.raw_metrics?.trendType || null,
+      geography: item.geography || null, geographyConfidence: item.geography_confidence || null, dataStatus: item.data_status
     });
   }
   return raw;
@@ -94,7 +97,8 @@ function socialCandidatesFor(theme, socialItemsByPlatform) {
         members: [{
           sourceItemId: item.id, sourceType: platform, matchType: 'social_post',
           metricType: null, metricValue: null, sourceNativeClassification: null, author: item.author || null,
-          publishedAt: item.published_at || null
+          publishedAt: item.published_at || null,
+          geography: item.geography || null, geographyConfidence: item.geography_confidence || null, dataStatus: item.data_status
         }]
       });
     }

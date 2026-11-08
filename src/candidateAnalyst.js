@@ -26,6 +26,8 @@
 const ANTHROPIC_API_BASE = 'https://api.anthropic.com/v1/messages';
 const MODEL = process.env.ANTHROPIC_MODEL || 'claude-haiku-4-5-20251001';
 const { PRODUCTS } = require('./products');
+const suitabilityConfig = require('./suitabilityConfig');
+const { validateEligibilityBlock } = require('./eligibility');
 
 const PRODUCT_NAMES = new Set(PRODUCTS.map((p) => p.name));
 const VALID_CLASSIFICATIONS = new Set(['macro', 'micro', 'seasonal']);
@@ -47,7 +49,14 @@ const SOURCE_LABELS = { apify_reddit: 'Reddit post', apify_tiktok: 'TikTok post'
 function formatMember(m) {
   const metric = m.metricValue != null ? `, ${m.metricType}=${m.metricValue}` : '';
   const label = SOURCE_LABELS[m.sourceType] || m.sourceType;
-  return `    - [evidenceId ${m.sourceItemId}] ${label} (${m.matchType}${metric})`;
+  // Stage 4 (IMPLEMENTATION_CHECKLIST.md): geography is shown so Claude can
+  // judge "could this translate to an Australian audience" honestly --
+  // "unknown" is a real, distinct state from "confirmed Australian", never
+  // collapsed into one or the other.
+  const geo = m.geography
+    ? ` [geography: ${m.geography}, ${m.geographyConfidence === 'confirmed' ? 'confirmed' : 'unconfirmed'}]`
+    : ' [geography: unknown]';
+  return `    - [evidenceId ${m.sourceItemId}] ${label} (${m.matchType}${metric})${geo}`;
 }
 
 function formatCandidate(c) {
@@ -93,8 +102,30 @@ Respond with ONLY a single valid JSON array (no markdown fences, no prose before
     "format": "e.g. Short-form how-to video, Written recipe post, Carousel",
     "creativeAngle": "the specific hook or execution idea"
   },
+  "eligibility": {
+    "verdict": "eligible" | "rejected" | "uncertain",
+    "reasonCode": "product_mismatch" | "audience_mismatch" | "too_generic" | "too_late" | null,
+    "explanation": "1-2 sentences -- required whenever verdict is \\"rejected\\" or \\"uncertain\\", must be null when verdict is \\"eligible\\""
+  },
   "evidenceIds": [<real evidenceId numbers from the candidate(s) this assessment covers>]
 }
+
+Eligibility judgment -- this is a SEPARATE, equally important job from the rest of the assessment above. Use SunRice's suitability standard below:
+- Primary market: ${suitabilityConfig.primaryMarket}. Primary audiences: ${suitabilityConfig.primaryAudiences.join(', ')}.
+- Accepted occasions: ${suitabilityConfig.acceptedOccasions.join('; ')}.
+- Product connection standard: ${suitabilityConfig.productConnectionStandard}
+- Generic-advice standard: ${suitabilityConfig.genericAdviceStandard}
+- International trends: ${suitabilityConfig.internationalTrendsPolicy}
+- Excluded entirely: ${suitabilityConfig.excludedTopics.join('; ')}.
+
+Reason codes YOU may use (reject or mark uncertain with exactly one of these):
+- product_mismatch: no credible connection to a real SunRice product or rice-based occasion, OR the connection only works if the original trend is changed into something it isn't.
+- audience_mismatch: outside the audience/market/brand suitability standard above. Do NOT use this reason just because an evidence item's geography is non-Australian or unconfirmed -- judge only whether the underlying behaviour could translate to an Australian audience (see the international trends policy above).
+- too_generic: evergreen advice with no specific new development, angle, or evidence of rising interest -- a real, on-brand topic is not enough on its own.
+- too_late: the trend has clearly already peaked or passed its relevant window, based only on what the evidence actually shows (never invent a timeline).
+- verdict "uncertain": use this, with no reasonCode, whenever you are genuinely not confident enough to call eligible or rejected -- never force a confident-sounding verdict you don't actually have evidence for.
+- verdict "eligible": the normal case when none of the above applies. reasonCode and explanation must both be null.
+Do NOT use "already_covered" or "insufficient_evidence" -- those are decided deterministically by code, not by you.
 
 How to use clusterKeys -- THIS IS WHERE YOU DO REAL ANALYTICAL WORK, not just restate the input:
 - One candidate normally maps to one clusterKey.
@@ -185,6 +216,14 @@ function validateAssessment(raw, clusterKeyToMembers) {
       format: proposedAction.format ? String(proposedAction.format).slice(0, 120) : null,
       creativeAngle: proposedAction.creativeAngle ? String(proposedAction.creativeAngle).slice(0, 300) : null
     },
+    // Stage 4 (IMPLEMENTATION_CHECKLIST.md): a missing/malformed eligibility
+    // block degrades to 'uncertain' here (see validateEligibilityBlock),
+    // never to a fabricated 'eligible' -- this is deliberately NOT a reason
+    // to reject the whole assessment (real evidence/scoring/Emerging
+    // visibility shouldn't be lost over a formatting hiccup in one
+    // sub-object); reportBuilder.js is what actually keeps an 'uncertain'
+    // candidate out of the recommendation feed.
+    eligibility: validateEligibilityBlock(raw.eligibility),
     evidenceIds
   };
 }

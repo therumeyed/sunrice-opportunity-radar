@@ -17,7 +17,7 @@ matter for how this system actually decides what to recommend.
 | Pinterest trend terms + rank/trendType | Yes | `source_items` | Candidate extraction, `sourceNativeClassification` ('growing' flag feeds `hasMomentumCorroboration`) | Since Pinterest integration | rank/count have no confirmed scale -- never used numerically, only the categorical flag |
 | Google News articles | Yes | `source_items` | Corroboration only, by design -- never a candidate source | Since launch | Working as intended |
 | `geography` | Yes, where a source gives it | `source_items.geography` | Signal display only | N/A | Was previously undifferentiated (any string looked equally trustworthy) |
-| `geography_confidence` **(new, Stage 2)** | Derived, not collected | `source_items.geography_confidence` | Not read anywhere yet | Since Stage 2 | Set to `'confirmed'` only for DataForSEO's AU-targeted queries; every social/news item stays `null` (genuinely unknown) rather than inheriting the dashboard's AU default. Ready for Stage 4's eligibility filter to consult |
+| `geography_confidence` **(new, Stage 2)** | Derived, not collected | `source_items.geography_confidence` | **Stage 4:** shown on every evidence line in Claude's eligibility prompt (`candidateAnalyst.js`'s `formatMember`), so "could this translate to an Australian audience" can be judged honestly instead of assumed | Since Stage 2 | Set to `'confirmed'` only for DataForSEO's AU-targeted queries; every social/news item stays `null` (genuinely unknown) rather than inheriting the dashboard's AU default |
 | `content_format` **(new, Stage 2)** | Derived, not collected | `source_items.content_format` | Not read anywhere yet | Since Stage 2 | Only set where certain: `'video'` for every TikTok item. Reddit/Instagram left `null` -- their raw payload shape hasn't actually been inspected against a live Apify run, so guessing a field name would be worse than leaving it unknown |
 | `content_hash` dedup | Yes | Unique constraint `(source_type, content_hash)` | Prevents same-source duplicates at ingest | Permanent | Within-source only |
 | `possible_reposts` **(new, Stage 2)** | Derived, not collected | `possible_reposts` table | Not read by scoring -- detection/storage only | Since Stage 2 | Cross-source near-identical-text flag (`src/repostDetection.js`, threshold 0.9), scoped to candidates Claude already merged into one assessment -- does NOT yet scan across the whole report for reposts that landed in different candidate groups. A flag, never a merge -- creators are never conflated |
@@ -34,16 +34,16 @@ matter for how this system actually decides what to recommend.
 | `action_fingerprint` | Yes | `recommendations`, `ideas`, `recommendation_feedback` | Continuity, suppression, Idea Tracker identity | Since launch | Working as intended |
 | `baseline_snapshots` **(new, Stage 1)** | Computed on demand | `baseline_snapshots`, append-only | `POST /admin/baseline`, `GET /api/baseline` | One real snapshot captured 2026-11-08 | Stage 9 compares later snapshots against this one |
 | `src/products.js` catalogue | Partially verified (10 of 66 products) | `src/products.js` | `candidateAnalyst.js`'s product-fit validation, (future) Stage 5 brand-fit scoring | Verified 2026-11-08 for 10 representative products across every real site category; the rest are best-effort URL/category matches, `uses: null` | `verified: false` entries' `uses` must never be treated as a real site claim -- see the file's own header |
+| `rejected_candidates` **(new, Stage 4)** | Derived, not collected | `rejected_candidates` | `GET /admin/rejected-candidates` (audit, admin-only), `baseline.js`'s `productMismatchRate`/`genericRecommendationRate`, Stage 4's own reason-aware resurfacing check | Since Stage 4 | `verdict` distinguishes a confident `rejected` from `uncertain` (Claude's own read wasn't confident) -- both are kept out of the feed, but only `uncertain` rows are what Stage 8's human review queue is specifically for |
+| `recommendations.resurfacing_note` **(new, Stage 4)** | Derived, not collected | `recommendations.resurfacing_note` | Displayed on the recommendation itself (`resurfacingNote` in the API) | Since Stage 4 | Null in the normal case (never previously rejected) -- set only when a prior rejection's bar was genuinely cleared |
 
 ## Known gaps carried forward (not yet closed)
 
 - **No acceleration/2nd-derivative signal anywhere in scoring** --
   `microtrend_social_signals` stores the raw material (Stage 6 reads it).
 - **No review-queue-derived signal** -- `usefulCandidatesIncorrectlyRejectedRate`
-  in the baseline stays `unavailable` until Stage 8 ships.
-- **No mismatch-reason-code-derived signal** -- `productMismatchRate`/
-  `genericRecommendationRate` in the baseline stay `unavailable` until
-  Stage 7 ships.
+  in the baseline stays `unavailable` until Stage 8 ships (`rejected_candidates`'
+  `uncertain` rows are the raw material Stage 8's queue will read).
 - **Repost detection is scoped to already-merged candidate groups** --
   it does not (yet) scan across the whole report for a repost whose two
   copies landed in different candidate groups entirely.
