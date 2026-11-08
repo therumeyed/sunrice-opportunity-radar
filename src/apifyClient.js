@@ -42,6 +42,24 @@ async function getDatasetItems(datasetId) {
   return res.json();
 }
 
+// Apify's own run.statusMessage is frequently empty for a crashed actor
+// (the actor's own uncaught exception never gets surfaced there) -- the
+// run's plain-text log is where the real reason actually lives. Only the
+// tail is kept: the run just ended, so the crash/exception line is almost
+// always there, and this keeps the error readable in Source health's alert
+// detail instead of dumping a full log into it.
+async function getRunLogTail(runId) {
+  try {
+    const token = process.env.APIFY_TOKEN;
+    const res = await fetchWithTimeout(`${APIFY_API_BASE}/actor-runs/${runId}/log?token=${token}`);
+    if (!res.ok) return null;
+    const log = (await res.text()).trim();
+    return log ? log.slice(-800) : null;
+  } catch {
+    return null; // never let a log-fetch failure mask the original error
+  }
+}
+
 // Returns { items, runId, datasetId, actorId, inputHash } -- callers store
 // the run/dataset ids alongside every derived source_item per the brief's
 // "record actor ID, run ID, dataset ID and input hash" requirement.
@@ -49,7 +67,10 @@ async function runActor(actorId, input) {
   const run = await startRun(actorId, input);
   const finished = await waitForRun(run.id);
   if (finished.status !== 'SUCCEEDED') {
-    throw new Error(`Apify actor ${actorId} run ended ${finished.status}: ${finished.statusMessage || 'no message'}`);
+    const detail = finished.statusMessage || await getRunLogTail(finished.id);
+    throw new Error(
+      `Apify actor ${actorId} run ended ${finished.status}: ${detail || 'no message, and no log tail available'} (run ${finished.id})`
+    );
   }
   const items = await getDatasetItems(finished.defaultDatasetId);
   return { items, runId: finished.id, datasetId: finished.defaultDatasetId, actorId };
