@@ -2,10 +2,11 @@ const {
   pool, insertSignal, insertRecommendation, linkEvidence,
   upsertThemeSnapshot, getPriorThemeSnapshots, getRecentRecommendationsForMicrotrend, getSameDayRecommendations,
   upsertMicrotrend, getMicrotrendObservationHistory, recordMicrotrendObservation, linkMicrotrendEvidence,
-  getMicrotrendSocialEvidenceHistory, recordMicrotrendSocialSignal,
+  getMicrotrendSocialEvidenceHistory, recordMicrotrendSocialSignal, recordPossibleRepost,
   updateMicrotrendScore, setMicrotrendStatus, getActiveExclusions, getPositiveFeedbackExamples,
   countRecentMicrotrendRecommendations, getMicrotrendEvidence, setReportAiStatus, ensureIdeaExists
 } = require('./db');
+const { detectPossibleReposts } = require('./repostDetection');
 const { ALL_TOPICS, evergreenBaselinesForTheme } = require('./topics');
 const { scoreOpportunity, confidenceFor, actionTypeFor } = require('./scoring');
 const { themeLifecycleFor } = require('./themeLifecycle');
@@ -259,6 +260,18 @@ async function processThemeAssessments(opp, assessments, rawCandidateByClusterKe
     const isSocialOnly = allMembers.every((m) => isSocialSourceType(m.sourceType));
     const socialMembersToday = allMembers.filter((m) => isSocialSourceType(m.sourceType));
     const distinctCreatorCount = new Set(socialMembersToday.map((m) => m.author).filter(Boolean)).size;
+
+    // Stage 2 (IMPLEMENTATION_CHECKLIST.md): flag, never merge, a possible
+    // repost across different platforms within this merged group --
+    // storage only, nothing here changes distinctCreatorCount or any
+    // score. Each social candidate carries its own real verbatim text as
+    // sourceWording (socialCandidatesFor), exactly one member each.
+    const socialCandidateTexts = referencedCandidates
+      .filter((c) => c.members.length === 1 && isSocialSourceType(c.members[0].sourceType))
+      .map((c) => ({ sourceItemId: c.members[0].sourceItemId, sourceType: c.members[0].sourceType, text: c.sourceWording }));
+    for (const flag of detectPossibleReposts(socialCandidateTexts)) {
+      await recordPossibleRepost(flag.sourceItemIdA, flag.sourceItemIdB, flag.similarity);
+    }
     const evidenceBasis = isSocialOnly ? 'social' : socialMembersToday.length > 0 ? 'mixed' : 'search';
     const fullHistory = await getMicrotrendObservationHistory(microtrend.id);
     const priorHistory = fullHistory.filter((h) => new Date(h.report_date).toISOString().slice(0, 10) < reportDate);
@@ -763,7 +776,7 @@ async function buildCandidateRecommendation({ reportId, rank, opp, winner, repor
   // regardless, for the Emerging section / audit.
   const microtrendEvidence = await getMicrotrendEvidence(microtrend.id, reportId);
   const cited = microtrendEvidence.filter((e) => assessment.evidenceIds.includes(e.id));
-  await linkDiverseEvidence(rec.id, cited.length > 0 ? cited : microtrendEvidence);
+  await linkDiverseEvidence(rec.id, cited.length > 0 ? cited : microtrendEvidence, assessment.productConnection);
 
   return rec;
 }
@@ -771,7 +784,7 @@ async function buildCandidateRecommendation({ reportId, rank, opp, winner, repor
 // Shared "up to one piece of evidence per contributing source_type, most
 // recent first" diversity rule -- used by every recommendation kind so the
 // evidence drawer never shows 5x the same platform.
-async function linkDiverseEvidence(recommendationId, items) {
+async function linkDiverseEvidence(recommendationId, items, productConnection) {
   const seenTypes = new Set();
   const evidenceToLink = [];
   for (const item of items) {
@@ -784,7 +797,7 @@ async function linkDiverseEvidence(recommendationId, items) {
     evidenceToLink.push(item);
   }
   for (const item of evidenceToLink) {
-    await linkEvidence(recommendationId, item.id, null);
+    await linkEvidence(recommendationId, item.id, null, productConnection);
   }
 }
 

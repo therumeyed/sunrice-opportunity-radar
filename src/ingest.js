@@ -34,6 +34,7 @@ async function cachedFallbackForTrends(theme, query, providerRunId, reportDate) 
     queryOrTopic: query,
     theme,
     geography: 'Australia',
+    geographyConfidence: 'confirmed',
     normalizedMetrics: prev.normalized_metrics,
     dataStatus: 'cached',
     rawPayload: prev.raw_payload,
@@ -84,6 +85,7 @@ async function collectTrends(report, reportDate) {
           queryOrTopic: query,
           theme: topic.theme,
           geography: 'Australia',
+          geographyConfidence: 'confirmed',
           normalizedMetrics: result.data,
           dataStatus: 'live',
           rawPayload: result.rawPayload,
@@ -193,7 +195,12 @@ async function collectSocial(report, reportDate, sinceDate) {
           theme: item.theme,
           rawMetrics: item.rawMetrics,
           dataStatus: 'live',
-          rawPayload: item.rawPayload
+          rawPayload: item.rawPayload,
+          // TikTok is the one source where the format is a certainty
+          // from the platform itself, never a guess at an unconfirmed
+          // raw-payload field -- every other source stays unset until
+          // its own raw shape has actually been inspected.
+          contentFormat: platform.sourceType === 'apify_tiktok' ? 'video' : null
         });
       }
     }

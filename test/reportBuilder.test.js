@@ -830,4 +830,55 @@ describe('report generation from fixture evidence (DB-backed)', { skip }, () => 
       assert.equal(signalRes.rowCount, 0, 'a purely-search microtrend must never get a hollow all-zero social signal row');
     });
   });
+
+  describe('Stage 2: repost detection and per-evidence product linkage', () => {
+    test('a near-identical caption across two platforms gets flagged, never merged, and never counted twice toward evidence', async () => {
+      const report = await db.getOrCreateReport(TODAY);
+      const caption = 'Air frying leftover rice into crispy bites, kids loved it';
+      await insertSocialPost(report.id, { theme: 'lunchbox_snacks', sourceType: 'apify_reddit', contentHash: 'fixture-repost-1', excerpt: caption, author: 'alice' });
+      await insertSocialPost(report.id, { theme: 'lunchbox_snacks', sourceType: 'apify_tiktok', contentHash: 'fixture-repost-2', excerpt: caption, author: 'bob' });
+      candidateAnalyst.analyzeCandidates = mergeAllForTheme('lunchbox_snacks', {
+        candidateName: 'Air fryer rice bites', productConnection: ['SunRice Sushi Rice']
+      });
+
+      await buildReport(report.id, TODAY);
+
+      const flagRes = await db.pool.query('SELECT * FROM possible_reposts');
+      assert.equal(flagRes.rowCount, 1, 'the near-identical caption across platforms must be flagged');
+      assert.ok(Number(flagRes.rows[0].similarity) >= 0.9);
+
+      const microtrendRow = (await db.pool.query(
+        `SELECT m.* FROM microtrends m WHERE m.theme = 'lunchbox_snacks'`
+      )).rows[0];
+      assert.ok(microtrendRow, 'expected a lunchbox_snacks microtrend');
+      const stillTwoRealPosts = await db.pool.query(
+        'SELECT COUNT(DISTINCT source_item_id)::int AS count FROM microtrend_evidence WHERE microtrend_id = $1',
+        [microtrendRow.id]
+      );
+      assert.equal(stillTwoRealPosts.rows[0].count, 2, 'flagging a possible repost must never delete or merge either real evidence row');
+    });
+
+    test('product_connection propagates from the assessment onto the recommendation\'s linked evidence', async () => {
+      const report = await db.getOrCreateReport(TODAY);
+      const run = await db.recordProviderRun(report.id, { providerName: 'DataForSEO', sourceType: 'dataforseo_trends', status: 'live' });
+      await db.upsertSourceItem({
+        providerRunId: run.id, sourceType: 'dataforseo_trends', sourceName: 'DataForSEO',
+        contentHash: 'fixture-product-link-1', title: 'sushi rice', queryOrTopic: 'sushi rice', theme: 'sushi_asian',
+        normalizedMetrics: { relatedQueries: { rising: [{ query: 'air fryer sushi rice bowl', value: 80 }] } },
+        dataStatus: 'live'
+      });
+      candidateAnalyst.analyzeCandidates = autoAssessAll({
+        candidateName: 'Air fryer sushi rice bowls', productConnection: ['SunRice Sushi Rice']
+      });
+
+      await buildReport(report.id, TODAY);
+      const bundle = await db.getReportBundle(report);
+      const rec = bundle.recommendations.find((r) => r.theme === 'sushi_asian');
+      assert.ok(rec, 'expected a sushi_asian recommendation');
+      assert.ok(rec.evidence.length > 0);
+      for (const e of rec.evidence) {
+        assert.deepEqual(e.product_connection, ['SunRice Sushi Rice']);
+      }
+    });
+  });
 });

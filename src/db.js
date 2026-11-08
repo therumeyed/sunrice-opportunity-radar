@@ -89,6 +89,16 @@ async function initSchema() {
       UNIQUE(source_type, content_hash)
     );
     CREATE INDEX IF NOT EXISTS idx_source_items_theme ON source_items(theme);
+    -- Stage 2 (IMPLEMENTATION_CHECKLIST.md): geography_confidence tells a
+    -- reader whether geography is a real, confirmed fact (DataForSEO's
+    -- AU-targeted query) or genuinely unknown (a social post or article
+    -- with no verified location) -- never silently treated as "probably
+    -- Australian" just because that's this dashboard's default focus.
+    -- content_format is set only where the source itself guarantees it
+    -- (TikTok is always video); everywhere else it stays null rather than
+    -- guessing at an unconfirmed raw-payload field shape.
+    ALTER TABLE source_items ADD COLUMN IF NOT EXISTS geography_confidence TEXT CHECK (geography_confidence IN ('confirmed', 'unknown'));
+    ALTER TABLE source_items ADD COLUMN IF NOT EXISTS content_format TEXT;
     CREATE INDEX IF NOT EXISTS idx_source_items_collected ON source_items(collected_at);
 
     -- One row per topic/platform rollup shown in the Search demand and
@@ -294,6 +304,25 @@ async function initSchema() {
     );
     CREATE INDEX IF NOT EXISTS idx_microtrend_social_signals_microtrend ON microtrend_social_signals(microtrend_id);
 
+    -- Stage 2 (IMPLEMENTATION_CHECKLIST.md): a possible repost across
+    -- DIFFERENT platforms, flagged by near-identical text -- never a
+    -- conclusive finding, and never merged/deduped automatically.
+    -- source_item_id_a is always the smaller id (enforced by the
+    -- detector, not the DB) so the same real pair can never be stored
+    -- twice in reversed order. Detection/storage only right now -- see
+    -- src/repostDetection.js's own header for why this doesn't touch
+    -- distinctCreatorCount or any score yet.
+    CREATE TABLE IF NOT EXISTS possible_reposts (
+      id SERIAL PRIMARY KEY,
+      source_item_id_a INTEGER NOT NULL REFERENCES source_items(id) ON DELETE CASCADE,
+      source_item_id_b INTEGER NOT NULL REFERENCES source_items(id) ON DELETE CASCADE,
+      similarity NUMERIC NOT NULL,
+      detected_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      UNIQUE(source_item_id_a, source_item_id_b)
+    );
+    CREATE INDEX IF NOT EXISTS idx_possible_reposts_a ON possible_reposts(source_item_id_a);
+    CREATE INDEX IF NOT EXISTS idx_possible_reposts_b ON possible_reposts(source_item_id_b);
+
     -- Additive: the daily recommendation unit is now a microtrend, not a
     -- theme directly. microtrend_id is nullable -- the fixed multicultural
     -- disclaimer path (recommendation_kind = 'theme_disclaimer') never had
@@ -420,6 +449,14 @@ async function initSchema() {
       note TEXT
     );
     CREATE INDEX IF NOT EXISTS idx_rec_evidence_rec ON recommendation_evidence(recommendation_id);
+    -- Stage 2 (IMPLEMENTATION_CHECKLIST.md): which of the recommendation's
+    -- own real productConnection names this specific piece of evidence
+    -- supports -- a snapshot of Claude's assessment-level product
+    -- judgment, propagated down onto each linked evidence row, not a new
+    -- per-evidence judgment Claude was separately asked to make. Null
+    -- means the recommendation itself claimed no product connection (an
+    -- empty productConnection array), never "unknown".
+    ALTER TABLE recommendation_evidence ADD COLUMN IF NOT EXISTS product_connection JSONB;
 
     CREATE TABLE IF NOT EXISTS topic_definitions (
       id SERIAL PRIMARY KEY,
@@ -546,9 +583,9 @@ async function upsertSourceItem(item) {
   const res = await pool.query(
     `INSERT INTO source_items
        (provider_run_id, source_type, source_name, source_url, external_id, content_hash,
-        title, excerpt, author, published_at, query_or_topic, theme, geography,
-        raw_metrics, normalized_metrics, data_status, raw_payload)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
+        title, excerpt, author, published_at, query_or_topic, theme, geography, geography_confidence,
+        raw_metrics, normalized_metrics, data_status, raw_payload, content_format)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
      ON CONFLICT (source_type, content_hash) DO NOTHING
      RETURNING *`,
     [
@@ -565,10 +602,15 @@ async function upsertSourceItem(item) {
       item.queryOrTopic || null,
       item.theme || null,
       item.geography || null,
+      // Confirmed only when geography itself is a real, sourced fact --
+      // never defaulted to 'confirmed' just because a geography string
+      // happens to be present (callers must set both or neither).
+      item.geography ? (item.geographyConfidence || 'unknown') : null,
       item.rawMetrics ? JSON.stringify(item.rawMetrics) : null,
       item.normalizedMetrics ? JSON.stringify(item.normalizedMetrics) : null,
       item.dataStatus,
-      item.rawPayload ? JSON.stringify(item.rawPayload) : null
+      item.rawPayload ? JSON.stringify(item.rawPayload) : null,
+      item.contentFormat || null
     ]
   );
   if (res.rowCount > 0) return res.rows[0];
@@ -1365,10 +1407,10 @@ async function getPositiveFeedbackExamples(theme, limit = 5) {
   return res.rows;
 }
 
-async function linkEvidence(recommendationId, sourceItemId, note) {
+async function linkEvidence(recommendationId, sourceItemId, note, productConnection) {
   await pool.query(
-    `INSERT INTO recommendation_evidence (recommendation_id, source_item_id, note) VALUES ($1,$2,$3)`,
-    [recommendationId, sourceItemId, note || null]
+    `INSERT INTO recommendation_evidence (recommendation_id, source_item_id, note, product_connection) VALUES ($1,$2,$3,$4)`,
+    [recommendationId, sourceItemId, note || null, productConnection && productConnection.length > 0 ? JSON.stringify(productConnection) : null]
   );
 }
 
@@ -1382,7 +1424,7 @@ async function getReportBundle(report) {
   let evidenceByRec = new Map();
   if (recIds.length > 0) {
     const evRes = await pool.query(
-      `SELECT re.recommendation_id, re.note, si.*
+      `SELECT re.recommendation_id, re.note, re.product_connection, si.*
        FROM recommendation_evidence re
        JOIN source_items si ON si.id = re.source_item_id
        WHERE re.recommendation_id = ANY($1)
@@ -1418,6 +1460,29 @@ async function getReportBundle(report) {
   };
 }
 
+async function recordPossibleRepost(sourceItemIdA, sourceItemIdB, similarity) {
+  const res = await pool.query(
+    `INSERT INTO possible_reposts (source_item_id_a, source_item_id_b, similarity)
+     VALUES ($1, $2, $3)
+     ON CONFLICT (source_item_id_a, source_item_id_b) DO UPDATE SET similarity = EXCLUDED.similarity
+     RETURNING *`,
+    [sourceItemIdA, sourceItemIdB, similarity]
+  );
+  return res.rows[0];
+}
+
+// Every flag touching any of these source_item_ids, in either column --
+// a reader asking "is this evidence item possibly a repost of something
+// else" needs both directions checked.
+async function getPossibleRepostsForSourceItems(sourceItemIds) {
+  if (!sourceItemIds || sourceItemIds.length === 0) return [];
+  const res = await pool.query(
+    `SELECT * FROM possible_reposts WHERE source_item_id_a = ANY($1) OR source_item_id_b = ANY($1)`,
+    [sourceItemIds]
+  );
+  return res.rows;
+}
+
 async function recordBaselineSnapshot(metrics, notes) {
   const res = await pool.query(
     `INSERT INTO baseline_snapshots (metrics, notes) VALUES ($1, $2) RETURNING *`,
@@ -1441,6 +1506,8 @@ module.exports = {
   recordBaselineSnapshot,
   getLatestBaselineSnapshot,
   getAllBaselineSnapshots,
+  recordPossibleRepost,
+  getPossibleRepostsForSourceItems,
   DATA_STATUSES,
   initSchema,
   initSchemaWithRetry,

@@ -47,14 +47,42 @@ token where it expected Basic auth). Fixed by moving `ADMIN_TOKEN`/
 verified live, both gates now compose correctly. See README section 6a/7.
 
 ## Stage 2: Evidence-store additions, catalogue enrichment, data-use audit
-**Status:** pending
+**Status:** done
 
-- [ ] `source_items.geography_confidence`, `content_format` columns (additive)
-- [ ] Cross-source repost detection (flags, never merges/conflates creators)
-- [ ] Per-evidence product linkage
-- [ ] `products.js` enriched with category/format/uses/url/verifiedAt/provenance,
-      inferred vs verified clearly distinguished
-- [ ] Data-use audit committed to the repo as a living file
+- [x] `source_items.geography_confidence`, `content_format` columns (additive).
+      `geography_confidence` is `'confirmed'` only for DataForSEO's real
+      AU-targeted queries, `null` everywhere else (never inherited as
+      "probably Australian"). `content_format` is set to `'video'` only
+      for TikTok (the one source where it's a certainty, not a guess);
+      Reddit/Instagram stay `null` until their raw payload shape is
+      actually inspected
+- [x] Cross-source repost detection (`src/repostDetection.js`,
+      `possible_reposts` table) -- flags near-identical text (0.9 token-
+      overlap threshold, deliberately much stricter than the 0.75 used
+      for "same idea" clustering) across different platforms, never
+      merges candidates or conflates creators. **Known scope limit:**
+      only checks within candidates Claude already merged into one
+      assessment, not across the whole report -- see DATA_USE_AUDIT.md
+- [x] Per-evidence product linkage (`recommendation_evidence.product_connection`)
+      -- a snapshot of the recommendation's own real `productConnection`,
+      propagated onto each linked evidence row
+- [x] `products.js` enriched: real URLs for 65/66 products (1 genuinely
+      ambiguous, flagged `url: null`) and real categories for all 66,
+      matched against the site's own actual category taxonomy
+      (discovered via sitemap.xml, since the listing GRID is client-
+      rendered but individual product pages are not) -- `uses` populated
+      with real, fetched, verified text for 10 representative products
+      spanning every category; the other 56 stay `uses: null`, never
+      inferred or guessed. `verified`/`verifiedAt` fields distinguish the two
+- [x] Data-use audit committed to the repo as `DATA_USE_AUDIT.md`
+
+**Verification:** `test/repostDetection.test.js` (5/5) proves reposts are
+flagged only across platforms on near-identical text, never for merely-
+similar independent posts, and never merge/delete anything.
+`test/reportBuilder.test.js`'s new Stage 2 suite (2/2) proves the flag
+persists end-to-end through a real report build without destroying
+either evidence row, and that `product_connection` reaches the
+recommendation's actual linked evidence. Full suite: 242/242.
 
 ## Stage 3: Monitoring and failure visibility
 **Status:** pending

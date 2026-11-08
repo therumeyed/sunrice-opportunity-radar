@@ -224,6 +224,9 @@ async function serializeBundle(bundle) {
         collectedAt: e.collected_at,
         queryOrTopic: e.query_or_topic,
         geography: e.geography,
+        geographyConfidence: e.geography_confidence,
+        contentFormat: e.content_format,
+        productConnection: e.product_connection || [],
         rawMetrics: e.raw_metrics,
         normalizedMetrics: e.normalized_metrics,
         dataStatus: e.data_status
