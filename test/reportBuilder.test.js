@@ -13,6 +13,7 @@
 const { test, describe, before, after, beforeEach } = require('node:test');
 const assert = require('node:assert/strict');
 const { computeSunriceFit } = require('../src/sunriceFit');
+const { themeReviewFlags } = require('../src/feedback');
 
 const TEST_DATABASE_URL = process.env.TEST_DATABASE_URL;
 const skip = !TEST_DATABASE_URL ? 'set TEST_DATABASE_URL to a scratch database to run this suite' : false;
@@ -145,14 +146,14 @@ describe('report generation from fixture evidence (DB-backed)', { skip }, () => 
   beforeEach(async () => {
     candidateAnalyst.analyzeCandidates = realAnalyzeCandidates; // undo any stub a previous test set
     delete process.env.ANTHROPIC_API_KEY;
-    await db.pool.query(`TRUNCATE TABLE rejected_candidates, fit_contradictions, idea_status_history, ideas, recommendation_feedback, recommendation_evidence, recommendations,
+    await db.pool.query(`TRUNCATE TABLE rejected_candidates, fit_contradictions, theme_exclusions, idea_status_history, ideas, recommendation_feedback, recommendation_evidence, recommendations,
       microtrend_evidence, microtrend_observations, microtrends,
       signals, theme_daily_snapshots, source_items, provider_runs, reports RESTART IDENTITY CASCADE`);
   });
 
   after(async () => {
     candidateAnalyst.analyzeCandidates = realAnalyzeCandidates;
-    await db.pool.query(`TRUNCATE TABLE rejected_candidates, fit_contradictions, idea_status_history, ideas, recommendation_feedback, recommendation_evidence, recommendations,
+    await db.pool.query(`TRUNCATE TABLE rejected_candidates, fit_contradictions, theme_exclusions, idea_status_history, ideas, recommendation_feedback, recommendation_evidence, recommendations,
       microtrend_evidence, microtrend_observations, microtrends,
       signals, theme_daily_snapshots, source_items, provider_runs, reports RESTART IDENTITY CASCADE`);
     await db.pool.end();
@@ -1301,6 +1302,136 @@ describe('report generation from fixture evidence (DB-backed)', { skip }, () => 
         'SELECT * FROM microtrend_social_signals WHERE microtrend_id = $1 ORDER BY report_id ASC', [m.id]
       );
       assert.equal(signalHistory.rowCount, 8, 'one real row per real day -- never duplicated, never collapsed');
+    });
+  });
+
+  // Stage 7 (IMPLEMENTATION_CHECKLIST.md): the UI collapses to Relevant/
+  // Not relevant; "Not relevant" now carries a reason_code shared with
+  // Claude's own eligibility taxonomy, and is scoped to the exact
+  // recommendation rather than the whole microtrend (see the pre-existing
+  // "not_relevant feedback hides a microtrend" test above for the
+  // legacy, no-reason_code behaviour this leaves untouched).
+  describe('Stage 7: reason-coded feedback, theme exclusions, and review flags', () => {
+    test('a reason-coded not_relevant vote blocks only the exact recommendation -- a genuinely different angle on the same microtrend still wins', async () => {
+      const yesterday = new Date(Date.now() - 86400000);
+      const yesterdayStr = melbourneDateString(yesterday);
+
+      const report1 = await db.getOrCreateReport(yesterdayStr);
+      const run1 = await db.recordProviderRun(report1.id, { providerName: 'DataForSEO', sourceType: 'dataforseo_trends', status: 'live' });
+      const item1 = await db.upsertSourceItem({
+        providerRunId: run1.id, sourceType: 'dataforseo_trends', sourceName: 'DataForSEO',
+        contentHash: 'fixture-stage7-fp-1', title: 'curry', queryOrTopic: 'curry', theme: 'curry_night',
+        normalizedMetrics: { relatedQueries: { rising: [{ query: 'slow cooker curry kits', value: 70 }], top: [] } },
+        dataStatus: 'live'
+      });
+      await db.pool.query('UPDATE source_items SET collected_at = $1 WHERE id = $2', [yesterday, item1.id]);
+
+      candidateAnalyst.analyzeCandidates = autoAssessAll({ candidateName: 'Slow cooker curry kits', creativeAngle: 'A 60-second slow-cooker demo' });
+      await buildReport(report1.id, yesterdayStr);
+      const bundle1 = await db.getReportBundle(report1);
+      const rec1 = bundle1.recommendations.find((r) => r.theme === 'curry_night');
+      assert.ok(rec1, 'expected a curry_night recommendation on day 1');
+
+      await db.insertFeedback({
+        recommendationId: rec1.id, microtrendId: rec1.microtrend_id, actionFingerprint: rec1.action_fingerprint,
+        feedbackType: 'not_relevant', reasonCode: 'too_late'
+      });
+
+      const report2 = await db.getOrCreateReport(TODAY);
+      const run2 = await db.recordProviderRun(report2.id, { providerName: 'DataForSEO', sourceType: 'dataforseo_trends', status: 'live' });
+      await db.upsertSourceItem({
+        providerRunId: run2.id, sourceType: 'dataforseo_trends', sourceName: 'DataForSEO',
+        contentHash: 'fixture-stage7-fp-2', title: 'curry', queryOrTopic: 'curry', theme: 'curry_night',
+        normalizedMetrics: { relatedQueries: { rising: [{ query: 'slow cooker curry kits', value: 95 }], top: [] } },
+        dataStatus: 'live'
+      });
+
+      // Same underlying microtrend, but a genuinely different creative
+      // angle -- a different action_fingerprint, per too_late's own
+      // "affects timing only" scope.
+      candidateAnalyst.analyzeCandidates = autoAssessAll({ candidateName: 'Slow cooker curry kits', creativeAngle: 'A side-by-side taste test' });
+      const result2 = await buildReport(report2.id, TODAY);
+      assert.equal(result2.recommendationsCreated, 1, 'a genuinely different angle on the same microtrend must still be eligible to win');
+      const bundle2 = await db.getReportBundle(report2);
+      const rec2 = bundle2.recommendations.find((r) => r.theme === 'curry_night');
+      assert.ok(rec2, 'the new angle must have won a slot -- not_relevant never blocked the whole microtrend this time');
+      assert.notEqual(rec2.action_fingerprint, rec1.action_fingerprint);
+    });
+
+    test('an explicit theme exclusion produces nothing for that theme, and reversing it resumes normal processing with no repair needed', async () => {
+      const report = await db.getOrCreateReport(TODAY);
+      const run = await db.recordProviderRun(report.id, { providerName: 'DataForSEO', sourceType: 'dataforseo_trends', status: 'live' });
+      await db.upsertSourceItem({
+        providerRunId: run.id, sourceType: 'dataforseo_trends', sourceName: 'DataForSEO',
+        contentHash: 'fixture-theme-exclusion-1', title: 'sushi', queryOrTopic: 'sushi', theme: 'sushi_asian',
+        normalizedMetrics: { relatedQueries: { rising: [{ query: 'air fryer sushi bake', value: 80 }], top: [] } },
+        dataStatus: 'live'
+      });
+
+      const exclusion = await db.excludeTheme('sushi_asian', 'Temporary pause while a campaign clashes');
+      assert.ok(exclusion.id);
+      assert.ok((await db.getActiveExcludedThemes()).has('sushi_asian'));
+
+      candidateAnalyst.analyzeCandidates = autoAssessAll({ candidateName: 'Air fryer sushi bake' });
+      await buildReport(report.id, TODAY);
+
+      const bundle1 = await db.getReportBundle(report);
+      assert.equal(bundle1.recommendations.find((r) => r.theme === 'sushi_asian'), undefined, 'an excluded theme must produce no recommendation');
+      assert.equal(bundle1.signals.find((s) => s.theme === 'sushi_asian'), undefined, 'an excluded theme must produce no signal either -- treated as if there were no evidence at all');
+
+      await db.reverseThemeExclusion(exclusion.id);
+      assert.equal((await db.getActiveExcludedThemes()).has('sushi_asian'), false);
+
+      await buildReport(report.id, TODAY); // same-day rebuild -- the only thing that changed is the exclusion
+      const bundle2 = await db.getReportBundle(report);
+      assert.ok(bundle2.recommendations.find((r) => r.theme === 'sushi_asian'), 'once reversed, the very next build resumes normally with no special repair');
+    });
+
+    test('3 distinct not_relevant decisions, same theme and reason, flag the theme for review -- but never auto-exclude it', async () => {
+      const microtrend = await db.upsertMicrotrend({
+        theme: 'curry_night', normalizedKey: 'fixture-review-flag-curry', displayName: 'Fixture review-flag candidate',
+        sourceWording: 'Fixture review-flag candidate', candidateType: 'micro', observedDate: TODAY, semanticMerges: []
+      });
+
+      for (const fp of ['fp-review-1', 'fp-review-2']) {
+        await db.insertFeedback({ microtrendId: microtrend.id, actionFingerprint: fp, feedbackType: 'not_relevant', reasonCode: 'product_mismatch' });
+      }
+      let flags = themeReviewFlags(await db.getNotRelevantFeedbackForReview());
+      assert.equal(flags.find((f) => f.theme === 'curry_night' && f.reasonCode === 'product_mismatch'), undefined, 'only 2 distinct decisions so far -- must not flag yet');
+
+      await db.insertFeedback({ microtrendId: microtrend.id, actionFingerprint: 'fp-review-3', feedbackType: 'not_relevant', reasonCode: 'product_mismatch' });
+      flags = themeReviewFlags(await db.getNotRelevantFeedbackForReview());
+      const flag = flags.find((f) => f.theme === 'curry_night' && f.reasonCode === 'product_mismatch');
+      assert.ok(flag, 'expected a review flag once a 3rd distinct decision landed');
+      assert.equal(flag.distinctCount, 3);
+
+      // A soft signal only -- reaching the threshold must never itself
+      // exclude the theme. Only the separate, explicit admin action does.
+      assert.equal((await db.getActiveExcludedThemes()).has('curry_night'), false);
+    });
+
+    test('a relevant vote creates no exclusion -- the same recommendation can still win again', async () => {
+      const report1 = await db.getOrCreateReport(TODAY);
+      const run1 = await db.recordProviderRun(report1.id, { providerName: 'DataForSEO', sourceType: 'dataforseo_trends', status: 'live' });
+      await db.upsertSourceItem({
+        providerRunId: run1.id, sourceType: 'dataforseo_trends', sourceName: 'DataForSEO',
+        contentHash: 'fixture-relevant-1', title: 'lunchbox', queryOrTopic: 'lunchbox', theme: 'lunchbox_snacks',
+        normalizedMetrics: { relatedQueries: { rising: [{ query: 'rice cake lunchbox stackers', value: 65 }], top: [] } },
+        dataStatus: 'live'
+      });
+      candidateAnalyst.analyzeCandidates = autoAssessAll({ candidateName: 'Rice cake lunchbox stackers' });
+      await buildReport(report1.id, TODAY);
+      const bundle1 = await db.getReportBundle(report1);
+      const rec1 = bundle1.recommendations.find((r) => r.theme === 'lunchbox_snacks');
+      assert.ok(rec1);
+
+      await db.insertFeedback({ recommendationId: rec1.id, microtrendId: rec1.microtrend_id, actionFingerprint: rec1.action_fingerprint, feedbackType: 'relevant' });
+
+      await buildReport(report1.id, TODAY); // same-day rebuild
+      const bundle2 = await db.getReportBundle(report1);
+      const rec2 = bundle2.recommendations.find((r) => r.theme === 'lunchbox_snacks');
+      assert.ok(rec2, 'a relevant vote must never suppress anything');
+      assert.equal(rec2.action_fingerprint, rec1.action_fingerprint);
     });
   });
 });

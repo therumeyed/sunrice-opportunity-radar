@@ -764,6 +764,76 @@ day) -- only a candidate that also carries search/Pinterest evidence (a
 stable, text-based identity) can accumulate the multi-day history this
 lifecycle needs. Pre-existing, not something this stage changed.
 
+## 5h. Feedback: Relevant/Not relevant, and reason-specific exclusion (Stage 7)
+
+The feedback UI on every priority card is now 2 buttons: **Relevant** and
+**Not relevant**. The 4 older buttons (Useful, Already covered, Not
+relevant, Don't show again) are gone from the UI, but every value they
+ever wrote (`useful`/`already_covered`/`dont_show_again`) stays valid in
+the database forever and keeps displaying under its original meaning in
+the Hidden & covered manager and Idea Tracker -- old feedback is never
+rewritten or reinterpreted.
+
+**Relevant** folds "Useful" in without carrying its old weight: Useful
+used to double as a style/execution endorsement, feeding
+`getPositiveFeedbackExamples` as a real example of a channel/angle that's
+worked before. `relevant` is a separate, lighter-weight type that is
+never read by that function -- the historical `useful` rows keep feeding
+it exactly as before, frozen with their original meaning; `relevant`
+contributes no exclusion and no style signal, just a positive note.
+
+**Not relevant** now requires a reason, and that reason is one of the
+same 6 codes Claude's own eligibility gate uses (`src/eligibility.js`'s
+`REASON_CODES`: product mismatch, audience mismatch, too generic, already
+covered, too late, insufficient evidence) -- not a free-text list.
+Picking **Already covered** reveals the same "where does it already
+live" URL/status fields the old standalone button used to show, since
+that's now a reason, not a separate verdict.
+
+A reason-coded Not-relevant vote is scoped to the **exact
+recommendation** (its `action_fingerprint`), never the whole microtrend:
+it's removed from the active feed now, and an unchanged duplicate of that
+same proposal is blocked later, but a genuinely different angle on the
+same real trend is never blocked by it. This is deliberately true for
+every reason, including the two the brief calls out specifically --
+**too late** (that proposal's timing was wrong; a later, different
+proposal on the same trend isn't blocked) and **already covered** (that
+proposal's repetition is the problem; a different angle isn't blocked) --
+fingerprint scoping already makes both statements true without any
+separate expiry logic.
+
+A vote given before this stage shipped (no `reason_code` -- the column
+didn't exist yet) keeps its original, broader meaning: it still hides the
+whole microtrend, exactly as it always did. The database can't tell "an
+old vote" from "a new vote with no reason" any other way, so this is the
+one signal that distinguishes them, and it's read, never guessed.
+
+**Soft signal, never an automatic ban:** every reason-coded Not-relevant
+vote is also raw material for `themeReviewFlags` (`src/feedback.js`) --
+once **3 distinct recommendation decisions** (never repeated clicks on
+one decision) land on the **same theme and same reason** within **60
+days**, that combination shows up at `GET /admin/theme-review-flags`
+(admin-gated, no UI yet). Nothing is excluded just by crossing that
+threshold -- it's a flag for a human to look at.
+
+**Explicit theme exclusions** are the only thing that actually removes a
+whole theme, and it's always a deliberate, separate, admin-only step,
+never an automatic consequence of feedback:
+
+```bash
+curl -X POST -H "X-Admin-Token: <ADMIN_TOKEN>" -H "Content-Type: application/json" \
+  -d '{"theme":"curry_night","reason":"Paused during a campaign clash"}' \
+  https://<your-service>.onrender.com/admin/theme-exclusions
+
+curl -X POST -H "X-Admin-Token: <ADMIN_TOKEN>" \
+  https://<your-service>.onrender.com/admin/theme-exclusions/<id>/reverse
+```
+
+An excluded theme produces literally nothing on the next build -- no
+signal, no snapshot, no candidate, same as a day with zero real evidence
+-- and reversing it needs no repair: the very next build just evaluates
+that theme normally again.
+
 ## 6. Deploy to Render
 
 `render.yaml` provisions a web service, a daily cron job (ingestion), and

@@ -470,6 +470,42 @@ async function initSchema() {
     ALTER TABLE recommendation_feedback DROP CONSTRAINT IF EXISTS recommendation_feedback_recommendation_id_fkey;
     ALTER TABLE recommendation_feedback ADD CONSTRAINT recommendation_feedback_recommendation_id_fkey
       FOREIGN KEY (recommendation_id) REFERENCES recommendations(id) ON DELETE SET NULL;
+    -- Stage 7 (IMPLEMENTATION_CHECKLIST.md): the UI collapses to Relevant/
+    -- Not relevant -- 'relevant' is the new, lighter-weight positive verdict
+    -- ("useful" folds into it without implying style/execution endorsement);
+    -- the 4 old values stay valid forever so historical rows never need
+    -- rewriting and keep their original meaning.
+    ALTER TABLE recommendation_feedback DROP CONSTRAINT IF EXISTS recommendation_feedback_feedback_type_check;
+    ALTER TABLE recommendation_feedback ADD CONSTRAINT recommendation_feedback_feedback_type_check
+      CHECK (feedback_type IN ('useful','relevant','already_covered','not_relevant','dont_show_again'));
+    -- Structured reason, shared with Claude's own eligibility gate
+    -- (src/eligibility.js's REASON_CODES) -- null on every pre-Stage-7 row,
+    -- which is exactly what tells deriveExclusions() to keep an old
+    -- not_relevant vote under its original, broader meaning rather than
+    -- silently reinterpreting it under the new, narrower rule.
+    ALTER TABLE recommendation_feedback ADD COLUMN IF NOT EXISTS reason_code TEXT
+      CHECK (reason_code IN ('product_mismatch','audience_mismatch','too_generic','already_covered','too_late','insufficient_evidence'));
+
+    -- Stage 7 (IMPLEMENTATION_CHECKLIST.md): "explicit theme exclusions --
+    -- admin-only action, reversible". A genuinely separate mechanism from
+    -- feedback-derived exclusion: one not_relevant vote (any reason) only
+    -- ever removes the exact recommendation that was voted on, never the
+    -- whole theme -- excluding a whole theme is always this deliberate,
+    -- explicit, auditable step, never an automatic consequence of
+    -- accumulated feedback (see themeReviewFlags, src/feedback.js, which
+    -- only ever surfaces a flag for a human to act on here). At most one
+    -- ACTIVE exclusion per theme (the partial unique index below); past,
+    -- reversed exclusions are kept for the audit trail, same reversed_at
+    -- convention as recommendation_feedback.
+    CREATE TABLE IF NOT EXISTS theme_exclusions (
+      id SERIAL PRIMARY KEY,
+      theme TEXT NOT NULL,
+      reason TEXT,
+      excluded_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      reversed_at TIMESTAMPTZ
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_theme_exclusions_active_theme
+      ON theme_exclusions(theme) WHERE reversed_at IS NULL;
 
     -- Idea Tracker: one row per stable action_fingerprint, not one row per
     -- daily appearance -- appearance history (first/last_recommended_at,
@@ -1397,11 +1433,11 @@ async function getRecommendationById(id) {
 // rejected with a clear 400 rather than a raw constraint-violation error.
 async function insertFeedback(feedback) {
   const res = await pool.query(
-    `INSERT INTO recommendation_feedback (recommendation_id, microtrend_id, action_fingerprint, feedback_type, reason, existing_content_url, note, content_status)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
+    `INSERT INTO recommendation_feedback (recommendation_id, microtrend_id, action_fingerprint, feedback_type, reason, reason_code, existing_content_url, note, content_status)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *`,
     [
       feedback.recommendationId, feedback.microtrendId || null, feedback.actionFingerprint || null,
-      feedback.feedbackType, feedback.reason || null, feedback.existingContentUrl || null,
+      feedback.feedbackType, feedback.reason || null, feedback.reasonCode || null, feedback.existingContentUrl || null,
       feedback.note || null, feedback.contentStatus || null
     ]
   );
@@ -1441,12 +1477,10 @@ async function listActiveFeedback(feedbackTypes = null) {
   return res.rows;
 }
 
-// The 3 deterministic exclusion rules (brief section 8) as one query,
-// called once per report build rather than once per candidate --
-// not_relevant excludes the whole microtrend cluster; dont_show_again and
-// already_covered both key off action_fingerprint (the specific proposed
-// angle), not the underlying trend, so a genuinely different angle on the
-// same real trend is never blocked by either.
+// The deterministic exclusion rules (brief section 8, revised Stage 7) as
+// one query, called once per report build rather than once per candidate
+// -- see src/feedback.js's deriveExclusions for exactly what each
+// feedback_type/reason_code combination does.
 // Unions two independently-sourced exclusion signals: feedback-derived
 // ones (deriveExclusions, from recommendation_feedback) and workflow-
 // derived ones -- an idea marked `implemented` suppresses its own
@@ -1456,12 +1490,72 @@ async function listActiveFeedback(feedbackTypes = null) {
 // not to permanently hide it).
 async function getActiveExclusions() {
   const feedbackRes = await pool.query(
-    `SELECT feedback_type, microtrend_id, action_fingerprint FROM recommendation_feedback WHERE reversed_at IS NULL`
+    `SELECT feedback_type, microtrend_id, action_fingerprint, reason_code FROM recommendation_feedback WHERE reversed_at IS NULL`
   );
   const exclusions = deriveExclusions(feedbackRes.rows);
   const implementedRes = await pool.query(`SELECT action_fingerprint FROM ideas WHERE workflow_status = 'implemented'`);
   for (const row of implementedRes.rows) exclusions.suppressedFingerprints.add(row.action_fingerprint);
   return exclusions;
+}
+
+// Stage 7: every real theme currently under an explicit, admin-set
+// exclusion -- read once per report build (src/reportBuilder.js), before
+// any evidence for that theme is even looked at, so an excluded theme
+// produces literally nothing that day (no signal, no snapshot, no
+// candidate) rather than being filtered out after the fact.
+async function getActiveExcludedThemes() {
+  const res = await pool.query(`SELECT theme FROM theme_exclusions WHERE reversed_at IS NULL`);
+  return new Set(res.rows.map((r) => r.theme));
+}
+
+async function getThemeExclusions() {
+  const res = await pool.query(`SELECT * FROM theme_exclusions ORDER BY excluded_at DESC`);
+  return res.rows;
+}
+
+// Admin-only, explicit, reversible (src/server.js's requireAdmin) -- never
+// called automatically by anything in this file. ON CONFLICT targets the
+// partial unique index (idx_theme_exclusions_active_theme): re-excluding
+// an already-actively-excluded theme is a no-op rather than a duplicate
+// row, same "at most one active row" discipline as source_health_alerts.
+async function excludeTheme(theme, reason) {
+  const res = await pool.query(
+    `INSERT INTO theme_exclusions (theme, reason) VALUES ($1, $2)
+     ON CONFLICT (theme) WHERE reversed_at IS NULL DO NOTHING RETURNING *`,
+    [theme, reason || null]
+  );
+  if (res.rows[0]) return res.rows[0];
+  const existing = await pool.query(`SELECT * FROM theme_exclusions WHERE theme = $1 AND reversed_at IS NULL`, [theme]);
+  return existing.rows[0] || null;
+}
+
+async function reverseThemeExclusion(id) {
+  const res = await pool.query(
+    `UPDATE theme_exclusions SET reversed_at = now() WHERE id = $1 AND reversed_at IS NULL RETURNING *`,
+    [id]
+  );
+  return res.rows[0] || null;
+}
+
+// Stage 7: raw material for src/feedback.js's themeReviewFlags -- every
+// active not_relevant vote that carries a real reason_code (pre-Stage-7
+// votes never do, and are correctly left out of this tally -- see
+// deriveExclusions' own comment on why those keep their original, broader
+// meaning instead). theme is read the same COALESCE(rec.theme, m.theme)
+// way listActiveFeedback already does, so a same-day report rebuild
+// (which can null out recommendation_id) never drops a row from the tally.
+async function getNotRelevantFeedbackForReview() {
+  const res = await pool.query(
+    `SELECT COALESCE(rec.theme, m.theme) AS theme, f.reason_code, f.action_fingerprint, f.recommendation_id, f.created_at
+     FROM recommendation_feedback f
+     LEFT JOIN recommendations rec ON rec.id = f.recommendation_id
+     LEFT JOIN microtrends m ON m.id = f.microtrend_id
+     WHERE f.feedback_type = 'not_relevant' AND f.reversed_at IS NULL AND f.reason_code IS NOT NULL`
+  );
+  return res.rows.map((r) => ({
+    theme: r.theme, reasonCode: r.reason_code, actionFingerprint: r.action_fingerprint,
+    recommendationId: r.recommendation_id, createdAt: r.created_at
+  }));
 }
 
 // Ensures a row exists for this action_fingerprint so the Idea Tracker has
@@ -1902,6 +1996,11 @@ module.exports = {
   restoreFeedback,
   listActiveFeedback,
   getActiveExclusions,
+  getActiveExcludedThemes,
+  getThemeExclusions,
+  excludeTheme,
+  reverseThemeExclusion,
+  getNotRelevantFeedbackForReview,
   getPositiveFeedbackExamples,
   ensureIdeaExists,
   getIdeaByFingerprint,

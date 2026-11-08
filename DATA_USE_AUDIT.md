@@ -29,7 +29,8 @@ matter for how this system actually decides what to recommend.
 | `source_health_alerts` **(new, Stage 3)** | Derived, not collected | `source_health_alerts` | In-app admin alerts, email trigger, the public evidence-outage notice (names no source, just a boolean) | Since Stage 3 | At most one OPEN row per (source_type, alert_type) by construction (partial unique index) -- a repeat firing bumps the existing row, never creates a duplicate |
 | `microtrend_observations` (daily score/classification per source) | Yes | `microtrend_observations`, append-only per report | `scoreMicrotrend`'s velocity input, material-change checks | Since microtrend discovery shipped | Working as intended |
 | `microtrend_social_signals` (new posts/creators/platforms/dateable/recent) | Yes | `microtrend_social_signals`, append-only per report | **Stage 6:** `new_post_count` history now feeds `candidateLifecycleFor`'s social-direction check (`src/candidateLifecycle.js`) -- the other columns (creators/platforms/dateable/recent) are still unread | Since the momentum round | First real read happened this stage, once enough history existed to make it meaningful |
-| `recommendation_feedback` | Yes | `recommendation_feedback` | Exclusion rules (`deriveExclusions`), "useful" style examples shown to Claude | Since feedback system shipped | 4 types today, not the Relevant/Not-relevant split -- Stage 7. No feedback-to-scoring numeric loop yet |
+| `recommendation_feedback` | Yes | `recommendation_feedback` | Exclusion rules (`deriveExclusions`), "useful" style examples shown to Claude | Since feedback system shipped | **Stage 7:** UI now only writes `relevant`/`not_relevant`; the 3 older values (`useful`/`already_covered`/`dont_show_again`) stay valid forever for historical rows but are no longer written. `useful`'s style-examples read is unchanged and still scoped to just that value -- `relevant` never joins it. No feedback-to-scoring numeric loop yet |
+| `recommendation_feedback.reason_code` **(new, Stage 7)** | Derived, not collected | `recommendation_feedback` | `deriveExclusions` (exclusion scope -- see below), `themeReviewFlags`'s 3-strikes tally, `GET /admin/theme-review-flags` | Since Stage 7 | Null on every row given before this stage -- that null is itself the signal `deriveExclusions` reads to keep an old `not_relevant` vote under its original, broader (whole-microtrend) meaning rather than the new, narrower (fingerprint-only) one |
 | `ideas.workflow_status` | Yes | `ideas` | Idea Tracker | Since Idea Tracker shipped | Already correctly separate from `feedback_type` -- no change needed |
 | `action_fingerprint` | Yes | `recommendations`, `ideas`, `recommendation_feedback` | Continuity, suppression, Idea Tracker identity | Since launch | Working as intended |
 | `baseline_snapshots` **(new, Stage 1)** | Computed on demand | `baseline_snapshots`, append-only | `POST /admin/baseline`, `GET /api/baseline` | One real snapshot captured 2026-11-08 | Stage 9 compares later snapshots against this one |
@@ -39,6 +40,7 @@ matter for how this system actually decides what to recommend.
 | `microtrends.sunrice_fit_*` / `recommendations.sunrice_fit_*` **(new, Stage 5)** | Derived, not collected | `microtrends`, `recommendations` | Displayed on every priority/Emerging card and the evidence drawer (`sunriceFit` in the API); `detectFitEligibilityContradiction`'s input | Since Stage 5 | Stored on `microtrends` for EVERY observed candidate regardless of outcome (same "store now" reasoning as `last_score`); `recommendations`' copy is a write-time snapshot, never recomputed later |
 | `fit_contradictions` **(new, Stage 5)** | Derived, not collected | `fit_contradictions` | `GET /admin/fit-contradictions` (audit, admin-only) | Since Stage 5 | Scoped to the one component that overlaps both Stage 4 and Stage 5's primary question -- product connection -- the only place a disagreement between the two stages is actually meaningful to compare |
 | `microtrends.candidate_lifecycle` / `recommendations.candidate_lifecycle` / `recommendations.urgency_note` **(new, Stage 6)** | Derived, not collected | `microtrends`, `recommendations` | Displayed on every priority/Emerging card and the evidence drawer (`candidateLifecycle`/`urgencyNote` in the API), explicitly labelled as the idea's own trend, not the theme's | Since Stage 6 | Stored on `microtrends` for every observed candidate (same "store now" reasoning as `last_score`/`sunrice_fit_*`); `recommendations`' copy is a write-time snapshot, never recomputed later |
+| `theme_exclusions` **(new, Stage 7)** | Derived, not collected | `theme_exclusions` | `src/reportBuilder.js` checks the active set before producing any evidence for a theme; `GET`/`POST /admin/theme-exclusions*` (admin-only) | Since Stage 7 | The only thing that removes a whole theme -- always an explicit, reversible admin action, never an automatic consequence of feedback. At most one active row per theme (partial unique index); reversed rows are kept for the audit trail |
 
 ## Known gaps carried forward (not yet closed)
 
@@ -54,6 +56,13 @@ matter for how this system actually decides what to recommend.
 - `microtrend_social_signals`' creator/platform/dateable/recent counts
   are still unread by anything -- only `new_post_count` feeds Stage 6's
   social direction check so far.
+- **`themeReviewFlags`' distinct-decision count needs a stable key** --
+  it falls back to the recommendation's own id only when no
+  `action_fingerprint` ever existed; a row with neither is skipped from
+  the tally rather than risk double- or under-counting it (rare in
+  practice -- `recommendation_feedback` stores `microtrend_id`/
+  `action_fingerprint` directly specifically so this almost never
+  happens, same reasoning as `deriveExclusions`).
 - **No review-queue-derived signal** -- `usefulCandidatesIncorrectlyRejectedRate`
   in the baseline stays `unavailable` until Stage 8 ships (`rejected_candidates`'
   `uncertain` rows are the raw material Stage 8's queue will read).

@@ -3,7 +3,7 @@ const {
   upsertThemeSnapshot, getPriorThemeSnapshots, getRecentRecommendationsForMicrotrend, getSameDayRecommendations,
   upsertMicrotrend, getMicrotrendObservationHistory, recordMicrotrendObservation, linkMicrotrendEvidence,
   getMicrotrendSocialEvidenceHistory, recordMicrotrendSocialSignal, getMicrotrendSocialSignalHistory, recordPossibleRepost,
-  updateMicrotrendScore, setMicrotrendStatus, getActiveExclusions, getPositiveFeedbackExamples,
+  updateMicrotrendScore, setMicrotrendStatus, getActiveExclusions, getActiveExcludedThemes, getPositiveFeedbackExamples,
   countRecentMicrotrendRecommendations, getMicrotrendEvidence, setReportAiStatus, ensureIdeaExists,
   getEvidenceSourceItemIdsForRecommendation, recordRejectedCandidate, getLatestRejectionForMicrotrend,
   recordFitContradiction
@@ -562,9 +562,17 @@ async function buildReport(reportId, reportDate) {
   const opportunities = [];
   // Fetched once per build, not once per candidate.
   const exclusions = await getActiveExclusions();
+  // Stage 7 (IMPLEMENTATION_CHECKLIST.md): explicit, admin-set theme
+  // exclusions -- checked before any evidence for that theme is even
+  // looked at, so an excluded theme produces literally nothing this run
+  // (no signal, no snapshot, no candidate) for as long as it stays
+  // excluded, and reversing it needs no repair -- the very next build
+  // just evaluates that theme normally again.
+  const excludedThemes = await getActiveExcludedThemes();
 
   for (const topic of ALL_TOPICS) {
     const theme = topic.theme;
+    if (excludedThemes.has(theme)) continue;
     const searchItems = items.filter((i) => i.source_type === 'dataforseo_trends' && i.theme === theme);
     const socialItemsByPlatform = {
       reddit: items.filter((i) => i.source_type === 'apify_reddit' && i.theme === theme),

@@ -3,60 +3,115 @@
 // for an LLM to infer a hidden "brand preference profile" from. Every
 // function here is pure so the suppression logic is fully auditable and
 // testable without a database.
+//
+// Stage 7 (IMPLEMENTATION_CHECKLIST.md): the UI collapses to 2 verdicts --
+// Relevant / Not relevant -- and "Not relevant" now carries a structured
+// reason_code from the SAME taxonomy Claude's own eligibility gate uses
+// (src/eligibility.js's REASON_CODES), rather than a free-text reason list.
+// This is what "reason-specific integration" means: human feedback and
+// Claude's own rejections now speak one shared vocabulary.
+const { REASON_CODES } = require('./eligibility');
 
-// Fixed, editable reason lists per feedback type -- shown as dropdown
-// options in the UI rather than a free-text field alone, so feedback stays
-// structured enough to aggregate later. `note` is always still accepted
-// alongside a reason for anything a fixed list doesn't capture.
+// All feedback_type values the database has ever stored, including the
+// pre-Stage-7 ones -- kept so historical rows (useful/already_covered/
+// dont_show_again) keep displaying and filtering correctly under their
+// original meaning. WRITABLE_FEEDBACK_TYPES below is the much narrower set
+// the API actually accepts going forward.
+const FEEDBACK_TYPES = ['useful', 'relevant', 'already_covered', 'not_relevant', 'dont_show_again'];
+
+// Going forward, only these two verdicts are ever written. "Useful" folds
+// into "Relevant" at the UI level -- a lighter-weight positive signal that
+// deliberately does NOT feed the style/execution examples
+// getPositiveFeedbackExamples hands to Claude (that stays scoped to the
+// historical 'useful' rows alone, frozen with their original meaning,
+// never joined by 'relevant'). "Already covered" and "Don't show again"
+// fold into "Not relevant" + a reason_code of 'already_covered' --  the
+// same structured reason, not a separate verdict.
+const WRITABLE_FEEDBACK_TYPES = ['relevant', 'not_relevant'];
+
+// Legacy free-text reason lists -- kept only so old rows (given before
+// Stage 7) keep rendering their original reason text in the Hidden &
+// covered manager and Idea Tracker. Never used by the current write path.
 const REASONS_BY_TYPE = {
   useful: [],
+  relevant: [],
   already_covered: ['Published on blog', 'Covered in EDM', 'Already in content calendar', 'Covered on social'],
   not_relevant: ['Not on-brand', 'Too niche for our audience', 'Not aligned with current strategy', "Doesn't fit our products"],
   dont_show_again: ['Already tried, did not work', 'Not on-brand', 'Too niche', 'Low commercial value']
 };
 
-const FEEDBACK_TYPES = Object.keys(REASONS_BY_TYPE);
+// Human-readable labels for the 6 structured reason codes, shown in the
+// "Not relevant" reason dropdown -- same codes src/eligibility.js's
+// CLAUDE_REASON_CODES/REASON_CODES use, so a theme's human rejections and
+// Claude's own rejections can be compared on equal footing.
+const NOT_RELEVANT_REASON_LABELS = {
+  product_mismatch: "Doesn't fit our products",
+  audience_mismatch: 'Not right for our audience',
+  too_generic: 'Too generic -- no fresh angle',
+  already_covered: 'Already covered',
+  too_late: 'Too late -- the moment has passed',
+  insufficient_evidence: "Not convinced this is real"
+};
 
 // already_covered additionally captures where the existing content lives --
-// the brief's own fields for this feedback type -- which the other 3 types
-// have no use for.
-function requiresContentDetails(feedbackType) {
-  return feedbackType === 'already_covered';
+// the brief's own fields for this feedback type -- which nothing else has
+// a use for. Checked against reasonCode too, now that already_covered is
+// reachable as a not_relevant reason as well as its own legacy type.
+function requiresContentDetails(feedbackType, reasonCode) {
+  return feedbackType === 'already_covered' || (feedbackType === 'not_relevant' && reasonCode === 'already_covered');
 }
 
 /**
  * @returns {{valid: boolean, error?: string}}
  */
 function validateFeedbackInput(feedbackType, payload = {}) {
-  if (!FEEDBACK_TYPES.includes(feedbackType)) {
-    return { valid: false, error: `Unknown feedback_type "${feedbackType}" -- must be one of ${FEEDBACK_TYPES.join(', ')}` };
+  if (!WRITABLE_FEEDBACK_TYPES.includes(feedbackType)) {
+    return { valid: false, error: `Unknown feedback_type "${feedbackType}" -- must be one of ${WRITABLE_FEEDBACK_TYPES.join(', ')}` };
   }
-  if (feedbackType === 'already_covered' && payload.contentStatus && !['planned', 'published'].includes(payload.contentStatus)) {
-    return { valid: false, error: 'content_status must be "planned" or "published"' };
-  }
-  const allowedReasons = REASONS_BY_TYPE[feedbackType];
-  if (allowedReasons.length > 0 && payload.reason && !allowedReasons.includes(payload.reason) && payload.reason !== 'Other') {
-    return { valid: false, error: `reason must be one of ${allowedReasons.join(', ')}, or "Other" with a note` };
-  }
-  if (payload.reason === 'Other' && !payload.note) {
-    return { valid: false, error: '"Other" requires a note explaining why' };
+  if (feedbackType === 'not_relevant') {
+    if (!payload.reasonCode || !REASON_CODES.includes(payload.reasonCode)) {
+      return { valid: false, error: `reasonCode is required for not_relevant and must be one of ${REASON_CODES.join(', ')}` };
+    }
+    if (payload.reasonCode === 'already_covered' && payload.contentStatus && !['planned', 'published'].includes(payload.contentStatus)) {
+      return { valid: false, error: 'content_status must be "planned" or "published"' };
+    }
   }
   return { valid: true };
 }
 
-// The 3 deterministic exclusion rules (brief): not_relevant hides the
-// whole microtrend cluster -- the topic itself isn't relevant, no angle on
-// it should resurface. already_covered and dont_show_again both key off
-// action_fingerprint (the specific proposed angle: products + channel +
-// format + creative angle for this theme), not the underlying microtrend --
-// a genuinely different angle on the same real microtrend is never blocked
-// by either. useful contributes no exclusion at all; it's a positive
-// signal only (see getPositiveFeedbackExamples / summarizeUsefulFeedback).
+// The exclusion rules (brief section 8, revised Stage 7): not_relevant now
+// carries a reason_code and is scoped to the exact recommendation (its
+// action_fingerprint) -- "the exact recommendation is removed from the
+// active feed; an unchanged duplicate is blocked", never the whole
+// microtrend. A too_late vote and an already_covered vote are both scoped
+// this way for the same reason: too_late is about THIS proposal's timing
+// (a later, genuinely different proposal on the same real trend isn't
+// blocked by it), and already_covered is about THIS proposal's repetition
+// (a genuinely different angle isn't blocked either) -- fingerprint-level
+// suppression is exactly what makes both of those true at once, without
+// inventing separate expiry machinery for either.
+//
+// A not_relevant row given BEFORE Stage 7 (reason_code is null, since the
+// column didn't exist yet) keeps its original, broader meaning -- the
+// whole topic wasn't relevant -- rather than being silently reinterpreted
+// under the new, narrower rule just because the code changed underneath it.
+//
+// already_covered and dont_show_again (the old standalone types) keep
+// their original fingerprint-scoped behaviour unchanged. relevant and
+// useful contribute no exclusion at all; relevant is a pure positive
+// signal, useful's historical meaning is untouched.
 function deriveExclusions(activeFeedbackRows) {
   const hiddenMicrotrendIds = new Set();
   const suppressedFingerprints = new Set();
   for (const row of activeFeedbackRows) {
-    if (row.feedback_type === 'not_relevant' && row.microtrend_id) hiddenMicrotrendIds.add(row.microtrend_id);
+    if (row.feedback_type === 'not_relevant') {
+      if (row.reason_code) {
+        if (row.action_fingerprint) suppressedFingerprints.add(row.action_fingerprint);
+        else if (row.microtrend_id) hiddenMicrotrendIds.add(row.microtrend_id); // no fingerprint ever existed -- nothing finer to suppress
+      } else if (row.microtrend_id) {
+        hiddenMicrotrendIds.add(row.microtrend_id); // pre-Stage-7 vote -- original whole-topic meaning preserved
+      }
+    }
     if (row.feedback_type === 'dont_show_again' || row.feedback_type === 'already_covered') {
       if (row.action_fingerprint) {
         suppressedFingerprints.add(row.action_fingerprint);
@@ -114,8 +169,53 @@ function needsBrandPreferenceReview(usefulCount, lastReviewedCount = 0) {
   return (usefulCount - lastReviewedCount) >= BRAND_PREFERENCE_REVIEW_BATCH_SIZE;
 }
 
+// Stage 7 (IMPLEMENTATION_CHECKLIST.md): "3 distinct rejected
+// recommendations, same narrow theme, same reason, within 60 days ->
+// flags the theme for admin review (never auto-hard-bans)". A soft,
+// aggregated signal only -- nothing here suppresses anything; it's read by
+// an admin-only endpoint (GET /admin/theme-review-flags) and acting on it
+// (src/db.js's theme_exclusions) is always a separate, deliberate, human
+// step.
+//
+// Counts DISTINCT recommendation decisions, never repeated clicks on the
+// same one: grouped by action_fingerprint when one exists (the specific
+// proposed angle), falling back to the recommendation's own id only when
+// no fingerprint was ever generated for it (no API key, a failed call) --
+// never by raw row count, so undoing and re-voting on the same
+// recommendation, or two feedback rows that are really the same decision,
+// can't inflate the tally. Rows with no reason_code (pre-Stage-7 votes, or
+// anything with neither a fingerprint nor a recommendation id to key on)
+// are skipped -- there is nothing stable to de-duplicate on, and inventing
+// a count would be exactly the kind of fabricated precision this system
+// avoids elsewhere.
+const THEME_REVIEW_WINDOW_DAYS = 60;
+const THEME_REVIEW_THRESHOLD = 3;
+function themeReviewFlags(notRelevantRows, { windowDays = THEME_REVIEW_WINDOW_DAYS, threshold = THEME_REVIEW_THRESHOLD } = {}) {
+  const cutoff = Date.now() - windowDays * 86400000;
+  const decisionsByGroup = new Map();
+  for (const row of notRelevantRows) {
+    if (!row.reasonCode || !row.theme) continue;
+    if (new Date(row.createdAt).getTime() < cutoff) continue;
+    const decisionKey = row.actionFingerprint || (row.recommendationId ? `rec:${row.recommendationId}` : null);
+    if (!decisionKey) continue;
+    const groupKey = `${row.theme}::${row.reasonCode}`;
+    if (!decisionsByGroup.has(groupKey)) decisionsByGroup.set(groupKey, new Set());
+    decisionsByGroup.get(groupKey).add(decisionKey);
+  }
+  const flags = [];
+  for (const [groupKey, decisions] of decisionsByGroup) {
+    if (decisions.size >= threshold) {
+      const [theme, reasonCode] = groupKey.split('::');
+      flags.push({ theme, reasonCode, distinctCount: decisions.size });
+    }
+  }
+  return flags.sort((a, b) => b.distinctCount - a.distinctCount);
+}
+
 module.exports = {
-  FEEDBACK_TYPES, REASONS_BY_TYPE, requiresContentDetails, validateFeedbackInput,
+  FEEDBACK_TYPES, WRITABLE_FEEDBACK_TYPES, REASONS_BY_TYPE, NOT_RELEVANT_REASON_LABELS,
+  requiresContentDetails, validateFeedbackInput,
   deriveExclusions, applyExclusions, summarizeUsefulFeedback,
-  BRAND_PREFERENCE_REVIEW_BATCH_SIZE, needsBrandPreferenceReview
+  BRAND_PREFERENCE_REVIEW_BATCH_SIZE, needsBrandPreferenceReview,
+  THEME_REVIEW_WINDOW_DAYS, THEME_REVIEW_THRESHOLD, themeReviewFlags
 };

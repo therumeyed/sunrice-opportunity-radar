@@ -397,20 +397,103 @@ for the same underlying theme.
   but weren't individually screenshotted.
 
 ## Stage 7: Feedback interface and reason-specific integration
-**Status:** pending
+**Status:** done
 
-- [ ] UI collapsed to Relevant / Not relevant; Useful folds into Relevant
-      without implying style/execution endorsement; historical Useful
-      examples preserved with their original meaning
-- [ ] One Not-relevant vote: exact recommendation removed from the active
-      feed, unchanged duplicates blocked
-- [ ] One vote also creates a soft, reason-specific signal (not a ban)
-- [ ] 3 distinct rejected recommendations, same narrow theme, same reason,
-      within 60 days -> flags the theme for admin review (never
-      auto-hard-bans)
-- [ ] Explicit theme exclusions: admin-only action, reversible
-- [ ] Too-late affects timing only; already-covered affects repetition only
-- [ ] Counts distinct recommendation decisions, not repeated clicks
+- [x] UI collapsed to Relevant / Not relevant (`public/app.js`'s priority
+      card buttons, `src/feedback.js`'s `WRITABLE_FEEDBACK_TYPES`) --
+      Useful folds into Relevant without implying style/execution
+      endorsement: `relevant` is a new, separate, lighter-weight type that
+      never feeds `getPositiveFeedbackExamples` (the style-example
+      harvesting Claude's prompt reads); historical `useful` rows are
+      untouched and keep feeding it under their original meaning, exactly
+      as before this stage
+- [x] One Not-relevant vote: exact recommendation removed from the active
+      feed, unchanged duplicates blocked -- `not_relevant` now carries a
+      `reason_code` (new column, same 6-value taxonomy as Claude's own
+      eligibility gate, `src/eligibility.js`'s `REASON_CODES`) and is
+      scoped to that recommendation's `action_fingerprint`, never the
+      whole microtrend (`deriveExclusions`, `src/feedback.js`). A
+      pre-Stage-7 vote (`reason_code IS NULL`) keeps its original, broader
+      whole-microtrend meaning rather than being silently reinterpreted --
+      verified both ways in `test/reportBuilder.test.js`
+- [x] One vote also creates a soft, reason-specific signal (not a ban) --
+      every reason-coded `not_relevant` row is raw material for
+      `themeReviewFlags` below; nothing about giving the vote itself
+      excludes a theme
+- [x] 3 distinct rejected recommendations, same narrow theme, same reason,
+      within 60 days -> flags the theme for admin review, never
+      auto-hard-bans (`themeReviewFlags`, `src/feedback.js`; surfaced via
+      `GET /admin/theme-review-flags`, admin-gated, no UI yet -- same
+      pattern as Stage 4/5's rejected-candidates/fit-contradictions
+      endpoints). Purely a computed-on-read signal -- nothing is written
+      or excluded just by crossing the threshold
+- [x] Explicit theme exclusions: admin-only action, reversible -- new
+      `theme_exclusions` table (at most one active row per theme, a
+      partial unique index), `POST /admin/theme-exclusions` /
+      `POST /admin/theme-exclusions/:id/reverse` / `GET` to list, all
+      `requireAdmin`-gated. `src/reportBuilder.js` checks the active set
+      before producing any evidence for that theme, so an excluded theme
+      gets no signal, no snapshot, no candidate -- and reversing it needs
+      no repair, the very next build just resumes normally
+- [x] Too-late affects timing only; already-covered affects repetition
+      only -- both are `not_relevant` reason codes, not separate verdicts,
+      and both get the same fingerprint-scoped suppression: a genuinely
+      different, later proposal on the same real trend (too_late) or a
+      genuinely different angle (already_covered) is never blocked by
+      either, only the literal unchanged duplicate is. No separate expiry
+      machinery was built for either -- fingerprint scoping already makes
+      both statements true
+- [x] Counts distinct recommendation decisions, not repeated clicks --
+      `themeReviewFlags` groups by `action_fingerprint` (falling back to
+      the recommendation's own id only when no fingerprint was ever
+      generated), never by raw feedback-row count, so undoing and
+      re-voting on the same recommendation can't inflate the tally
+
+**Verification:** `test/feedback.test.js`'s Stage 7 additions (pure) --
+`validateFeedbackInput` only accepts `relevant`/`not_relevant` as new
+writes and requires a real shared reason code on `not_relevant`;
+`requiresContentDetails` correctly keys off `reasonCode` as well as the
+legacy type; `deriveExclusions` proven both ways (pre-Stage-7 whole-
+microtrend vs. reason-coded fingerprint-only, for every reason code
+including already_covered); `themeReviewFlags` proven against the 3-vote
+threshold, the 60-day window, distinct-theme/distinct-reason isolation,
+de-duplication by fingerprint (including repeated clicks on one decision
+never inflating the count), and the fingerprint-id fallback.
+`test/reportBuilder.test.js`'s new Stage 7 suite (4/4, DB-backed): a
+reason-coded `not_relevant` vote blocking only the exact recommendation
+while a genuinely different angle on the same microtrend still wins; an
+explicit theme exclusion producing zero signals/recommendations for that
+theme and a reversal resuming normal processing with no repair; 3
+distinct reason-coded rejections flagging a theme for review while never
+auto-excluding it; a `relevant` vote never suppressing anything. Full
+suite: 368/368 passing in a scratch Postgres instance, run twice with no
+flakiness. Live-verified with a seeded smoke database and Playwright: the
+priority card shows exactly the 2 new buttons (no legacy buttons
+rendered); clicking "Not relevant" shows the 6 shared reason codes;
+selecting "Already covered" reveals the existing-content URL/status
+fields, and switching away from it hides them again. This live check
+caught a real bug -- hiding those fields on a reason change didn't clear
+their values, so a stray `contentStatus` was being submitted on votes
+with an unrelated reason -- fixed in `submitFeedback`
+(`public/app.js`) before shipping, and re-verified live.
+
+**Known limitations:**
+- The free-text `reason` lists for the 3 legacy types
+  (`REASONS_BY_TYPE`) are kept only for rendering old rows under their
+  original labels -- the API no longer accepts writing `useful`,
+  `already_covered`, or `dont_show_again` at all; attempting to is
+  rejected the same way an unknown type would be.
+- `themeReviewFlags`' distinct-decision count falls back to the
+  recommendation's own id only when no `action_fingerprint` ever existed;
+  if a recommendation's row is later lost entirely (same-day rebuild
+  nulls `recommendation_id` but never the fingerprint, so this is rare in
+  practice) with no fingerprint either, that one decision has nothing
+  stable to de-duplicate on and is skipped from the tally rather than
+  risk double- or under-counting it.
+- No UI yet for the two new admin endpoints (theme review flags, theme
+  exclusions) -- same "endpoint now, page later" pattern as Stage 4/5's
+  admin-only audit endpoints; Stage 8's human review queue is the natural
+  place a real page for these eventually belongs.
 
 ## Stage 8: Human review queue and evaluation
 **Status:** pending

@@ -8,7 +8,8 @@ const {
   tryAcquireIngestLock, releaseIngestLock, getRecommendationById, insertFeedback, restoreFeedback, listActiveFeedback,
   getActiveExclusions, getIdeas, updateIdea, getIdeaHistory, getIdeaStatusCounts, getMostRecentRecommendationByFingerprint,
   recordBaselineSnapshot, getLatestBaselineSnapshot, getAllBaselineSnapshots, getOpenSourceHealthAlerts,
-  getRejectedCandidates, getFitContradictions
+  getRejectedCandidates, getFitContradictions, getNotRelevantFeedbackForReview,
+  getThemeExclusions, excludeTheme, reverseThemeExclusion
 } = require('./db');
 const { computeBaseline } = require('./baseline');
 const { runHealthCheck } = require('./healthMonitor');
@@ -18,7 +19,11 @@ const { urgencyNote } = require('./candidateLifecycle');
 const { ALL_TOPICS } = require('./topics');
 const { peakingEligible } = require('./themeLifecycle');
 const { isSocialSourceType } = require('./microtrendExtraction');
-const { FEEDBACK_TYPES, REASONS_BY_TYPE, validateFeedbackInput } = require('./feedback');
+const {
+  FEEDBACK_TYPES, WRITABLE_FEEDBACK_TYPES, REASONS_BY_TYPE, NOT_RELEVANT_REASON_LABELS,
+  validateFeedbackInput, themeReviewFlags
+} = require('./feedback');
+const { REASON_CODES } = require('./eligibility');
 
 const app = express();
 
@@ -115,6 +120,7 @@ function serializeFeedback(row) {
     actionFingerprint: row.action_fingerprint,
     feedbackType: row.feedback_type,
     reason: row.reason,
+    reasonCode: row.reason_code,
     existingContentUrl: row.existing_content_url,
     note: row.note,
     contentStatus: row.content_status,
@@ -361,8 +367,17 @@ app.use(express.json());
 // same as /api/meta. The frontend's feedback dropdowns are populated from
 // this rather than a hard-coded copy, so adding a reason here is the only
 // place that needs editing.
+// Stage 7: writableFeedbackTypes/notRelevantReasons are what the current
+// UI actually uses (2 verdicts, 6 shared reason codes); feedbackTypes/
+// reasonsByType stay for rendering historical rows under their original
+// labels (Hidden & covered manager, Idea Tracker) -- never for writing.
 app.get('/api/feedback/reasons', (req, res) => {
-  res.json({ feedbackTypes: FEEDBACK_TYPES, reasonsByType: REASONS_BY_TYPE });
+  res.json({
+    feedbackTypes: FEEDBACK_TYPES,
+    reasonsByType: REASONS_BY_TYPE,
+    writableFeedbackTypes: WRITABLE_FEEDBACK_TYPES,
+    notRelevantReasons: REASON_CODES.map((code) => ({ code, label: NOT_RELEVANT_REASON_LABELS[code] }))
+  });
 });
 
 // The hidden/covered-items manager's data source -- read access is public,
@@ -384,8 +399,8 @@ app.post('/api/recommendations/:id/feedback', requireEditor, async (req, res) =>
   const recommendation = await getRecommendationById(req.params.id);
   if (!recommendation) return res.status(404).json({ error: `no recommendation with id ${req.params.id}` });
 
-  const { feedbackType, reason, note, existingContentUrl, contentStatus } = req.body || {};
-  const validation = validateFeedbackInput(feedbackType, { reason, note, contentStatus });
+  const { feedbackType, reasonCode, note, existingContentUrl, contentStatus } = req.body || {};
+  const validation = validateFeedbackInput(feedbackType, { reasonCode, note, contentStatus });
   if (!validation.valid) return res.status(400).json({ error: validation.error });
 
   const row = await insertFeedback({
@@ -393,7 +408,7 @@ app.post('/api/recommendations/:id/feedback', requireEditor, async (req, res) =>
     microtrendId: recommendation.microtrend_id,
     actionFingerprint: recommendation.action_fingerprint,
     feedbackType,
-    reason,
+    reasonCode,
     note,
     existingContentUrl,
     contentStatus
@@ -614,6 +629,66 @@ app.get('/admin/fit-contradictions', requireAdmin, async (req, res) => {
       createdAt: r.created_at
     }))
   });
+});
+
+// Stage 7 (IMPLEMENTATION_CHECKLIST.md): "3 distinct rejected
+// recommendations, same narrow theme, same reason, within 60 days ->
+// flags the theme for admin review (never auto-hard-bans)" -- a soft,
+// computed-on-read signal, admin-only, same no-UI-yet pattern as
+// rejected-candidates/fit-contradictions above. Acting on a flag (if an
+// admin agrees) is always the separate, explicit POST below -- this
+// endpoint itself never excludes anything.
+app.get('/admin/theme-review-flags', requireAdmin, async (req, res) => {
+  const rows = await getNotRelevantFeedbackForReview();
+  const flags = themeReviewFlags(rows);
+  res.json({
+    flags: flags.map((f) => ({
+      theme: f.theme,
+      themeLabel: THEME_LABEL_BY_KEY[f.theme] || f.theme,
+      reasonCode: f.reasonCode,
+      reasonLabel: NOT_RELEVANT_REASON_LABELS[f.reasonCode] || f.reasonCode,
+      distinctCount: f.distinctCount
+    }))
+  });
+});
+
+// Stage 7: "explicit theme exclusions -- admin-only action, reversible".
+// A deliberate, separate step from the soft review-flag signal above --
+// never applied automatically. GET lists every exclusion (active and
+// historical, for the audit trail); POST excludes a theme; POST .../reverse
+// undoes it. src/reportBuilder.js checks the active set before producing
+// any evidence for that theme, so a reversal needs no repair -- the very
+// next build just resumes normally.
+app.get('/admin/theme-exclusions', requireAdmin, async (req, res) => {
+  const rows = await getThemeExclusions();
+  res.json({
+    exclusions: rows.map((r) => ({
+      id: r.id,
+      theme: r.theme,
+      themeLabel: THEME_LABEL_BY_KEY[r.theme] || r.theme,
+      reason: r.reason,
+      excludedAt: r.excluded_at,
+      reversedAt: r.reversed_at
+    }))
+  });
+});
+
+app.post('/admin/theme-exclusions', requireAdmin, async (req, res) => {
+  const { theme, reason } = req.body || {};
+  const validThemes = ALL_TOPICS.map((t) => t.theme);
+  if (!validThemes.includes(theme)) {
+    return res.status(400).json({ error: `theme must be one of ${validThemes.join(', ')}` });
+  }
+  const row = await excludeTheme(theme, reason);
+  res.status(201).json({
+    exclusion: { id: row.id, theme: row.theme, reason: row.reason, excludedAt: row.excluded_at }
+  });
+});
+
+app.post('/admin/theme-exclusions/:id/reverse', requireAdmin, async (req, res) => {
+  const row = await reverseThemeExclusion(req.params.id);
+  if (!row) return res.status(404).json({ error: `no active exclusion with id ${req.params.id}` });
+  res.json({ exclusion: { id: row.id, theme: row.theme, reversedAt: row.reversed_at } });
 });
 
 // Public read, same as every other report read in this app -- lets

@@ -1,52 +1,120 @@
 const { test, describe } = require('node:test');
 const assert = require('node:assert/strict');
 const {
-  FEEDBACK_TYPES, validateFeedbackInput, deriveExclusions, applyExclusions,
-  summarizeUsefulFeedback, needsBrandPreferenceReview, BRAND_PREFERENCE_REVIEW_BATCH_SIZE
+  FEEDBACK_TYPES, WRITABLE_FEEDBACK_TYPES, validateFeedbackInput, requiresContentDetails, deriveExclusions, applyExclusions,
+  summarizeUsefulFeedback, needsBrandPreferenceReview, BRAND_PREFERENCE_REVIEW_BATCH_SIZE, themeReviewFlags
 } = require('../src/feedback');
+const { REASON_CODES } = require('../src/eligibility');
 
+// Stage 7 (IMPLEMENTATION_CHECKLIST.md): the UI collapses to Relevant/Not
+// relevant; the API only ever accepts writing those two going forward.
+// FEEDBACK_TYPES (the 3 older values plus these 2) still exists so
+// historical rows keep displaying/filtering under their original meaning
+// -- see test/reportBuilder.test.js for that read-side coverage.
 describe('validateFeedbackInput', () => {
   test('rejects an unknown feedback type', () => {
     assert.equal(validateFeedbackInput('love_it', {}).valid, false);
   });
 
-  test('accepts every real feedback type with no extra payload', () => {
-    for (const type of FEEDBACK_TYPES) {
-      assert.equal(validateFeedbackInput(type, {}).valid, true, type);
+  test('rejects every pre-Stage-7 type as a new write -- the UI no longer offers them', () => {
+    for (const type of ['useful', 'already_covered', 'dont_show_again']) {
+      assert.equal(validateFeedbackInput(type, {}).valid, false, type);
     }
   });
 
-  test('rejects an invalid content_status on already_covered', () => {
-    const result = validateFeedbackInput('already_covered', { contentStatus: 'draft' });
+  test('accepts "relevant" with no extra payload -- a pure positive signal, no reason required', () => {
+    assert.equal(validateFeedbackInput('relevant', {}).valid, true);
+  });
+
+  test('rejects "not_relevant" with no reasonCode', () => {
+    assert.equal(validateFeedbackInput('not_relevant', {}).valid, false);
+  });
+
+  test('rejects "not_relevant" with a reasonCode outside the shared eligibility taxonomy', () => {
+    assert.equal(validateFeedbackInput('not_relevant', { reasonCode: 'not_on_brand' }).valid, false);
+  });
+
+  test('accepts every real shared reason code on "not_relevant"', () => {
+    for (const code of REASON_CODES) {
+      assert.equal(validateFeedbackInput('not_relevant', { reasonCode: code }).valid, true, code);
+    }
+  });
+
+  test('rejects an invalid content_status when the reason is already_covered', () => {
+    const result = validateFeedbackInput('not_relevant', { reasonCode: 'already_covered', contentStatus: 'draft' });
     assert.equal(result.valid, false);
   });
 
-  test('accepts a valid content_status on already_covered', () => {
-    assert.equal(validateFeedbackInput('already_covered', { contentStatus: 'published' }).valid, true);
+  test('accepts a valid content_status when the reason is already_covered', () => {
+    assert.equal(validateFeedbackInput('not_relevant', { reasonCode: 'already_covered', contentStatus: 'published' }).valid, true);
   });
 
-  test('rejects a reason not on that type\'s fixed list', () => {
-    const result = validateFeedbackInput('not_relevant', { reason: 'Published on blog' }); // that's an already_covered reason
-    assert.equal(result.valid, false);
+  test('content_status is irrelevant, and never checked, for a reason other than already_covered', () => {
+    assert.equal(validateFeedbackInput('not_relevant', { reasonCode: 'too_late', contentStatus: 'draft' }).valid, true);
+  });
+});
+
+describe('WRITABLE_FEEDBACK_TYPES', () => {
+  test('is exactly the 2-verdict UI, nothing more', () => {
+    assert.deepEqual([...WRITABLE_FEEDBACK_TYPES].sort(), ['not_relevant', 'relevant']);
+  });
+});
+
+describe('requiresContentDetails', () => {
+  test('true for the legacy already_covered type', () => {
+    assert.equal(requiresContentDetails('already_covered', null), true);
   });
 
-  test('accepts a reason from that type\'s own list', () => {
-    assert.equal(validateFeedbackInput('not_relevant', { reason: 'Not on-brand' }).valid, true);
+  test('true for not_relevant with reasonCode already_covered', () => {
+    assert.equal(requiresContentDetails('not_relevant', 'already_covered'), true);
   });
 
-  test('"Other" reason requires a note', () => {
-    assert.equal(validateFeedbackInput('dont_show_again', { reason: 'Other' }).valid, false);
-    assert.equal(validateFeedbackInput('dont_show_again', { reason: 'Other', note: 'Seasonal clash with a current campaign' }).valid, true);
+  test('false for not_relevant with any other reasonCode', () => {
+    assert.equal(requiresContentDetails('not_relevant', 'too_late'), false);
+  });
+
+  test('false for relevant', () => {
+    assert.equal(requiresContentDetails('relevant', null), false);
   });
 });
 
 describe('deriveExclusions', () => {
-  test('not_relevant hides the whole microtrend cluster', () => {
+  test('a pre-Stage-7 not_relevant vote (no reason_code) keeps its original, broader meaning -- the whole microtrend cluster', () => {
     const { hiddenMicrotrendIds, suppressedFingerprints } = deriveExclusions([
-      { feedback_type: 'not_relevant', microtrend_id: 42, action_fingerprint: null }
+      { feedback_type: 'not_relevant', microtrend_id: 42, action_fingerprint: 'fp-old-style', reason_code: null }
     ]);
-    assert.ok(hiddenMicrotrendIds.has(42));
+    assert.ok(hiddenMicrotrendIds.has(42), 'never silently reinterpreted just because the column now exists');
     assert.equal(suppressedFingerprints.size, 0);
+  });
+
+  test('Stage 7: a reason-coded not_relevant vote only suppresses the exact recommendation (action_fingerprint), never the whole microtrend', () => {
+    const { hiddenMicrotrendIds, suppressedFingerprints } = deriveExclusions([
+      { feedback_type: 'not_relevant', microtrend_id: 42, action_fingerprint: 'fp-new-style', reason_code: 'too_late' }
+    ]);
+    assert.equal(hiddenMicrotrendIds.size, 0, 'a genuinely different angle on the same microtrend must stay eligible');
+    assert.ok(suppressedFingerprints.has('fp-new-style'));
+  });
+
+  test('Stage 7: this holds for every reason code, including already_covered -- it affects repetition only, never the whole topic', () => {
+    const { hiddenMicrotrendIds, suppressedFingerprints } = deriveExclusions([
+      { feedback_type: 'not_relevant', microtrend_id: 1, action_fingerprint: 'fp-covered', reason_code: 'already_covered' }
+    ]);
+    assert.equal(hiddenMicrotrendIds.size, 0);
+    assert.ok(suppressedFingerprints.has('fp-covered'));
+  });
+
+  test('a reason-coded not_relevant vote with no fingerprint (no LLM output existed) falls back to hiding the whole microtrend -- nothing finer to suppress', () => {
+    const { hiddenMicrotrendIds, suppressedFingerprints } = deriveExclusions([
+      { feedback_type: 'not_relevant', microtrend_id: 9, action_fingerprint: null, reason_code: 'product_mismatch' }
+    ]);
+    assert.ok(hiddenMicrotrendIds.has(9));
+    assert.equal(suppressedFingerprints.size, 0);
+  });
+
+  test('relevant produces no exclusion at all, same as useful', () => {
+    const result = deriveExclusions([{ feedback_type: 'relevant', microtrend_id: 1, action_fingerprint: 'fp-a', reason_code: null }]);
+    assert.equal(result.hiddenMicrotrendIds.size, 0);
+    assert.equal(result.suppressedFingerprints.size, 0);
   });
 
   test('already_covered and dont_show_again both suppress by action_fingerprint, not by microtrend', () => {
@@ -118,6 +186,76 @@ describe('summarizeUsefulFeedback', () => {
     const summary = summarizeUsefulFeedback([]);
     assert.equal(summary.sampleSize, 0);
     assert.deepEqual(summary.topChannels, []);
+  });
+});
+
+describe('themeReviewFlags', () => {
+  const row = (overrides) => ({
+    theme: 'curry_night', reasonCode: 'product_mismatch', actionFingerprint: 'fp-1',
+    recommendationId: 1, createdAt: new Date(), ...overrides
+  });
+
+  test('flags a theme+reason once 3 DISTINCT decisions are reached, never before', () => {
+    const rows = [row({ actionFingerprint: 'fp-1' }), row({ actionFingerprint: 'fp-2' })];
+    assert.deepEqual(themeReviewFlags(rows), []);
+    rows.push(row({ actionFingerprint: 'fp-3' }));
+    const flags = themeReviewFlags(rows);
+    assert.equal(flags.length, 1);
+    assert.equal(flags[0].theme, 'curry_night');
+    assert.equal(flags[0].reasonCode, 'product_mismatch');
+    assert.equal(flags[0].distinctCount, 3);
+  });
+
+  test('counts distinct recommendation decisions, not repeated clicks on the same one', () => {
+    const rows = [row({ actionFingerprint: 'fp-1' }), row({ actionFingerprint: 'fp-1' }), row({ actionFingerprint: 'fp-1' })];
+    assert.deepEqual(themeReviewFlags(rows), [], 'one real decision clicked 3 times is still just one decision');
+  });
+
+  test('different reasons on the same theme never combine toward the same tally', () => {
+    const rows = [
+      row({ actionFingerprint: 'fp-1', reasonCode: 'product_mismatch' }),
+      row({ actionFingerprint: 'fp-2', reasonCode: 'too_late' }),
+      row({ actionFingerprint: 'fp-3', reasonCode: 'audience_mismatch' })
+    ];
+    assert.deepEqual(themeReviewFlags(rows), []);
+  });
+
+  test('different themes with the same reason never combine toward the same tally', () => {
+    const rows = [
+      row({ actionFingerprint: 'fp-1', theme: 'curry_night' }),
+      row({ actionFingerprint: 'fp-2', theme: 'sushi_asian' }),
+      row({ actionFingerprint: 'fp-3', theme: 'healthy_eating' })
+    ];
+    assert.deepEqual(themeReviewFlags(rows), []);
+  });
+
+  test('a decision older than the 60-day window never counts', () => {
+    const old = new Date(Date.now() - 61 * 86400000);
+    const rows = [row({ actionFingerprint: 'fp-1', createdAt: old }), row({ actionFingerprint: 'fp-2' }), row({ actionFingerprint: 'fp-3' })];
+    assert.deepEqual(themeReviewFlags(rows), []);
+  });
+
+  test('a row with no reason_code (pre-Stage-7) is skipped -- nothing to group it by', () => {
+    const rows = [row({ actionFingerprint: 'fp-1', reasonCode: null }), row({ actionFingerprint: 'fp-2' }), row({ actionFingerprint: 'fp-3' })];
+    assert.deepEqual(themeReviewFlags(rows), [], 'only 2 real reason-coded decisions exist here');
+  });
+
+  test('falls back to the recommendation id when no fingerprint exists, rather than silently dropping the decision', () => {
+    const rows = [
+      row({ actionFingerprint: null, recommendationId: 101 }),
+      row({ actionFingerprint: null, recommendationId: 102 }),
+      row({ actionFingerprint: null, recommendationId: 103 })
+    ];
+    assert.equal(themeReviewFlags(rows).length, 1);
+  });
+
+  test('a row with neither a fingerprint nor a recommendation id is skipped -- nothing stable to de-duplicate on', () => {
+    const rows = [
+      row({ actionFingerprint: null, recommendationId: null }),
+      row({ actionFingerprint: 'fp-2' }),
+      row({ actionFingerprint: 'fp-3' })
+    ];
+    assert.deepEqual(themeReviewFlags(rows), []);
   });
 });
 

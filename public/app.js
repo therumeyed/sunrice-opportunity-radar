@@ -279,10 +279,8 @@
           <button class="bd-proof" type="button" data-rec-id="${r.id}">View evidence &rarr;</button>
         </div>
         <div class="bd-feedback-row">
-          <button class="bd-feedback-btn" type="button" data-feedback-rec="${r.id}" data-feedback-type="useful">Useful</button>
-          <button class="bd-feedback-btn" type="button" data-feedback-rec="${r.id}" data-feedback-type="already_covered">Already covered</button>
+          <button class="bd-feedback-btn" type="button" data-feedback-rec="${r.id}" data-feedback-type="relevant">Relevant</button>
           <button class="bd-feedback-btn" type="button" data-feedback-rec="${r.id}" data-feedback-type="not_relevant">Not relevant</button>
-          <button class="bd-feedback-btn" type="button" data-feedback-rec="${r.id}" data-feedback-type="dont_show_again">Don't show again</button>
         </div>
       </article>
     `;
@@ -511,7 +509,14 @@
   }
 
   // --- Feedback form ------------------------------------------------------
-  const FEEDBACK_TYPE_LABELS = { useful: 'Useful', already_covered: 'Already covered', not_relevant: 'Not relevant', dont_show_again: "Don't show this idea again" };
+  // Stage 7 (IMPLEMENTATION_CHECKLIST.md): the UI only ever writes 2
+  // verdicts now -- relevant/not_relevant. The other 3 labels stay here
+  // purely so historical rows (Hidden & covered manager, Idea Tracker)
+  // keep displaying under their original meaning.
+  const FEEDBACK_TYPE_LABELS = {
+    useful: 'Useful', relevant: 'Relevant', already_covered: 'Already covered',
+    not_relevant: 'Not relevant', dont_show_again: "Don't show this idea again"
+  };
 
   async function loadFeedbackReasons() {
     if (state.feedbackReasons) return state.feedbackReasons;
@@ -520,27 +525,29 @@
     return state.feedbackReasons;
   }
 
+  // not_relevant's reason is now a required, structured code shared with
+  // Claude's own eligibility gate (src/eligibility.js) rather than a free-
+  // text list -- picking "Already covered" as the reason reveals the same
+  // "where does it already live" fields the old standalone button used to
+  // show, since that's now a reason, not a separate verdict.
   async function openFeedbackForm(recId, feedbackType) {
     const reasonsData = await loadFeedbackReasons();
-    const reasons = reasonsData.reasonsByType[feedbackType] || [];
-    const needsContentDetails = feedbackType === 'already_covered';
+    const notRelevantReasons = feedbackType === 'not_relevant' ? (reasonsData.notRelevantReasons || []) : [];
 
     qs('#bd-feedback-title').textContent = FEEDBACK_TYPE_LABELS[feedbackType] || feedbackType;
     qs('#bd-feedback-form').innerHTML = `
-      ${reasons.length > 0 ? `
+      ${notRelevantReasons.length > 0 ? `
       <div class="bd-feedback-field">
-        <label for="bd-feedback-reason">Reason</label>
-        <select id="bd-feedback-reason">
-          ${reasons.map((r) => `<option value="${escapeHtml(r)}">${escapeHtml(r)}</option>`).join('')}
-          <option value="Other">Other (add a note)</option>
+        <label for="bd-feedback-reason-code">Reason</label>
+        <select id="bd-feedback-reason-code">
+          ${notRelevantReasons.map((r) => `<option value="${escapeHtml(r.code)}">${escapeHtml(r.label)}</option>`).join('')}
         </select>
-      </div>` : ''}
-      ${needsContentDetails ? `
-      <div class="bd-feedback-field">
+      </div>
+      <div class="bd-feedback-field" id="bd-feedback-covered-fields" hidden>
         <label for="bd-feedback-url">Where this already lives (optional)</label>
         <input id="bd-feedback-url" type="url" placeholder="https://...">
       </div>
-      <div class="bd-feedback-field">
+      <div class="bd-feedback-field" id="bd-feedback-status-field" hidden>
         <label for="bd-feedback-status">Status</label>
         <select id="bd-feedback-status">
           <option value="published">Published</option>
@@ -548,12 +555,22 @@
         </select>
       </div>` : ''}
       <div class="bd-feedback-field">
-        <label for="bd-feedback-note">Note (required if "Other")</label>
+        <label for="bd-feedback-note">Note (optional)</label>
         <textarea id="bd-feedback-note" rows="3"></textarea>
       </div>
       <button class="bd-feedback-submit" type="button" id="bd-feedback-submit">Save feedback</button>
       <p id="bd-feedback-error" style="color:var(--bd-red);font-size:11px;"></p>
     `;
+
+    if (notRelevantReasons.length > 0) {
+      const toggleCoveredFields = () => {
+        const isCovered = qs('#bd-feedback-reason-code').value === 'already_covered';
+        qs('#bd-feedback-covered-fields').hidden = !isCovered;
+        qs('#bd-feedback-status-field').hidden = !isCovered;
+      };
+      qs('#bd-feedback-reason-code').addEventListener('change', toggleCoveredFields);
+      toggleCoveredFields();
+    }
 
     qs('#bd-feedback-submit').addEventListener('click', () => submitFeedback(recId, feedbackType));
     qs('#bd-feedback-scrim').hidden = false;
@@ -567,11 +584,16 @@
   async function submitFeedback(recId, feedbackType) {
     const token = getEditorToken();
     if (!token) return;
+    const reasonCode = qs('#bd-feedback-reason-code')?.value || undefined;
+    // Hiding the "already covered" fields on a reason change doesn't clear
+    // their values -- only send them when that reason is actually the one
+    // selected, so a stray contentStatus never lands on an unrelated vote.
+    const isAlreadyCovered = reasonCode === 'already_covered';
     const payload = {
       feedbackType,
-      reason: qs('#bd-feedback-reason')?.value || undefined,
-      existingContentUrl: qs('#bd-feedback-url')?.value || undefined,
-      contentStatus: qs('#bd-feedback-status')?.value || undefined,
+      reasonCode,
+      existingContentUrl: isAlreadyCovered ? (qs('#bd-feedback-url')?.value || undefined) : undefined,
+      contentStatus: isAlreadyCovered ? (qs('#bd-feedback-status')?.value || undefined) : undefined,
       note: qs('#bd-feedback-note')?.value || undefined
     };
     const res = await fetch(`/api/recommendations/${recId}/feedback`, {
@@ -607,21 +629,27 @@
   async function renderFeedbackManager() {
     const list = qs('#bd-manager-list');
     list.innerHTML = '<div class="bd-empty">Loading…</div>';
-    const res = await fetch('/api/feedback/active');
-    const { feedback } = await res.json();
+    const [feedbackRes, reasonsData] = await Promise.all([fetch('/api/feedback/active'), loadFeedbackReasons()]);
+    const { feedback } = await feedbackRes.json();
+    const reasonCodeLabels = Object.fromEntries((reasonsData.notRelevantReasons || []).map((r) => [r.code, r.label]));
     if (feedback.length === 0) {
       list.innerHTML = '<div class="bd-empty">Nothing hidden, covered, or dismissed right now.</div>';
       return;
     }
-    list.innerHTML = feedback.map((f) => `
+    list.innerHTML = feedback.map((f) => {
+      // reasonCode (Stage 7, structured) takes precedence when present;
+      // reason (pre-Stage-7, free text) still displays for older rows.
+      const reasonText = f.reasonCode ? (reasonCodeLabels[f.reasonCode] || f.reasonCode) : f.reason;
+      return `
       <div class="bd-manager-row">
         <div>
           <strong>${escapeHtml(f.microtrendDisplayName || f.opportunityName || f.theme || 'Untitled')}</strong>
-          <span>${escapeHtml(FEEDBACK_TYPE_LABELS[f.feedbackType] || f.feedbackType)}${f.reason ? ` · ${escapeHtml(f.reason)}` : ''} · ${escapeHtml(fmtDateTime(f.createdAt))}</span>
+          <span>${escapeHtml(FEEDBACK_TYPE_LABELS[f.feedbackType] || f.feedbackType)}${reasonText ? ` · ${escapeHtml(reasonText)}` : ''} · ${escapeHtml(fmtDateTime(f.createdAt))}</span>
         </div>
         <button class="bd-manager-undo" type="button" data-undo-id="${f.id}">Undo</button>
       </div>
-    `).join('');
+    `;
+    }).join('');
     list.querySelectorAll('[data-undo-id]').forEach((btn) => btn.addEventListener('click', () => undoFeedback(btn.dataset.undoId)));
   }
 
