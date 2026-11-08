@@ -11,7 +11,7 @@ known limitation -- filled in as each stage actually ships, not drafted
 in advance.
 
 ## Stage 1: Baseline snapshot
-**Status:** shipped (code); real production run still pending
+**Status:** done
 
 Capture what the system can already measure before any of Stages 4-7
 change recommendation behaviour. Metrics that genuinely can't be
@@ -32,10 +32,9 @@ measured yet (no review queue, no mismatch reason codes) are marked
       nothing zero" case and real computed numbers against hand-checked
       fixture data (duplicate rate, time-to-recommendation, tier-at-first-
       appearance, evidence completeness/freshness all matched by hand)
-- [ ] Run once for real against production (needs the user to call
-      `POST /admin/baseline` on the live Render deploy once this ships --
-      a scratch DB has no real history to snapshot, so this step can't be
-      done from here)
+- [x] Run once for real against production -- `baseline_snapshots.id=1`,
+      computed 2026-11-08T08:03:53.664Z. This is the real day-zero number
+      Stage 9 compares against once Stages 4-7 ship.
 
 **Found and fixed along the way (not new work, a standing regression):**
 the site-wide login wall (shipped earlier) and `ADMIN_TOKEN`/`EDITOR_TOKEN`
