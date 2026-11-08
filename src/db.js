@@ -35,6 +35,14 @@ async function initSchema() {
     -- predates this column).
     ALTER TABLE reports ADD COLUMN IF NOT EXISTS ai_analysis_available BOOLEAN;
     ALTER TABLE reports ADD COLUMN IF NOT EXISTS ai_analysis_reason TEXT;
+    -- Stage 3 (IMPLEMENTATION_CHECKLIST.md): which trigger produced the
+    -- ingest run that last touched this report -- the daily cron
+    -- (scheduled) or an admin's manual Refresh click (manual). Alert
+    -- thresholds in healthMonitor.js must only count scheduled runs, so a
+    -- manual retry never inflates a failure streak. Set on every
+    -- getOrCreateReport call, including a same-day re-run, so this always
+    -- reflects whichever run actually produced today's data.
+    ALTER TABLE reports ADD COLUMN IF NOT EXISTS trigger_type TEXT NOT NULL DEFAULT 'scheduled' CHECK (trigger_type IN ('scheduled','manual'));
 
     CREATE TABLE IF NOT EXISTS provider_runs (
       id SERIAL PRIMARY KEY,
@@ -61,6 +69,33 @@ async function initSchema() {
     -- declining interest.
     ALTER TABLE provider_runs ADD COLUMN IF NOT EXISTS raw_item_count INTEGER;
     ALTER TABLE provider_runs ADD COLUMN IF NOT EXISTS hit_retrieval_cap BOOLEAN;
+    -- Stage 3: new vs duplicate counts for per-source run history. Null
+    -- until the caller knows (set via updateProviderRunCounts once the
+    -- collection loop for this run has actually finished upserting) --
+    -- never defaulted to 0, which would misreport "ran and found nothing"
+    -- the same as "we never counted".
+    ALTER TABLE provider_runs ADD COLUMN IF NOT EXISTS new_item_count INTEGER;
+    ALTER TABLE provider_runs ADD COLUMN IF NOT EXISTS duplicate_item_count INTEGER;
+
+    -- Stage 3: open/resolved incidents, grouped by source+alert type so
+    -- repeated firings of the same underlying problem don't spam a fresh
+    -- alert every run -- see healthMonitor.js. The partial unique index is
+    -- what "groups by source and incident": at most one OPEN row per
+    -- (source_type, alert_type) at a time; resolving it and a later
+    -- re-trigger opens a genuinely new incident.
+    CREATE TABLE IF NOT EXISTS source_health_alerts (
+      id SERIAL PRIMARY KEY,
+      source_type TEXT NOT NULL,
+      alert_type TEXT NOT NULL CHECK (alert_type IN ('consecutive_failures','stale_no_success','zero_usable_records','auth_or_quota_error')),
+      status TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open','resolved')),
+      opened_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      resolved_at TIMESTAMPTZ,
+      last_detail TEXT,
+      last_seen_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      occurrence_count INTEGER NOT NULL DEFAULT 1
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_source_health_alerts_open ON source_health_alerts(source_type, alert_type) WHERE status = 'open';
+    CREATE INDEX IF NOT EXISTS idx_source_health_alerts_source ON source_health_alerts(source_type);
 
     -- Raw evidence: every item this dashboard ever cites lives here, in full,
     -- never trimmed to just what a recommendation needed. content_hash is
@@ -500,12 +535,20 @@ async function initSchemaWithRetry(maxAttempts = 30, delayMs = 5000) {
   }
 }
 
-async function getOrCreateReport(reportDate) {
+// triggerType defaults to 'scheduled' (the cron's own invocation never sets
+// INGEST_TRIGGER). A same-day re-run always overwrites the stored
+// trigger_type to whichever run is happening now, same as the existing
+// same-day provider_runs wipe -- "today's data" and "today's trigger" stay
+// in sync.
+async function getOrCreateReport(reportDate, triggerType = 'scheduled') {
   const existing = await pool.query('SELECT * FROM reports WHERE report_date = $1', [reportDate]);
-  if (existing.rowCount > 0) return existing.rows[0];
+  if (existing.rowCount > 0) {
+    const updated = await pool.query(`UPDATE reports SET trigger_type = $2 WHERE id = $1 RETURNING *`, [existing.rows[0].id, triggerType]);
+    return updated.rows[0];
+  }
   const inserted = await pool.query(
-    `INSERT INTO reports (report_date, status) VALUES ($1, 'pending') RETURNING *`,
-    [reportDate]
+    `INSERT INTO reports (report_date, status, trigger_type) VALUES ($1, 'pending', $2) RETURNING *`,
+    [reportDate, triggerType]
   );
   return inserted.rows[0];
 }
@@ -573,6 +616,18 @@ async function recordProviderRun(reportId, run) {
     ]
   );
   return res.rows[0];
+}
+
+// Stage 3: set once a collection loop has finished upserting every item it
+// fetched for this run -- newItemCount is how many were genuinely new rows
+// (upsertSourceItem's RETURNING * came back non-empty), duplicateItemCount
+// is everything else it tried to insert. Never called for a run that
+// didn't attempt any items (DataForSEO's ceiling-skip, a failed fetch).
+async function updateProviderRunCounts(runId, newItemCount, duplicateItemCount) {
+  await pool.query(
+    `UPDATE provider_runs SET new_item_count = $2, duplicate_item_count = $3 WHERE id = $1`,
+    [runId, newItemCount, duplicateItemCount]
+  );
 }
 
 // ON CONFLICT DO NOTHING is the dedupe: the same item collected again on a
@@ -1501,11 +1556,114 @@ async function getAllBaselineSnapshots() {
   return res.rows;
 }
 
+// Stage 3 (IMPLEMENTATION_CHECKLIST.md): per (source_type, report_date)
+// aggregate across the real, already-stored provider_runs rows -- one real
+// ingest attempt per day, even though DataForSEO/social collection loops
+// write many provider_runs rows per day (one per query/platform). Grouped
+// by trigger_type too, but in practice a given date only ever has one: a
+// same-day re-run wipes and rebuilds that day's provider_runs wholesale
+// (see ingest.js), so the group's trigger_type is always whichever run
+// last touched that date.
+async function getSourceRunHistory(sinceDate) {
+  const res = await pool.query(
+    `SELECT
+       pr.source_type,
+       r.report_date,
+       r.trigger_type,
+       MIN(pr.started_at) AS started_at,
+       MAX(pr.finished_at) AS finished_at,
+       COUNT(*) FILTER (WHERE pr.status IN ('live','cached','imported')) AS success_count,
+       COUNT(*) FILTER (WHERE pr.status = 'failed') AS failed_count,
+       COUNT(*) AS total_count,
+       SUM(pr.new_item_count) AS new_items,
+       SUM(pr.duplicate_item_count) AS duplicate_items,
+       (ARRAY_AGG(pr.error ORDER BY pr.started_at DESC) FILTER (WHERE pr.error IS NOT NULL))[1] AS last_error
+     FROM provider_runs pr
+     JOIN reports r ON r.id = pr.report_id
+     WHERE r.report_date >= $1
+     GROUP BY pr.source_type, r.report_date, r.trigger_type
+     ORDER BY r.report_date DESC, pr.source_type ASC`,
+    [sinceDate]
+  );
+  return res.rows;
+}
+
+// Same shape of question, but AI analysis isn't a provider_runs row at all
+// -- it's the single per-report ai_analysis_available/reason flag set by
+// reportBuilder.js's mandatory Claude call. Kept as its own function/source
+// (never merged into getSourceRunHistory's rows) per the brief's "keep
+// scraper health separate from AI analysis health" rule.
+async function getAiAnalysisHistory(sinceDate) {
+  const res = await pool.query(
+    `SELECT report_date, trigger_type, ai_analysis_available, ai_analysis_reason
+     FROM reports
+     WHERE report_date >= $1 AND ai_analysis_available IS NOT NULL
+     ORDER BY report_date DESC`,
+    [sinceDate]
+  );
+  return res.rows;
+}
+
+// Groups by source+incident: at most one OPEN row per (source_type,
+// alert_type) -- a repeat firing of the same underlying problem bumps
+// occurrence_count/last_seen_at on the existing row rather than creating a
+// new one. isNew tells the caller whether to send a "new alert" email
+// (healthMonitor.js) rather than silently updating one that's already
+// been notified about.
+async function upsertOpenAlert(sourceType, alertType, detail) {
+  const existing = await pool.query(
+    `SELECT * FROM source_health_alerts WHERE source_type = $1 AND alert_type = $2 AND status = 'open'`,
+    [sourceType, alertType]
+  );
+  if (existing.rowCount > 0) {
+    const updated = await pool.query(
+      `UPDATE source_health_alerts SET last_detail = $2, last_seen_at = now(), occurrence_count = occurrence_count + 1
+       WHERE id = $1 RETURNING *`,
+      [existing.rows[0].id, detail]
+    );
+    return { alert: updated.rows[0], isNew: false };
+  }
+  const inserted = await pool.query(
+    `INSERT INTO source_health_alerts (source_type, alert_type, last_detail) VALUES ($1, $2, $3) RETURNING *`,
+    [sourceType, alertType, detail]
+  );
+  return { alert: inserted.rows[0], isNew: true };
+}
+
+// Notify-on-recovery: resolving an alert that was never open is a no-op
+// (returns null) so the caller knows not to send a recovery notification
+// for a condition that was never actually flagged.
+async function resolveOpenAlert(sourceType, alertType) {
+  const res = await pool.query(
+    `UPDATE source_health_alerts SET status = 'resolved', resolved_at = now()
+     WHERE source_type = $1 AND alert_type = $2 AND status = 'open' RETURNING *`,
+    [sourceType, alertType]
+  );
+  return res.rows[0] || null;
+}
+
+async function getOpenSourceHealthAlerts() {
+  const res = await pool.query(`SELECT * FROM source_health_alerts WHERE status = 'open' ORDER BY opened_at ASC`);
+  return res.rows;
+}
+
+async function getRecentlyResolvedAlerts(limit = 20) {
+  const res = await pool.query(`SELECT * FROM source_health_alerts WHERE status = 'resolved' ORDER BY resolved_at DESC LIMIT $1`, [limit]);
+  return res.rows;
+}
+
 module.exports = {
   pool,
   recordBaselineSnapshot,
   getLatestBaselineSnapshot,
   getAllBaselineSnapshots,
+  updateProviderRunCounts,
+  getSourceRunHistory,
+  getAiAnalysisHistory,
+  upsertOpenAlert,
+  resolveOpenAlert,
+  getOpenSourceHealthAlerts,
+  getRecentlyResolvedAlerts,
   recordPossibleRepost,
   getPossibleRepostsForSourceItems,
   DATA_STATUSES,

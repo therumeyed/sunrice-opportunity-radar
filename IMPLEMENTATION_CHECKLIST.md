@@ -85,18 +85,82 @@ either evidence row, and that `product_connection` reaches the
 recommendation's actual linked evidence. Full suite: 242/242.
 
 ## Stage 3: Monitoring and failure visibility
-**Status:** pending
+**Status:** done
 
-- [ ] Per-source run history surfaced (last attempted/successful, duration,
-      new vs duplicate counts)
-- [ ] 4 alert rules: 2 consecutive failures; no success for 2x refresh
-      interval; 3 consecutive zero-usable-record runs flagged (not failed);
-      auth/quota errors immediate
-- [ ] In-app admin alerts + configurable email (unconfigured state shown
-      honestly, never claimed as tested without a real send)
-- [ ] Alerts grouped by source+incident, notify on recovery
-- [ ] Scraper health kept separate from AI-analysis health
-- [ ] Admin section: inspect failures, retry without duplicating
+- [x] Per-source run history surfaced (`src/db.js` `getSourceRunHistory`/
+      `getAiAnalysisHistory`, aggregated per source+day across the real,
+      already-stored `provider_runs` rows -- new/duplicate counts are a
+      new `provider_runs.new_item_count`/`duplicate_item_count` pair,
+      populated in `ingest.js`'s 3 collection loops from whether each
+      upsert actually inserted a fresh row)
+- [x] 4 alert rules in `src/alerts.js` (pure, no DB access, fixture-tested):
+      2 consecutive failed **scheduled** runs; no successful scheduled run
+      for >2x the refresh interval (a documented, configurable assumption
+      -- `DEFAULT_REFRESH_INTERVAL_HOURS`, currently 24h since the cron
+      runs once/day); 3 consecutive scheduled zero-usable-record runs
+      flagged as `zero_usable_records`, a distinct alert type from
+      `consecutive_failures` so "ran fine, found nothing" is never
+      conflated with "broke"; an auth/quota-shaped error (`isAuthOrQuotaError`,
+      pattern-matched against the free-text error column) alerts
+      immediately, no streak required
+- [x] Scheduled vs. manual is a real, persisted distinction: new
+      `reports.trigger_type` column, set by `ingest.js` from
+      `INGEST_TRIGGER` (only `/admin/refresh` in `server.js` sets this env
+      var on the spawned process); alert evaluation only ever reads
+      scheduled runs, so a manual retry can never inflate a failure streak
+- [x] In-app admin alerts (new `source_health_alerts` table, reconciled by
+      `src/healthMonitor.js`) + configurable email via Resend's HTTP API
+      (`src/emailAlerts.js`) -- unconfigured by default (`ALERT_EMAIL_API_KEY`/
+      `ALERT_EMAIL_TO`/`ALERT_EMAIL_FROM` unset), shown honestly as such on
+      the Source health tab; no send has been claimed as tested in this
+      environment (no real Resend credentials exist here)
+- [x] Alerts grouped by source+incident (partial unique index: at most one
+      OPEN row per source_type+alert_type); notify-on-recovery fires an
+      email (when configured) the moment a condition stops being true
+- [x] Scraper health kept separate from AI-analysis health -- `ai_analysis`
+      is evaluated as its own distinct "source" against the same 4 rules,
+      read from `reports.ai_analysis_available`/`ai_analysis_reason`,
+      never merged into any real scraper source's history or alerts
+- [x] Real admin section, not just endpoints: a **Source health** nav tab
+      (`public/index.html`/`app.js`), gated behind the same `X-Admin-Token`
+      prompt as Refresh -- shows per-source run history (last 14 days),
+      active alerts, recently-recovered alerts, email config state, and a
+      **Run ingestion now** button that reuses the existing dedup-safe
+      `/admin/refresh` (no separate per-source retry needed: the same
+      action safely re-attempts everything)
+- [x] One public-facing piece (original spec item #7): a plain, generic
+      notice on the Today view when a real scraper source has an open
+      alert -- never names the source, the alert type, or any error text;
+      AI-analysis outages keep their existing, separately-worded message
+
+**Verification:** `test/alerts.test.js` (15/15) -- pure fixture tests for
+all 4 rules, including that a single failure/zero-record run is never
+enough, a success breaking up 2 failures resets the streak, and
+`newItemCount: null` (never measured) correctly skips the
+zero-usable-records rule rather than treating "unknown" as "zero".
+`test/healthMonitor.test.js` (6/6, DB-backed) -- `getOrCreateReport`'s
+trigger_type lifecycle; `getSourceRunHistory`'s per-source-per-day
+aggregation across multiple raw rows; `upsertOpenAlert`/`resolveOpenAlert`'s
+group-not-duplicate and resolve-is-a-no-op-if-not-open behaviour; and an
+end-to-end `runHealthCheck` proof that a manual retry between two real
+scheduled failures does NOT trigger the alert, a third scheduled failure
+does, and a real scheduled success resolves it -- plus that a
+never-configured source (every run `awaiting_connection`) raises nothing,
+and `ai_analysis` is tracked as a fully separate entry. Full suite:
+263/263 passing in a scratch Postgres instance.
+
+**Known limitations:**
+- The refresh-interval assumption (24h, so the staleness threshold is 48h)
+  is a single global default, not yet configurable per source -- fine
+  while every source shares the same once-daily cron; would need a
+  per-source override if that ever changes.
+- Email sending uses Resend's HTTP API but has never actually been
+  test-sent in this environment (no real API key here) -- the code path
+  is real, not a stub, but "configured" only means the 3 env vars are
+  set, not that a send has been verified.
+- The auth/quota-error detection is a regex over free-text error strings
+  (no structured error-code field exists yet on `provider_runs`) -- could
+  miss a provider's own non-standard error wording.
 
 ## Stage 4: Eligibility filtering and rejection storage
 **Status:** pending

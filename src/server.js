@@ -7,9 +7,11 @@ const {
   pool, initSchemaWithRetry, getReportByDate, getLatestReport, listReportDates, getReportBundle,
   tryAcquireIngestLock, releaseIngestLock, getRecommendationById, insertFeedback, restoreFeedback, listActiveFeedback,
   getActiveExclusions, getIdeas, updateIdea, getIdeaHistory, getIdeaStatusCounts, getMostRecentRecommendationByFingerprint,
-  recordBaselineSnapshot, getLatestBaselineSnapshot, getAllBaselineSnapshots
+  recordBaselineSnapshot, getLatestBaselineSnapshot, getAllBaselineSnapshots, getOpenSourceHealthAlerts
 } = require('./db');
 const { computeBaseline } = require('./baseline');
+const { runHealthCheck } = require('./healthMonitor');
+const { getEmailConfig } = require('./emailAlerts');
 const { ALL_TOPICS } = require('./topics');
 const { peakingEligible } = require('./themeLifecycle');
 const { isSocialSourceType } = require('./microtrendExtraction');
@@ -172,6 +174,13 @@ function serializeMicrotrend(m) {
 async function serializeBundle(bundle) {
   const exclusions = await getActiveExclusions();
   const winningMicrotrendIds = new Set(bundle.recommendations.filter((r) => r.microtrend_id).map((r) => r.microtrend_id));
+  // Stage 3's one public-facing piece (brief: "show dashboard users when
+  // an outage materially limits the evidence behind recommendations") --
+  // a plain, honest notice, never scraper internals (no source names, no
+  // error text, no alert type). AI-analysis outages already get their own
+  // explicit message above, so this only looks at real scraper sources.
+  const openAlerts = await getOpenSourceHealthAlerts();
+  const scraperOutage = openAlerts.some((a) => a.source_type !== 'ai_analysis');
   return {
     report: {
       date: bundle.report.report_date,
@@ -184,7 +193,10 @@ async function serializeBundle(bundle) {
       // from a day where AI ran fine and genuinely found nothing to
       // recommend, which looks identical otherwise (zero recommendations).
       aiAnalysisAvailable: bundle.report.ai_analysis_available,
-      aiAnalysisReason: bundle.report.ai_analysis_reason
+      aiAnalysisReason: bundle.report.ai_analysis_reason,
+      evidenceOutageNotice: scraperOutage
+        ? "One or more data sources are currently having trouble collecting new evidence -- today's recommendations may be based on less evidence than usual."
+        : null
     },
     recommendations: bundle.recommendations.map((r) => ({
       id: r.id,
@@ -483,10 +495,29 @@ app.post('/admin/refresh', requireAdmin, async (req, res) => {
   const child = spawn(process.execPath, [path.join(__dirname, 'ingest.js')], {
     detached: true,
     stdio: 'ignore',
-    env: process.env
+    // Marks every provider_runs/reports row this run produces as a manual
+    // trigger -- healthMonitor.js's alert thresholds only count scheduled
+    // runs, so this admin-initiated retry can never inflate a failure
+    // streak the real cron is responsible for.
+    env: { ...process.env, INGEST_TRIGGER: 'manual' }
   });
   child.unref();
   res.json({ ok: true, started: true });
+});
+
+// Stage 3 (IMPLEMENTATION_CHECKLIST.md): admin-only -- run history, error
+// detail and alert state are operational detail, not something every
+// dashboard viewer needs, same reasoning as gating Refresh. Recomputes
+// fresh on every call (runHealthCheck is idempotent against the real DB
+// state) so this always reflects reality, not just whatever it was after
+// the last ingest run.
+app.get('/admin/source-health', requireAdmin, async (req, res) => {
+  try {
+    const health = await runHealthCheck();
+    res.json(health);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // Stage 1 of the roadmap (IMPLEMENTATION_CHECKLIST.md) -- computes and

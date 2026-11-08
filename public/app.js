@@ -27,6 +27,21 @@
     sessionStorage.removeItem('bd-editor-token');
   }
 
+  // Same session-scoped-token UX, shared by Refresh and the Source health
+  // view -- both are ADMIN_TOKEN actions, so one prompt/cache serves both
+  // rather than asking twice in the same session.
+  function getAdminToken() {
+    let token = sessionStorage.getItem('bd-admin-token');
+    if (!token) {
+      token = window.prompt('Admin token:');
+      if (token) sessionStorage.setItem('bd-admin-token', token);
+    }
+    return token;
+  }
+  function clearAdminToken() {
+    sessionStorage.removeItem('bd-admin-token');
+  }
+
   function readUrl() {
     const params = new URLSearchParams(location.search);
     state.date = params.get('date') || null;
@@ -113,6 +128,7 @@
 
   function renderNoReport() {
     qs('#bd-report-date').textContent = 'No completed report for this date yet';
+    renderOutageNotice(null);
     qs('#bd-priorities').innerHTML = `<p class="bd-empty-hero">Nothing to show. Run ingestion, or pick a different date from History.</p>`;
     qs('#bd-emerging-list').innerHTML = '<div class="bd-empty">No data</div>';
     qs('#bd-theme-trends').innerHTML = '<div class="bd-empty">No data</div>';
@@ -122,9 +138,19 @@
     qs('#bd-updated-status').textContent = '';
   }
 
+  // Stage 3's one public-facing piece -- a plain honest notice (never
+  // naming a source or showing error text) that an outage is currently
+  // limiting the evidence behind recommendations. null just hides it.
+  function renderOutageNotice(notice) {
+    const el = qs('#bd-outage-notice');
+    el.hidden = !notice;
+    el.textContent = notice || '';
+  }
+
   function render(bundle) {
     qs('#bd-report-date').textContent = `${fmtDate(bundle.report.date)} · National view`;
     qs('#bd-updated-status').textContent = bundle.report.generatedAt ? `Updated ${fmtDateTime(bundle.report.generatedAt)}` : '';
+    renderOutageNotice(bundle.report.evidenceOutageNotice);
     renderPriorities(bundle.recommendations, bundle.report);
     renderEmerging(bundle.microtrendsEmerging || []);
     renderThemeTrends(bundle.themeTrends || []);
@@ -736,24 +762,149 @@
       const view = btn.dataset.view;
       qs('#bd-view-today').hidden = view !== 'today';
       qs('#bd-view-ideas').hidden = view !== 'ideas';
+      qs('#bd-view-health').hidden = view !== 'health';
       if (view === 'ideas') openIdeaTracker();
+      if (view === 'health') loadSourceHealth();
     }));
   }
 
   // --- Refresh (admin) --------------------------------------------------
+  async function triggerRefresh() {
+    const token = getAdminToken();
+    if (!token) return;
+    const res = await fetch('/admin/refresh', { method: 'POST', headers: { 'X-Admin-Token': token } });
+    if (res.status === 403) { clearAdminToken(); alert('Admin token rejected -- try again.'); return; }
+    if (res.ok) {
+      alert('Refresh started. This can take several minutes -- reload later to see the new report.');
+    } else if (res.status === 409) {
+      alert('An ingest run is already in progress -- wait for it to finish before starting another.');
+    } else {
+      alert('Refresh failed to start.');
+    }
+  }
+
   function setupRefresh() {
-    qs('#bd-refresh-button').addEventListener('click', async () => {
-      const token = window.prompt('Admin token to trigger a refresh:');
-      if (!token) return;
-      const res = await fetch('/admin/refresh', { method: 'POST', headers: { 'X-Admin-Token': token } });
-      if (res.ok) {
-        alert('Refresh started. This can take several minutes -- reload later to see the new report.');
-      } else if (res.status === 409) {
-        alert('An ingest run is already in progress -- wait for it to finish before starting another.');
-      } else {
-        alert('Refresh failed to start -- check the token.');
-      }
-    });
+    qs('#bd-refresh-button').addEventListener('click', triggerRefresh);
+    qs('#bd-health-refresh-button').addEventListener('click', triggerRefresh);
+    qs('#bd-health-reload-button').addEventListener('click', loadSourceHealth);
+  }
+
+  // --- Source health (admin) --------------------------------------------
+  // Stage 3 (IMPLEMENTATION_CHECKLIST.md): the actual admin tab -- run
+  // history, active alerts, email config and a retry control, all gated
+  // behind the same ADMIN_TOKEN prompt as Refresh. Everything here is
+  // read fresh from /admin/source-health on each load, which itself
+  // recomputes against real stored data rather than serving a stale cache.
+  const ALERT_TYPE_LABELS = {
+    consecutive_failures: 'Consecutive failures',
+    stale_no_success: 'No recent success',
+    zero_usable_records: 'Zero usable records',
+    auth_or_quota_error: 'Auth / quota error'
+  };
+  const SOURCE_TYPE_LABELS = {
+    dataforseo_trends: 'DataForSEO (search trends)',
+    google_news: 'Google News',
+    apify_reddit: 'Reddit',
+    apify_tiktok: 'TikTok',
+    apify_instagram: 'Instagram',
+    apify_pinterest: 'Pinterest',
+    ai_analysis: 'AI analysis (Claude)'
+  };
+
+  function sourceLabel(sourceType) {
+    return SOURCE_TYPE_LABELS[sourceType] || sourceType;
+  }
+
+  function renderHealthEmail(email) {
+    const el = qs('#bd-health-email');
+    el.innerHTML = email.configured
+      ? `<div class="bd-health-email-ok"><strong>Email alerts configured</strong><br>Sending to ${escapeHtml(email.to)} via ${escapeHtml(email.provider)}. Real delivery hasn't necessarily been test-sent -- this just reflects that credentials are set.</div>`
+      : `<div class="bd-health-email-bad"><strong>Email alerts not configured</strong><br>${escapeHtml(email.note || '')}</div>`;
+  }
+
+  function renderHealthAlerts(openAlerts) {
+    const el = qs('#bd-health-alerts');
+    if (!openAlerts || openAlerts.length === 0) {
+      el.innerHTML = '<div class="bd-empty">No active alerts.</div>';
+      return;
+    }
+    el.innerHTML = openAlerts.map((a) => `
+      <div class="bd-alert-row">
+        <div>
+          <strong>${escapeHtml(sourceLabel(a.source_type))} &middot; ${escapeHtml(ALERT_TYPE_LABELS[a.alert_type] || a.alert_type)}</strong>
+          <p>${escapeHtml(a.last_detail || '')}</p>
+        </div>
+        <div class="bd-alert-meta">
+          <span class="bd-alert-badge">Open</span><br>
+          Since ${escapeHtml(fmtDateTime(a.opened_at))}<br>
+          Seen ${a.occurrence_count}&times;
+        </div>
+      </div>
+    `).join('');
+  }
+
+  function renderHealthResolved(resolved) {
+    const el = qs('#bd-health-resolved');
+    if (!resolved || resolved.length === 0) {
+      el.innerHTML = '<div class="bd-empty">Nothing recently recovered.</div>';
+      return;
+    }
+    el.innerHTML = resolved.slice(0, 10).map((a) => `
+      <div class="bd-alert-row">
+        <div>
+          <strong>${escapeHtml(sourceLabel(a.source_type))} &middot; ${escapeHtml(ALERT_TYPE_LABELS[a.alert_type] || a.alert_type)}</strong>
+          <p>${escapeHtml(a.last_detail || '')}</p>
+        </div>
+        <div class="bd-alert-meta">Resolved ${escapeHtml(fmtDateTime(a.resolved_at))}</div>
+      </div>
+    `).join('');
+  }
+
+  function runStatusClass(status) {
+    return status === 'ok' ? 'bd-run-status-ok' : status === 'failed' ? 'bd-run-status-failed' : 'bd-run-status-unknown';
+  }
+
+  function renderHealthSources(sources) {
+    const el = qs('#bd-health-sources');
+    if (!sources || sources.length === 0) {
+      el.innerHTML = '<div class="bd-empty">No run history yet.</div>';
+      return;
+    }
+    el.innerHTML = `<div class="bd-source-health-grid">${sources.map((s) => `
+      <div class="bd-source-health-card">
+        <h4>${escapeHtml(sourceLabel(s.sourceType))}</h4>
+        ${s.recentRuns.length === 0 ? '<div class="bd-empty">No runs recorded in the last 30 days.</div>' : s.recentRuns.map((r) => `
+          <div class="bd-run-row">
+            <span>${escapeHtml(String(r.reportDate).slice(0, 10))} &middot; ${escapeHtml(r.triggerType)}</span>
+            <span class="${runStatusClass(r.status)}">${escapeHtml(r.status)}${r.newItemCount != null ? ` &middot; ${r.newItemCount} new` : ''}</span>
+          </div>
+        `).join('')}
+      </div>
+    `).join('')}</div>`;
+  }
+
+  async function loadSourceHealth() {
+    const token = getAdminToken();
+    if (!token) return;
+    qs('#bd-health-email').innerHTML = '<div class="bd-empty">Loading…</div>';
+    qs('#bd-health-alerts').innerHTML = '<div class="bd-empty">Loading…</div>';
+    qs('#bd-health-resolved').innerHTML = '<div class="bd-empty">Loading…</div>';
+    qs('#bd-health-sources').innerHTML = '<div class="bd-empty">Loading…</div>';
+    const res = await fetch('/admin/source-health', { headers: { 'X-Admin-Token': token } });
+    if (res.status === 403) {
+      clearAdminToken();
+      qs('#bd-health-alerts').innerHTML = '<div class="bd-empty">Admin token rejected -- switch to this tab again to re-enter it.</div>';
+      return;
+    }
+    if (!res.ok) {
+      qs('#bd-health-alerts').innerHTML = '<div class="bd-empty">Could not load source health.</div>';
+      return;
+    }
+    const health = await res.json();
+    renderHealthEmail(health.email);
+    renderHealthAlerts(health.openAlerts);
+    renderHealthResolved(health.recentlyResolved);
+    renderHealthSources(health.sources);
   }
 
   function setupEvents() {

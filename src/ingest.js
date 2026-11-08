@@ -1,8 +1,9 @@
 require('dotenv').config();
 const {
   pool, initSchemaWithRetry, getOrCreateReport, completeReport, recordProviderRun, upsertSourceItem,
-  tryAcquireIngestLock, releaseIngestLock
+  updateProviderRunCounts, tryAcquireIngestLock, releaseIngestLock
 } = require('./db');
+const { runHealthCheck } = require('./healthMonitor');
 const { ALL_TOPICS, allQueries } = require('./topics');
 const dataforseoTrends = require('./providers/dataforseoTrends');
 const googleNewsRss = require('./providers/googleNewsRss');
@@ -75,7 +76,7 @@ async function collectTrends(report, reportDate) {
       });
 
       if (result.status === 'live') {
-        await upsertSourceItem({
+        const inserted = await upsertSourceItem({
           providerRunId: run.id,
           sourceType: 'dataforseo_trends',
           sourceName: 'DataForSEO',
@@ -91,9 +92,16 @@ async function collectTrends(report, reportDate) {
           rawPayload: result.rawPayload,
           publishedAt: new Date()
         });
+        await updateProviderRunCounts(run.id, inserted ? 1 : 0, inserted ? 0 : 1);
         summary.live++;
       } else {
         const cached = await cachedFallbackForTrends(topic.theme, query, run.id, reportDate);
+        // cachedFallbackForTrends's own content_hash always bakes in
+        // today's reportDate, so it never collides with a prior day's row
+        // -- a truthy result is always a fresh insert, never a conflict.
+        // A falsy result means no attempt happened at all (no earlier
+        // successful pull existed to fall back to), not a duplicate.
+        await updateProviderRunCounts(run.id, cached ? 1 : 0, 0);
         summary[cached ? 'cached' : result.status]++;
       }
     }
@@ -115,11 +123,13 @@ async function collectGoogleNews(report, reportDate, sinceDate) {
         error: result.error
       });
       if (result.status === 'live') {
+        let newCount = 0;
+        let duplicateCount = 0;
         for (const item of result.items) {
           const publishedAt = item.pubDate ? new Date(item.pubDate) : null;
           if (publishedAt && publishedAt < sinceDate) continue;
           if (!item.link) continue;
-          await upsertSourceItem({
+          const inserted = await upsertSourceItem({
             providerRunId: run.id,
             sourceType: 'google_news',
             sourceName: item.source || 'Google News',
@@ -133,7 +143,9 @@ async function collectGoogleNews(report, reportDate, sinceDate) {
             dataStatus: 'live',
             rawPayload: item.raw
           });
+          if (inserted) newCount++; else duplicateCount++;
         }
+        await updateProviderRunCounts(run.id, newCount, duplicateCount);
         summary.live++;
       } else {
         summary.failed++;
@@ -178,9 +190,11 @@ async function collectSocial(report, reportDate, sinceDate) {
       hitRetrievalCap
     });
     if (result.status === 'live') {
+      let newCount = 0;
+      let duplicateCount = 0;
       for (const item of result.items) {
         if (!item.theme) continue; // couldn't attribute to a topic -- drop rather than mislabel
-        await upsertSourceItem({
+        const inserted = await upsertSourceItem({
           providerRunId: run.id,
           sourceType: platform.sourceType,
           sourceName: platform.sourceName,
@@ -202,7 +216,9 @@ async function collectSocial(report, reportDate, sinceDate) {
           // its own raw shape has actually been inspected.
           contentFormat: platform.sourceType === 'apify_tiktok' ? 'video' : null
         });
+        if (inserted) newCount++; else duplicateCount++;
       }
+      await updateProviderRunCounts(run.id, newCount, duplicateCount);
     }
     // Omit the error key entirely when there isn't one -- Render's log
     // viewer flags any line containing the literal word "error" as red,
@@ -252,7 +268,12 @@ async function run() {
       // visibility as the other credentials, not buried.
       ANTHROPIC_API_KEY: Boolean(process.env.ANTHROPIC_API_KEY)
     });
-    const report = await getOrCreateReport(reportDate);
+    // 'manual' only when server.js's /admin/refresh set it on the spawned
+    // process's env; the real cron invocation never sets this, so it
+    // defaults to 'scheduled' -- the one trigger type alert thresholds in
+    // healthMonitor.js are allowed to count.
+    const triggerType = process.env.INGEST_TRIGGER === 'manual' ? 'manual' : 'scheduled';
+    const report = await getOrCreateReport(reportDate, triggerType);
 
     // A same-day re-run (Refresh fired more than once before midnight) should
     // reflect only its own latest attempt on Source health, not accumulate
@@ -276,6 +297,21 @@ async function run() {
 
     await completeReport(report.id, providerSummary);
     console.log(`[ingest] report ${reportDate} completed`);
+
+    // Monitoring must never block a real ingest run -- a failure here is
+    // logged and swallowed, same principle as the brief's "don't block
+    // monitoring or claim email delivery has been tested" rule applied to
+    // the reverse case: a monitoring bug must not take the whole pipeline
+    // down with it.
+    try {
+      const health = await runHealthCheck();
+      const newAlerts = health.sources.flatMap((s) => s.alertOutcomes.filter((a) => a.status === 'open' && a.isNew));
+      if (newAlerts.length > 0) {
+        console.warn('[ingest] new source-health alerts:', newAlerts.map((a) => a.alertType));
+      }
+    } catch (err) {
+      console.error('[ingest] health check failed (ingest result above is unaffected):', err.message);
+    }
   } finally {
     await releaseIngestLock(lockClient);
   }

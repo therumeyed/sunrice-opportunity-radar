@@ -17,6 +17,7 @@
       <nav class="bd-nav" id="bd-nav">
         <button type="button" data-view="today" aria-pressed="true">Today</button>
         <button type="button" data-view="ideas" aria-pressed="false">Idea Tracker</button>
+        <button type="button" data-view="health" aria-pressed="false">Source health</button>
         <button type="button" disabled>Local visibility <span class="bd-soon">Later</span></button>
         <button type="button" disabled>Digital availability <span class="bd-soon">Later</span></button>
         <button type="button" disabled>Competitor pulse <span class="bd-soon">Later</span></button>
@@ -60,6 +61,8 @@
               <select id="bd-filter-state" aria-label="State"><option value="">All Australia</option></select>
             </div>
           </div>
+
+          <div id="bd-outage-notice" class="bd-outage-notice" hidden></div>
 
           <section class="bd-hero">
             <div class="bd-hero-top">
@@ -161,6 +164,32 @@
             </table>
             <div id="bd-ideas-empty" class="bd-empty" hidden>No ideas match these filters yet.</div>
           </div>
+        </div>
+
+        <div id="bd-view-health" hidden>
+          <div class="bd-health-toolbar">
+            <button class="bd-action primary" id="bd-health-refresh-button" type="button">Run ingestion now</button>
+            <button class="bd-action" id="bd-health-reload-button" type="button">Reload status</button>
+          </div>
+          <div id="bd-health-email" class="bd-panel bd-full" style="margin-bottom:16px;"></div>
+          <section class="bd-panel bd-full" style="margin-bottom:16px;">
+            <div class="bd-panel-head">
+              <div><h3>Active alerts</h3><p>Grouped by source and incident -- an alert disappears from here the moment the condition that raised it stops being true</p></div>
+            </div>
+            <div id="bd-health-alerts"><div class="bd-empty">Loading…</div></div>
+          </section>
+          <section class="bd-panel bd-full" style="margin-bottom:16px;">
+            <div class="bd-panel-head">
+              <div><h3>Recently recovered</h3><p>Alerts that stopped triggering -- kept here briefly so a recovery isn't invisible</p></div>
+            </div>
+            <div id="bd-health-resolved"><div class="bd-empty">Loading…</div></div>
+          </section>
+          <section class="bd-panel bd-full">
+            <div class="bd-panel-head">
+              <div><h3>Per-source run history</h3><p>Scraper sources and AI analysis, kept separate -- last 14 days shown per source, most recent first</p></div>
+            </div>
+            <div id="bd-health-sources"><div class="bd-empty">Loading…</div></div>
+          </section>
         </div>
       </div>
     </main>

@@ -703,6 +703,65 @@ section 5c) -- the dashboard's feedback buttons and the Hidden & covered
 items manager's Undo prompt for it the same way, and it's also
 auto-generated on Render under the same Environment tab.
 
+### 7a. Source health, alerts and email notifications
+
+Stage 3 of `IMPLEMENTATION_CHECKLIST.md`. The dashboard's **Source health**
+nav tab (admin-only, same `X-Admin-Token` prompt as Refresh) shows:
+
+- Per-source run history for the last 30 days (DataForSEO, Google News,
+  Reddit/TikTok/Instagram/Pinterest, and AI analysis kept as its own
+  separate entry) -- status, trigger (scheduled vs. manual), new vs.
+  duplicate record counts.
+- Active alerts, grouped by source + incident type, with occurrence count
+  and first-seen time.
+- Recently-recovered alerts, so a recovery isn't invisible.
+- Email alert configuration state (configured/unconfigured, never claimed
+  as tested without a real send).
+- A **Run ingestion now** button -- the same `/admin/refresh` action as
+  the top-level Refresh button, already dedup-safe via `content_hash`.
+
+Four alert rules, evaluated in `src/alerts.js` (pure, unit-tested against
+fixtures in `test/alerts.test.js`) and reconciled against real stored
+history in `src/healthMonitor.js`:
+
+1. Two consecutive failed **scheduled** runs for a source.
+2. No successful scheduled run for more than 2x the refresh interval
+   (currently a configurable assumption of one scheduled run/day, i.e. 48h
+   -- see `DEFAULT_REFRESH_INTERVAL_HOURS` in `src/alerts.js`).
+3. Three consecutive scheduled runs that succeeded but returned zero
+   new/usable records -- flagged for investigation, not treated as a
+   failure.
+4. An authentication/quota-shaped error -- alerted immediately, no
+   streak required.
+
+**Manual retries never count toward these thresholds.** Every ingest run
+is tagged `scheduled` (the real cron) or `manual` (an admin's Refresh
+click, via `INGEST_TRIGGER=manual` set on the spawned process) on
+`reports.trigger_type`, and alert evaluation only ever looks at scheduled
+runs.
+
+**Email notifications** go through Resend's HTTP API. Unset by default --
+set these three env vars in the `sunrice-radar-secrets` group to enable
+them:
+
+```
+ALERT_EMAIL_API_KEY=<a Resend API key>
+ALERT_EMAIL_TO=<admin recipient address>
+ALERT_EMAIL_FROM=<a verified sending address>
+```
+
+Until all three are set, the Source health tab shows email alerts as
+honestly **unconfigured** -- in-app alerts work regardless, and no send is
+ever claimed to have been tested without real credentials in this
+environment.
+
+**The one thing every dashboard viewer sees** (not just admins): if a real
+scraper source currently has an open alert, the Today view shows a plain,
+generic notice ("one or more data sources are currently having trouble
+collecting new evidence...") -- never naming the source, the alert type,
+or any error text. AI-analysis outages keep their own existing, separate
+message (see section 5).
+
 ## 8. Extending later
 
 - Wiring in Customer voice, Local visibility, Digital availability or

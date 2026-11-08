@@ -250,3 +250,23 @@ a { color: var(--bd-red); }
 @media (max-width: 860px) {
   .bd-ideas-summary { grid-template-columns: repeat(2, 1fr); }
 }
+
+/* Stage 3: public outage notice + admin Source health view. */
+.bd-outage-notice { background: var(--bd-amber-soft); color: var(--bd-amber); border: 1px solid var(--bd-amber); border-radius: 10px; padding: 10px 13px; font-size: 11px; margin-bottom: 16px; line-height: 1.45; }
+.bd-health-toolbar { display: flex; gap: 8px; margin-bottom: 16px; }
+.bd-health-email-ok { color: var(--bd-green); font-size: 12px; }
+.bd-health-email-bad { color: var(--bd-muted); font-size: 12px; }
+.bd-alert-row { border-top: 1px solid var(--bd-line); padding: 12px 0; display: flex; justify-content: space-between; align-items: start; gap: 12px; }
+.bd-alert-row:first-child { border-top: 0; padding-top: 0; }
+.bd-alert-row strong { font-size: 12px; display: block; }
+.bd-alert-row p { color: var(--bd-muted); font-size: 11px; margin: 4px 0 0; line-height: 1.4; max-width: 560px; }
+.bd-alert-badge { font-size: 9px; text-transform: uppercase; letter-spacing: .04em; border-radius: 999px; padding: 4px 8px; white-space: nowrap; background: var(--bd-red-soft); color: var(--bd-red); }
+.bd-alert-meta { color: var(--bd-muted); font-size: 10px; white-space: nowrap; text-align: right; }
+.bd-source-health-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 14px; }
+.bd-source-health-card { border: 1px solid var(--bd-line); border-radius: 12px; padding: 14px; }
+.bd-source-health-card h4 { font-size: 13px; margin: 0 0 8px; }
+.bd-source-health-card .bd-run-row { display: flex; justify-content: space-between; gap: 8px; font-size: 10px; color: var(--bd-muted); padding: 5px 0; border-top: 1px solid var(--bd-line); }
+.bd-source-health-card .bd-run-row:first-of-type { border-top: 0; }
+.bd-run-status-ok { color: var(--bd-green); }
+.bd-run-status-failed { color: var(--bd-red); }
+.bd-run-status-unknown { color: var(--bd-muted); }

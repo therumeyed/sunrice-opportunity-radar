@@ -39,6 +39,16 @@ envVarGroups:
         generateValue: true
       - key: EDITOR_TOKEN
         generateValue: true
+      # Stage 3 (IMPLEMENTATION_CHECKLIST.md): optional. Leave blank and the
+      # Source health tab honestly shows email alerts as unconfigured --
+      # in-app alerts work regardless. Set all three via a Resend account to
+      # enable real email notifications.
+      - key: ALERT_EMAIL_API_KEY
+        sync: false
+      - key: ALERT_EMAIL_TO
+        sync: false
+      - key: ALERT_EMAIL_FROM
+        sync: false
 
 services:
   - type: web
